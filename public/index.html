@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Job Agent</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script defer src="https://unpkg.com/lucide@0.468.0"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true"><i data-lucide="radar"></i></div>
+          <div>
+            <strong>Job Agent</strong>
+            <span>Phase 1 / Local</span>
+          </div>
+        </div>
+        <nav class="navigation" aria-label="工作区导航">
+          <button class="nav-item is-active" data-view="overview"><i data-lucide="layout-dashboard"></i><span>概览</span></button>
+          <button class="nav-item" data-view="jobs"><i data-lucide="briefcase-business"></i><span>职位审阅</span></button>
+          <button class="nav-item" data-view="routine"><i data-lucide="list-todo"></i><span>每日任务</span></button>
+          <button class="nav-item" data-view="profile"><i data-lucide="contact-round"></i><span>职业画像</span></button>
+          <button class="nav-item" data-view="settings"><i data-lucide="sliders-horizontal"></i><span>搜索设置</span></button>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="status-dot" id="api-status-dot"></span>
+          <span id="api-status">正在连接本地服务</span>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="page-kicker">今日工作区</p>
+            <h1 id="page-title">职位概览</h1>
+          </div>
+          <div class="topbar-actions">
+            <span class="ai-state" id="ai-state"></span>
+            <button class="button button-primary" id="start-run"><i data-lucide="play"></i><span>启动每日任务</span></button>
+          </div>
+        </header>
+
+        <section class="view is-active" id="view-overview">
+          <div class="metric-grid" id="overview-metrics"></div>
+          <div class="section-heading">
+            <div>
+              <h2>最新职位</h2>
+              <p>按发现时间排列</p>
+            </div>
+            <button class="button button-quiet" data-view="jobs">查看全部 <i data-lucide="arrow-right"></i></button>
+          </div>
+          <div class="data-table-wrap">
+            <table class="data-table compact-table">
+              <thead><tr><th>职位</th><th>公司与地点</th><th>来源</th><th>匹配</th><th>状态</th><th></th></tr></thead>
+              <tbody id="overview-jobs"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="view" id="view-jobs">
+          <div class="section-heading">
+            <div>
+              <h2>组合职位列表</h2>
+              <p id="jobs-summary">0 个已导入职位</p>
+            </div>
+            <button class="button button-secondary" id="open-import"><i data-lucide="file-input"></i><span>导入职位结果</span></button>
+          </div>
+          <div class="filter-bar">
+            <label class="search-control"><i data-lucide="search"></i><input id="job-search" type="search" placeholder="搜索职位、公司或地点"></label>
+            <label><span>匹配级别</span><select id="job-category"><option value="">全部</option><option>STRONG_MATCH</option><option>GOOD_MATCH</option><option>MAYBE</option><option>LOW_MATCH</option><option>REJECTED</option></select></label>
+            <label><span>平台</span><select id="job-source"><option value="">全部平台</option><option value="linkedin">LinkedIn</option><option value="indeed">Indeed</option><option value="seek">SEEK</option><option value="manual">手动</option></select></label>
+            <label><span>审阅状态</span><select id="job-status"><option value="">全部</option><option value="NEEDS_JD_REVIEW">待 JD 审阅</option><option value="JD_SCREENED">已审阅 JD</option><option value="TITLE_SCREENED">标题已筛查</option><option value="AI_ERROR">AI 错误</option></select></label>
+            <label><span>排序</span><select id="job-sort"><option value="discoveredAt">最新发现</option><option value="score">匹配分数</option><option value="source">平台</option><option value="company">公司</option><option value="title">职位名称</option></select></label>
+          </div>
+          <div class="data-table-wrap">
+            <table class="data-table jobs-table">
+              <thead><tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>状态</th><th></th></tr></thead>
+              <tbody id="jobs-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="view" id="view-routine">
+          <div class="section-heading">
+            <div>
+              <h2>每日任务</h2>
+              <p>按关键词、地点和平台顺序执行</p>
+            </div>
+            <button class="button button-primary" id="start-run-secondary"><i data-lucide="play"></i><span>创建新任务</span></button>
+          </div>
+          <div class="run-summary" id="run-summary"></div>
+          <div class="section-heading sub-heading"><div><h2>当前队列</h2><p>浏览器 worker 逐项领取任务</p></div></div>
+          <div class="data-table-wrap">
+            <table class="data-table">
+              <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>优先级</th><th>状态</th><th>说明</th></tr></thead>
+              <tbody id="tasks-table"></tbody>
+            </table>
+          </div>
+          <div class="section-heading sub-heading"><div><h2>最近运行</h2><p>单个平台失败不会中断其它平台</p></div></div>
+          <div class="run-list" id="runs-list"></div>
+        </section>
+
+        <section class="view" id="view-profile">
+          <div class="section-heading">
+            <div>
+              <h2>职业画像</h2>
+              <p id="profile-status">上传最新简历后生成一个待确认版本</p>
+            </div>
+            <span class="profile-current" id="profile-current"></span>
+          </div>
+          <div class="profile-layout">
+            <section class="form-panel upload-panel">
+              <h3>简历来源</h3>
+              <label class="file-control"><span>上传简历</span><input id="profile-file" type="file" accept=".txt,.md,.docx,.pdf"></label>
+              <div class="inline-actions">
+                <button class="button button-secondary" id="extract-resume"><i data-lucide="file-text"></i><span>读取简历</span></button>
+                <span id="resume-source">尚未选择文件</span>
+              </div>
+              <label class="field full"><span>简历文本</span><textarea id="resume-text" rows="15" placeholder="上传后会显示可编辑的文本，也可直接粘贴。"></textarea></label>
+              <button class="button button-primary wide" id="generate-profile"><i data-lucide="sparkles"></i><span>生成画像草稿</span></button>
+            </section>
+            <section class="form-panel profile-editor">
+              <div class="editor-heading"><h3>画像版本</h3><div class="profile-version-list" id="profile-versions"></div></div>
+              <div id="profile-fields" class="profile-fields"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-settings">
+          <div class="section-heading">
+            <div>
+              <h2>搜索设置</h2>
+              <p>三个平台共用同一份例行搜索配置</p>
+            </div>
+            <button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button>
+          </div>
+          <section class="settings-section">
+            <div class="setting-label"><h3>平台</h3><p>启用后会进入顺序队列</p></div>
+            <div class="platform-toggles" id="platform-toggles"></div>
+          </section>
+          <section class="settings-section">
+            <div class="setting-label"><h3>地点</h3><p>只使用已启用的地点</p></div>
+            <div class="settings-list" id="locations-list"></div>
+            <button class="button button-quiet add-row" data-add="location"><i data-lucide="plus"></i><span>添加地点</span></button>
+          </section>
+          <section class="settings-section">
+            <div class="setting-label"><h3>关键词</h3><p>优先级越高，越早进入队列</p></div>
+            <div class="settings-list" id="searches-list"></div>
+            <button class="button button-quiet add-row" data-add="search"><i data-lucide="plus"></i><span>添加关键词</span></button>
+          </section>
+          <section class="settings-section">
+            <div class="setting-label"><h3>匹配阈值</h3><p>分数只用于排序</p></div>
+            <div class="threshold-row" id="threshold-row"></div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="import-dialog" class="dialog">
+      <form method="dialog" id="import-form">
+        <div class="dialog-heading"><div><p class="eyebrow">职位结果</p><h2>导入到组合列表</h2></div><button class="icon-button" value="cancel" title="关闭"><i data-lucide="x"></i></button></div>
+        <label class="field full"><span>运行任务</span><select id="import-run"></select></label>
+        <label class="field full"><span>JSON 数组</span><textarea id="import-json" rows="14" placeholder='[{"source":"seek","title":"Graduate Software Engineer","company":"Example","location":"Melbourne VIC","jobUrl":"https://..."}]'></textarea></label>
+        <p class="form-note">重复来源记录会保留并标记，不会静默丢弃。</p>
+        <div class="dialog-actions"><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" id="submit-import" value="default">导入结果</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="review-dialog" class="dialog review-dialog">
+      <form method="dialog" id="review-form">
+        <div class="dialog-heading"><div><p class="eyebrow" id="review-source"></p><h2 id="review-title"></h2></div><button class="icon-button" value="cancel" title="关闭"><i data-lucide="x"></i></button></div>
+        <div id="review-meta" class="review-meta"></div>
+        <label class="field full"><span>职位描述</span><textarea id="review-description" rows="16" placeholder="粘贴模糊职位的 JD 后进行审阅。"></textarea></label>
+        <p class="form-note" id="review-note"></p>
+        <div class="dialog-actions"><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" id="submit-review" value="default"><i data-lucide="scan-search"></i><span>审阅 JD</span></button></div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

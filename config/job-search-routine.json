@@ -1,0 +1,27 @@
+{
+  "enabled": true,
+  "platforms": ["linkedin", "indeed", "seek"],
+  "locations": [
+    { "id": "melbourne-vic", "name": "Melbourne VIC", "enabled": true },
+    { "id": "australia", "name": "Australia", "enabled": false },
+    { "id": "sydney-nsw", "name": "Sydney NSW", "enabled": false },
+    { "id": "brisbane-qld", "name": "Brisbane QLD", "enabled": false },
+    { "id": "perth-wa", "name": "Perth WA", "enabled": false }
+  ],
+  "searches": [
+    { "id": "graduate-software", "keyword": "graduate software engineer", "enabled": true, "priority": 100 },
+    { "id": "graduate-developer", "keyword": "graduate software developer", "enabled": true, "priority": 95 },
+    { "id": "graduate-technology", "keyword": "graduate technology", "enabled": true, "priority": 90 },
+    { "id": "graduate-data", "keyword": "graduate data analyst", "enabled": true, "priority": 90 },
+    { "id": "graduate-ai", "keyword": "graduate AI", "enabled": true, "priority": 90 },
+    { "id": "software-intern", "keyword": "software engineer intern", "enabled": true, "priority": 85 },
+    { "id": "machine-learning-intern", "keyword": "machine learning intern", "enabled": true, "priority": 85 },
+    { "id": "data-intern", "keyword": "data science intern", "enabled": true, "priority": 80 }
+  ],
+  "thresholds": {
+    "strongMatch": 85,
+    "goodMatch": 70,
+    "maybe": 50,
+    "lowMatch": 30
+  }
+}

@@ -1,0 +1,4 @@
+data/state.json
+data/uploads/
+tools/__pycache__/
+.env
