@@ -1,6 +1,8 @@
 {
   "enabled": true,
   "platforms": ["linkedin", "indeed", "seek"],
+  "executionMode": "sequential",
+  "postedWithinDays": 7,
   "locations": [
     { "id": "melbourne-vic", "name": "Melbourne VIC", "enabled": true },
     { "id": "australia", "name": "Australia", "enabled": false },

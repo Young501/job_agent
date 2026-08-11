@@ -1,0 +1,95 @@
+[
+  {
+    "id": "preset_linkedin_graduate",
+    "name": "LinkedIn Graduate",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_li_grad_canberra", "platform": "linkedin", "keyword": "graduate", "location": "Canberra, Australian Capital Territory, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_victoria", "platform": "linkedin", "keyword": "graduate", "location": "Victoria, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_nsw", "platform": "linkedin", "keyword": "graduate", "location": "New South Wales, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_wa", "platform": "linkedin", "keyword": "graduate", "location": "Western Australia, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_sa", "platform": "linkedin", "keyword": "graduate", "location": "South Australia, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_nt", "platform": "linkedin", "keyword": "graduate", "location": "Northern Territory, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_qld", "platform": "linkedin", "keyword": "graduate", "location": "Queensland, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_tas", "platform": "linkedin", "keyword": "graduate", "location": "Tasmania, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_melbourne", "platform": "linkedin", "keyword": "graduate", "location": "Melbourne, Victoria, Australia", "postedWithinDays": 7 },
+      { "id": "preset_li_grad_australia", "platform": "linkedin", "keyword": "graduate", "location": "Australia", "postedWithinDays": 7 }
+    ]
+  },
+  {
+    "id": "preset_linkedin_intern",
+    "name": "LinkedIn Intern",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_li_intern_melbourne", "platform": "linkedin", "keyword": "intern OR internship", "location": "Melbourne, Victoria, Australia", "postedWithinDays": 7 }
+    ]
+  },
+  {
+    "id": "preset_seek_graduate_any",
+    "name": "SEEK Graduate · 时间不限",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_seek_grad_any_au", "platform": "seek", "keyword": "graduate", "location": "All Australia", "postedWithinDays": 0 },
+      { "id": "preset_seek_grad_any_mel", "platform": "seek", "keyword": "graduate", "location": "All Melbourne VIC", "postedWithinDays": 0 }
+    ]
+  },
+  {
+    "id": "preset_seek_graduate_week",
+    "name": "SEEK Graduate · 过去 7 天",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_seek_grad_week_au", "platform": "seek", "keyword": "graduate", "location": "All Australia", "postedWithinDays": 7 },
+      { "id": "preset_seek_grad_week_mel", "platform": "seek", "keyword": "graduate", "location": "All Melbourne VIC", "postedWithinDays": 7 }
+    ]
+  },
+  {
+    "id": "preset_seek_intern_any",
+    "name": "SEEK Intern · 时间不限",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_seek_intern_any_mel", "platform": "seek", "keyword": "intern OR internship", "location": "All Melbourne VIC", "postedWithinDays": 0 }
+    ]
+  },
+  {
+    "id": "preset_seek_intern_week",
+    "name": "SEEK Intern · 过去 7 天",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_seek_intern_week_mel", "platform": "seek", "keyword": "intern OR internship", "location": "All Melbourne VIC", "postedWithinDays": 7 }
+    ]
+  },
+  {
+    "id": "preset_indeed_graduate_any",
+    "name": "Indeed Graduate · 时间不限",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_indeed_grad_any_au", "platform": "indeed", "keyword": "graduate", "location": "Australia", "postedWithinDays": 0 },
+      { "id": "preset_indeed_grad_any_mel", "platform": "indeed", "keyword": "graduate", "location": "Melbourne VIC", "postedWithinDays": 0 }
+    ]
+  },
+  {
+    "id": "preset_indeed_graduate_week",
+    "name": "Indeed Graduate · 过去 7 天",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_indeed_grad_week_au", "platform": "indeed", "keyword": "graduate", "location": "Australia", "postedWithinDays": 7 },
+      { "id": "preset_indeed_grad_week_mel", "platform": "indeed", "keyword": "graduate", "location": "Melbourne VIC", "postedWithinDays": 7 }
+    ]
+  },
+  {
+    "id": "preset_indeed_intern_any",
+    "name": "Indeed Intern · 时间不限",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_indeed_intern_any_mel", "platform": "indeed", "keyword": "intern OR internship", "location": "Melbourne VIC", "postedWithinDays": 0 }
+    ]
+  },
+  {
+    "id": "preset_indeed_intern_week",
+    "name": "Indeed Intern · 过去 7 天",
+    "builtin": true,
+    "tasks": [
+      { "id": "preset_indeed_intern_week_mel", "platform": "indeed", "keyword": "intern OR internship", "location": "Melbourne VIC", "postedWithinDays": 7 }
+    ]
+  }
+]

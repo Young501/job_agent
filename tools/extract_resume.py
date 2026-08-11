@@ -11,6 +11,11 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 
+# Node reads this program's JSON output as UTF-8. Windows consoles often default
+# to a legacy code page that cannot represent resume bullets or Chinese text.
+sys.stdout.reconfigure(encoding="utf-8")
+
+
 def compact(text: str) -> str:
     return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", text)).strip()
 
