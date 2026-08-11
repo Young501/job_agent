@@ -12,10 +12,10 @@
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark" aria-hidden="true"><i data-lucide="radar"></i></div>
+          <div class="brand-mark" aria-hidden="true">JA</div>
           <div>
             <strong>Job Agent</strong>
-            <span>Phase 1 / Local</span>
+            <span>LOCAL / v2.0</span>
           </div>
         </div>
         <nav class="navigation" aria-label="工作区导航">
@@ -24,6 +24,7 @@
           <button class="nav-item" data-view="routine"><i data-lucide="list-todo"></i><span>每日任务</span></button>
           <button class="nav-item" data-view="profile"><i data-lucide="contact-round"></i><span>职业画像</span></button>
           <button class="nav-item" data-view="settings"><i data-lucide="sliders-horizontal"></i><span>搜索设置</span></button>
+          <button class="nav-item" data-view="setup"><i data-lucide="wrench"></i><span>安装设置</span></button>
         </nav>
         <div class="sidebar-footer">
           <span class="status-dot" id="api-status-dot"></span>
@@ -63,11 +64,37 @@
         <section class="view" id="view-jobs">
           <div class="section-heading">
             <div>
-              <h2>组合职位列表</h2>
-              <p id="jobs-summary">0 个已导入职位</p>
+              <h2 id="jobs-list-title">本次任务职位</h2>
+              <p id="jobs-summary">尚未开始本次任务</p>
             </div>
             <button class="button button-secondary" id="open-import"><i data-lucide="file-input"></i><span>导入职位结果</span></button>
           </div>
+          <div class="jobs-toolbar">
+            <div class="routine-tabs jobs-tabs" role="tablist" aria-label="职位批次视图">
+              <button class="routine-tab is-active" type="button" role="tab" data-jobs-pane="current" aria-controls="jobs-table"><i data-lucide="list-checks"></i><span>本次任务</span><small id="current-jobs-count">0</small></button>
+              <button class="routine-tab" type="button" role="tab" data-jobs-pane="history" aria-controls="jobs-table"><i data-lucide="history"></i><span>历史记录</span><small id="history-jobs-count">0</small></button>
+            </div>
+            <label class="jobs-run-filter" id="jobs-run-filter" hidden><span>运行批次</span><select id="job-history-run"><option value="">全部历史批次</option></select></label>
+          </div>
+          <section class="job-run-stats" id="job-run-stats" aria-labelledby="job-run-stats-title">
+            <div class="job-run-stats-heading">
+              <div><h3 id="job-run-stats-title">本次任务统计</h3><p>进入 Agent 包含脚本选中的全部职位与重复记录；待定职位尚未计入选中。</p></div>
+              <span id="job-run-stats-total"></span>
+            </div>
+            <div class="data-table-wrap">
+              <table class="data-table job-stats-table">
+                <thead><tr><th>关键词与地点</th><th>时间段</th><th>任务状态</th><th>进入 Agent</th><th>Agent 选中</th><th>待定 / 待 JD</th><th>明确不符合</th></tr></thead>
+                <tbody id="job-run-stats-body"></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="review-learning" id="review-learning" aria-labelledby="review-learning-title">
+            <div class="review-learning-heading">
+              <div><h3 id="review-learning-title">人工审阅复盘</h3><p id="review-learning-subtitle">标记没有帮助的职位，完成审阅后让 Agent 总结你的筛选偏好。</p></div>
+              <div class="review-learning-actions"><span id="review-feedback-count">0 条没帮助</span><button class="button button-secondary" id="complete-run-review" type="button"><i data-lucide="brain-circuit"></i><span>完成本次审阅并复盘</span></button></div>
+            </div>
+            <div class="review-learning-content" id="review-learning-content"></div>
+          </section>
           <div class="filter-bar">
             <label class="search-control"><i data-lucide="search"></i><input id="job-search" type="search" placeholder="搜索职位、公司或地点"></label>
             <label><span>匹配级别</span><select id="job-category"><option value="">全部</option><option>STRONG_MATCH</option><option>GOOD_MATCH</option><option>MAYBE</option><option>LOW_MATCH</option><option>REJECTED</option></select></label>
@@ -77,41 +104,82 @@
           </div>
           <div class="data-table-wrap">
             <table class="data-table jobs-table">
-              <thead><tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>状态</th><th></th></tr></thead>
+              <thead id="jobs-table-head"><tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>状态</th><th></th></tr></thead>
               <tbody id="jobs-table"></tbody>
             </table>
           </div>
         </section>
 
         <section class="view" id="view-routine">
-          <div class="section-heading">
-            <div>
-              <h2>每日任务</h2>
-              <p>按关键词、地点和平台顺序执行</p>
+          <div class="routine-toolbar">
+            <div class="routine-tabs" role="tablist" aria-label="每日任务视图">
+              <button class="routine-tab is-active" type="button" role="tab" data-routine-pane="plan" aria-controls="routine-plan-pane"><i data-lucide="list-checks"></i><span>任务计划</span><small id="routine-task-count">0</small></button>
+              <button class="routine-tab" type="button" role="tab" data-routine-pane="monitor" aria-controls="routine-monitor-pane"><i data-lucide="activity"></i><span>运行监控</span><small id="routine-monitor-count">0</small></button>
             </div>
-            <button class="button button-primary" id="start-run-secondary"><i data-lucide="play"></i><span>创建新任务</span></button>
+            <div class="routine-actions"><button class="button button-secondary" id="open-routine-task"><i data-lucide="plus"></i><span>添加任务</span></button><button class="button button-secondary" id="start-preflight-batch"><i data-lucide="shield-check"></i><span id="start-preflight-label">统一预检</span></button><button class="button button-primary" id="start-run-secondary"><i data-lucide="play"></i><span>运行全部任务</span></button></div>
           </div>
-          <div class="run-summary" id="run-summary"></div>
-          <div class="section-heading sub-heading"><div><h2>当前队列</h2><p>浏览器 worker 逐项领取任务</p></div></div>
-          <div class="data-table-wrap">
-            <table class="data-table">
-              <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>优先级</th><th>状态</th><th>说明</th></tr></thead>
-              <tbody id="tasks-table"></tbody>
-            </table>
+
+          <div class="routine-pane" id="routine-plan-pane" role="tabpanel">
+            <section class="task-category-library" aria-labelledby="task-category-title">
+              <div class="section-heading category-heading">
+                <div><h2 id="task-category-title">任务类别</h2><p>选择今天要执行的搜索组合</p></div>
+                <button class="button button-secondary" id="open-task-category" type="button"><i data-lucide="folder-plus"></i><span>新建类别</span></button>
+              </div>
+              <div class="category-selection-bar">
+                <label class="category-select-all"><input id="select-all-categories" type="checkbox"><span>全选类别</span></label>
+                <span class="category-selection-count" id="selected-category-count">已选 0 类 / 0 项任务</span>
+                <div class="category-selection-actions">
+                  <button class="button button-secondary" id="preflight-selected-categories" type="button" disabled><i data-lucide="shield-check"></i><span>预检所选</span></button>
+                  <button class="button button-primary" id="import-selected-categories" type="button" disabled><i data-lucide="list-plus"></i><span>导入所选到任务</span></button>
+                </div>
+              </div>
+              <div class="task-category-list" id="task-category-list"></div>
+            </section>
+            <div class="section-heading routine-heading"><div><h2>已验证任务</h2><p>仅运行通过平台预检的任务</p></div><button class="button button-danger" id="clear-routine-tasks"><i data-lucide="trash-2"></i><span>清空任务</span></button></div>
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>时间</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody id="routine-tasks-table"></tbody>
+              </table>
+            </div>
+            <details class="preflight-history" id="preflight-history">
+              <summary><span><i data-lucide="shield-check"></i>预检记录</span><small id="validation-summary">暂无记录</small></summary>
+              <div class="data-table-wrap">
+                <table class="data-table">
+                  <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>时间</th><th>结果</th><th>说明</th><th>操作</th></tr></thead>
+                  <tbody id="validations-table"></tbody>
+                </table>
+              </div>
+            </details>
           </div>
-          <div class="section-heading sub-heading"><div><h2>最近运行</h2><p>单个平台失败不会中断其它平台</p></div></div>
-          <div class="run-list" id="runs-list"></div>
+
+          <div class="routine-pane" id="routine-monitor-pane" role="tabpanel" hidden>
+            <div class="run-summary" id="run-summary"></div>
+            <div class="section-heading routine-heading"><div><h2>本次运行队列</h2><p>每个平台始终只执行一项任务</p></div><button class="button button-danger" id="clear-run-queue"><i data-lucide="trash-2"></i><span>清空队列</span></button></div>
+            <div class="data-table-wrap">
+              <table class="data-table">
+                <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>时间</th><th>状态</th><th>说明</th><th>操作</th></tr></thead>
+                <tbody id="tasks-table"></tbody>
+              </table>
+            </div>
+            <div class="section-heading sub-heading routine-heading"><div><h2>运行历史</h2><p>保留每次执行的结果与状态</p></div></div>
+            <div class="run-list" id="runs-list"></div>
+          </div>
         </section>
 
         <section class="view" id="view-profile">
           <div class="section-heading">
             <div>
-              <h2>职业画像</h2>
+              <h2>简历与画像</h2>
               <p id="profile-status">上传最新简历后生成一个待确认版本</p>
             </div>
             <span class="profile-current" id="profile-current"></span>
           </div>
-          <div class="profile-layout">
+          <div class="profile-tabs" role="tablist" aria-label="职业画像视图">
+            <button class="profile-tab" type="button" role="tab" data-profile-pane="upload" aria-controls="profile-upload-pane"><i data-lucide="file-up"></i><span>简历上传</span></button>
+            <button class="profile-tab is-active" type="button" role="tab" data-profile-pane="editor" aria-controls="profile-editor-pane"><i data-lucide="contact-round"></i><span>画像编辑</span><small id="profile-draft-count">0</small></button>
+          </div>
+          <div class="profile-pane" id="profile-upload-pane" role="tabpanel" hidden>
             <section class="form-panel upload-panel">
               <h3>简历来源</h3>
               <label class="file-control"><span>上传简历</span><input id="profile-file" type="file" accept=".txt,.md,.docx,.pdf"></label>
@@ -120,44 +188,112 @@
                 <span id="resume-source">尚未选择文件</span>
               </div>
               <label class="field full"><span>简历文本</span><textarea id="resume-text" rows="15" placeholder="上传后会显示可编辑的文本，也可直接粘贴。"></textarea></label>
-              <button class="button button-primary wide" id="generate-profile"><i data-lucide="sparkles"></i><span>生成画像草稿</span></button>
+              <div class="external-profile-input">
+                <div class="external-profile-heading"><div><h4>外部 GPT 画像 <small>可选</small></h4><p>上传同一份简历至 GPT，复制提示词后将 JSON 结果粘贴于此。</p></div><button class="button button-secondary" id="copy-external-profile-prompt"><i data-lucide="copy"></i><span>复制 GPT 提示词</span></button></div>
+                <label class="field full"><span>GPT 画像 JSON</span><textarea id="external-profile-text" rows="8" placeholder="粘贴 GPT 按提示词生成的 JSON 画像"></textarea></label>
+              </div>
+              <button class="button button-primary wide" id="generate-profile"><i data-lucide="file-output"></i><span>综合生成画像草稿</span></button>
             </section>
-            <section class="form-panel profile-editor">
-              <div class="editor-heading"><h3>画像版本</h3><div class="profile-version-list" id="profile-versions"></div></div>
-              <div id="profile-fields" class="profile-fields"></div>
-            </section>
+          </div>
+          <div class="profile-pane" id="profile-editor-pane" role="tabpanel">
+            <div class="editor-heading"><h3>画像版本</h3><div class="profile-version-list" id="profile-versions"></div></div>
+            <div id="profile-fields" class="profile-fields"></div>
           </div>
         </section>
 
         <section class="view" id="view-settings">
           <div class="section-heading">
             <div>
-              <h2>搜索设置</h2>
-              <p>三个平台共用同一份例行搜索配置</p>
+              <h2>运行与匹配</h2>
+              <p>运行方式、AI 服务和匹配阈值</p>
             </div>
-            <button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button>
+            <div class="topbar-actions"><button class="button button-secondary" id="install-workers"><i data-lucide="wrench"></i><span>Worker 安装</span></button><button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button></div>
           </div>
           <section class="settings-section">
-            <div class="setting-label"><h3>平台</h3><p>启用后会进入顺序队列</p></div>
-            <div class="platform-toggles" id="platform-toggles"></div>
-          </section>
-          <section class="settings-section">
-            <div class="setting-label"><h3>地点</h3><p>只使用已启用的地点</p></div>
-            <div class="settings-list" id="locations-list"></div>
-            <button class="button button-quiet add-row" data-add="location"><i data-lucide="plus"></i><span>添加地点</span></button>
-          </section>
-          <section class="settings-section">
-            <div class="setting-label"><h3>关键词</h3><p>优先级越高，越早进入队列</p></div>
-            <div class="settings-list" id="searches-list"></div>
-            <button class="button button-quiet add-row" data-add="search"><i data-lucide="plus"></i><span>添加关键词</span></button>
+            <div class="setting-label"><h3>执行方式</h3><p>同一平台始终只执行一项任务</p></div>
+            <div class="agent-schedule-fields">
+              <label class="field"><span>跨平台执行</span><select id="execution-mode"><option value="sequential">全部平台依次执行</option></select></label>
+            </div>
           </section>
           <section class="settings-section">
             <div class="setting-label"><h3>匹配阈值</h3><p>分数只用于排序</p></div>
             <div class="threshold-row" id="threshold-row"></div>
           </section>
+          <section class="settings-section">
+            <div class="setting-label"><h3>AI 服务</h3><p>密钥仅保存在本机后端，不会回显到页面</p></div>
+            <div class="ai-config-panel">
+              <div class="ai-config-grid">
+                <label class="field"><span>API Base URL</span><input id="ai-base-url" type="url" placeholder="https://api.openai.com/v1" autocomplete="off"></label>
+                <label class="field"><span>模型</span><input id="ai-model" placeholder="gpt-5.5" autocomplete="off"></label>
+                <label class="field"><span>API 类型</span><select id="ai-wire-api"><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
+                <label class="field"><span>API Key</span><input id="ai-api-key" type="password" placeholder="输入新密钥" autocomplete="new-password"></label>
+              </div>
+              <div class="ai-config-footer">
+                <span class="config-status" id="ai-config-status">尚未配置</span>
+                <div class="inline-actions">
+                  <button class="button button-danger" id="clear-ai-key" type="button"><i data-lucide="key-round"></i><span>清除密钥</span></button>
+                  <button class="button button-secondary" id="test-ai-config" type="button"><i data-lucide="plug-zap"></i><span>测试连接</span></button>
+                  <button class="button button-primary" id="save-ai-config" type="button"><i data-lucide="save"></i><span>保存 AI 配置</span></button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section class="view" id="view-setup">
+          <div class="section-heading">
+            <div>
+              <h2>浏览器 Worker 安装</h2>
+              <p>将三份独立 Worker 安装到 Tampermonkey，供预检与每日任务调用。</p>
+            </div>
+            <span class="setup-version"><i data-lucide="shield-check"></i><span>当前版本 v2.2.1</span></span>
+          </div>
+
+          <section class="setup-guide" aria-labelledby="setup-guide-title">
+            <div class="setup-guide-heading">
+              <i data-lucide="list-checks"></i>
+              <div><h3 id="setup-guide-title">直接安装</h3><p>每个平台各保留一份 Worker。</p></div>
+            </div>
+            <ol class="setup-steps">
+              <li><span>1</span><div><strong>确认 Tampermonkey 已启用</strong><p>Chrome 中需要安装并启用 Tampermonkey 扩展。</p></div></li>
+              <li><span>2</span><div><strong>点击“安装 / 更新”</strong><p>为 LinkedIn、Indeed 和 SEEK 分别打开安装确认页。</p></div></li>
+              <li><span>3</span><div><strong>确认安装或更新</strong><p>同名 Worker 会覆盖旧版本，不会另外创建重复脚本。</p></div></li>
+              <li><span>4</span><div><strong>运行统一预检</strong><p>返回每日任务，Worker 会领取任务并填写平台搜索条件。</p></div></li>
+            </ol>
+          </section>
+
+          <p class="setup-note"><i data-lucide="info"></i><span>“安装 / 更新”会替换同平台的旧版 <strong>Job Agent Worker</strong>，不会覆盖原有 LinkedIn/Indeed/SEEK helper。复制代码保留为浏览器未唤起 Tampermonkey 时的备用方式。</span></p>
+          <div class="worker-script-list" id="worker-script-list" aria-live="polite"></div>
+          <section class="setup-danger-zone" aria-labelledby="setup-danger-title">
+            <div><h3 id="setup-danger-title">调试数据清理</h3><p>清除 Agent 记录以及 LinkedIn、Indeed、SEEK Worker 的已扫描和汇总历史。</p></div>
+            <button class="button button-danger" id="open-clear-all-history" type="button"><i data-lucide="eraser"></i><span>清除全部历史记录</span></button>
+          </section>
         </section>
       </main>
     </div>
+
+    <dialog id="task-category-dialog" class="dialog category-dialog">
+      <form id="task-category-form">
+        <div class="dialog-heading"><div><p class="eyebrow">任务类别</p><h2 id="task-category-dialog-title">新建自定义类别</h2></div><button class="icon-button" type="button" data-close-dialog="task-category-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+        <label class="field full"><span>类别名称</span><input id="task-category-name" required maxlength="80" placeholder="例如：Melbourne Data Roles"></label>
+        <div class="category-editor-heading"><div><strong>子任务</strong><small id="category-editor-count">0 项</small></div><button class="button button-secondary" id="add-category-task" type="button"><i data-lucide="plus"></i><span>添加子任务</span></button></div>
+        <div class="category-task-editor" id="category-task-editor"></div>
+        <div class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="task-category-dialog">取消</button><button class="button button-primary" type="submit"><i data-lucide="save"></i><span>保存类别</span></button></div>
+      </form>
+    </dialog>
+
+    <dialog id="routine-task-dialog" class="dialog task-dialog">
+      <form id="routine-task-form">
+        <div class="dialog-heading"><div><p class="eyebrow">每日任务</p><h2 id="routine-task-dialog-title">添加待预检任务</h2></div><button class="icon-button" type="button" data-close-dialog="routine-task-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+        <div class="two-fields">
+          <label class="field"><span>平台</span><select id="routine-task-platform"><option value="linkedin">LinkedIn</option><option value="indeed">Indeed</option><option value="seek">SEEK</option></select></label>
+          <label class="field"><span>时间范围</span><select id="routine-task-time"><option value="0">不限</option><option value="1">过去 24 小时</option><option value="3">过去 3 天</option><option value="7">过去 7 天</option><option value="14">过去 14 天</option><option value="30">过去 30 天</option></select></label>
+        </div>
+        <label class="field full"><span>职位关键词</span><input id="routine-task-keyword" required maxlength="160"></label>
+        <label class="field full"><span>地点</span><input id="routine-task-location" required maxlength="120"></label>
+        <div class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="routine-task-dialog">取消</button><button class="button button-primary" type="submit"><i data-lucide="list-plus"></i><span id="routine-task-submit-label">加入待预检</span></button></div>
+      </form>
+    </dialog>
 
     <dialog id="import-dialog" class="dialog">
       <form method="dialog" id="import-form">
@@ -175,7 +311,32 @@
         <div id="review-meta" class="review-meta"></div>
         <label class="field full"><span>职位描述</span><textarea id="review-description" rows="16" placeholder="粘贴模糊职位的 JD 后进行审阅。"></textarea></label>
         <p class="form-note" id="review-note"></p>
-        <div class="dialog-actions"><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" id="submit-review" value="default"><i data-lucide="scan-search"></i><span>审阅 JD</span></button></div>
+        <div class="dialog-actions"><button class="button button-quiet" value="cancel">取消</button><button class="button button-primary" id="submit-review" type="submit" value="default"><i data-lucide="scan-search"></i><span>审阅 JD</span></button></div>
+      </form>
+    </dialog>
+
+    <dialog id="feedback-dialog" class="dialog feedback-dialog">
+      <form id="feedback-form">
+        <div class="dialog-heading"><div><p class="eyebrow">人工反馈</p><h2 id="feedback-title">这个职位没帮助</h2></div><button class="icon-button" type="button" data-close-dialog="feedback-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+        <p class="feedback-copy" id="feedback-job-meta"></p>
+        <fieldset class="feedback-reasons">
+          <legend>原因（可选）</legend>
+          <label><input type="radio" name="feedback-reason" value=""><span><strong>暂不说明</strong><small>只记录这条职位没有帮助</small></span></label>
+          <label><input type="radio" name="feedback-reason" value="CLASSIFICATION_WRONG"><span><strong>分类错了</strong><small>Agent 给出的匹配分类或分数过高</small></span></label>
+          <label><input type="radio" name="feedback-reason" value="NOT_RELEVANT"><span><strong>与我无关</strong><small>这类工作不符合我的求职方向</small></span></label>
+        </fieldset>
+        <label class="field full"><span>补充说明（可选）</span><textarea id="feedback-note" rows="3" maxlength="500" placeholder="例如：职位虽然写 software，但实际是纯销售。"></textarea></label>
+        <p class="form-note">反馈只会调整后续排序和分类，不会删除任何职位。</p>
+        <div class="dialog-actions feedback-dialog-actions"><button class="button button-quiet button-remove-feedback" id="remove-feedback" type="button"><i data-lucide="undo-2"></i><span>撤销没帮助</span></button><span class="dialog-action-spacer"></span><button class="button button-quiet" type="button" data-close-dialog="feedback-dialog">取消</button><button class="button button-primary" id="save-feedback" type="submit"><i data-lucide="thumbs-down"></i><span>保存反馈</span></button></div>
+      </form>
+    </dialog>
+
+    <dialog id="clear-all-history-dialog" class="dialog confirm-dialog">
+      <form method="dialog">
+        <div class="dialog-heading"><div><p class="eyebrow">调试清理</p><h2>清除全部历史记录？</h2></div><button class="icon-button" value="cancel" title="关闭"><i data-lucide="x"></i></button></div>
+        <p class="confirm-copy">将删除 Agent 中的职位、运行、每日任务、预检记录，以及三个 Worker 的已扫描和汇总历史。职业画像、搜索设置和 AI Key 会保留。</p>
+        <p class="form-note warning-note">此操作无法撤销。清理期间会依次打开三个招聘平台，请勿关闭清理窗口。</p>
+        <div class="dialog-actions"><button class="button button-quiet" value="cancel">取消</button><button class="button button-danger" id="confirm-clear-all-history" type="button"><i data-lucide="eraser"></i><span>确认清除</span></button></div>
       </form>
     </dialog>
 

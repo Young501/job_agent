@@ -1,4 +1,5 @@
 import { newId } from "./storage.mjs";
+import { matchingPreferenceSignal } from "./learning.mjs";
 
 const DIRECT_MATCHES = [
   ["software engineering", /\b(software engineer|software developer|developer graduate|programmer)\b/i],
@@ -48,7 +49,7 @@ export function categoryForScore(score, thresholds) {
   return "REJECTED";
 }
 
-export function screenTitle(title, { thresholds }) {
+export function screenTitle(title, { thresholds, preferenceModel = null }) {
   const cleanTitle = normalizeText(title);
   const reject = DIRECT_REJECTS.find(([, expression]) => expression.test(cleanTitle));
   if (reject) {
@@ -68,39 +69,50 @@ export function screenTitle(title, { thresholds }) {
   const matchedAreas = DIRECT_MATCHES
     .filter(([, expression]) => expression.test(cleanTitle))
     .map(([area]) => area);
+  const learnedAvoid = matchingPreferenceSignal(cleanTitle, preferenceModel, "avoid");
+  const learnedTarget = matchingPreferenceSignal(cleanTitle, preferenceModel, "target");
 
   if (matchedAreas.length) {
-    const score = Math.min(96, 86 + (matchedAreas.length - 1) * 4);
+    const score = Math.max(0, Math.min(96, 86 + (matchedAreas.length - 1) * 4 + (learnedTarget ? 8 : 0) - (learnedAvoid ? 40 : 0)));
     return {
-      titleClassification: "CLEAR_MATCH",
+      titleClassification: learnedAvoid ? "AMBIGUOUS" : "CLEAR_MATCH",
       score,
       category: categoryForScore(score, thresholds),
-      reason: `Title directly aligns with ${matchedAreas.join(" and ")}.`,
+      reason: learnedAvoid
+        ? `Title aligns with ${matchedAreas.join(" and ")}, but prior human review flagged “${learnedAvoid}” as unhelpful.`
+        : `Title directly aligns with ${matchedAreas.join(" and ")}${learnedTarget ? ` and the learned preference “${learnedTarget}”` : ""}.`,
       matchedAreas,
-      concerns: [],
+      concerns: learnedAvoid ? [`human-review preference: ${learnedAvoid}`] : [],
       jdReviewed: false,
-      screeningStatus: "TITLE_SCREENED",
-      engine: "local-rules"
+      screeningStatus: learnedAvoid ? "NEEDS_JD_REVIEW" : "TITLE_SCREENED",
+      engine: learnedAvoid || learnedTarget ? "local-rules+feedback" : "local-rules",
+      preferenceVersion: learnedAvoid || learnedTarget ? Number(preferenceModel?.version) || 0 : null
     };
   }
 
   const earlyCareer = /\b(graduate|intern|junior|entry[- ]?level|cadet|associate)\b/i.test(cleanTitle);
+  const score = Math.max(0, Math.min(100, (earlyCareer ? 58 : 45) + (learnedTarget ? 18 : 0) - (learnedAvoid ? 40 : 0)));
   return {
     titleClassification: "AMBIGUOUS",
-    score: earlyCareer ? 58 : 45,
-    category: categoryForScore(earlyCareer ? 58 : 45, thresholds),
-    reason: earlyCareer
-      ? "Early-career title is broad; review the job description before deciding."
-      : "Title does not establish a clear technology fit; review the job description.",
+    score,
+    category: categoryForScore(score, thresholds),
+    reason: learnedAvoid
+      ? `Prior human review flagged “${learnedAvoid}” as unhelpful, so this title was deprioritized.`
+      : learnedTarget
+        ? `Title contains the learned preference “${learnedTarget}”; review the job description to confirm the fit.`
+        : earlyCareer
+          ? "Early-career title is broad; review the job description before deciding."
+          : "Title does not establish a clear technology fit; review the job description.",
     matchedAreas: [],
-    concerns: ["role focus is not explicit in the title"],
+    concerns: ["role focus is not explicit in the title", ...(learnedAvoid ? [`human-review preference: ${learnedAvoid}`] : [])],
     jdReviewed: false,
-    screeningStatus: "NEEDS_JD_REVIEW",
-    engine: "local-rules"
+    screeningStatus: learnedAvoid && score < thresholds.lowMatch ? "TITLE_SCREENED" : "NEEDS_JD_REVIEW",
+    engine: learnedAvoid || learnedTarget ? "local-rules+feedback" : "local-rules",
+    preferenceVersion: learnedAvoid || learnedTarget ? Number(preferenceModel?.version) || 0 : null
   };
 }
 
-export function normalizeJob(input, { thresholds, runId = null, duplicateOf = null } = {}) {
+export function normalizeJob(input, { thresholds, runId = null, duplicateOf = null, preferenceModel = null } = {}) {
   const source = ["linkedin", "indeed", "seek", "manual"].includes(String(input.source).toLowerCase())
     ? String(input.source).toLowerCase()
     : "manual";
@@ -109,6 +121,7 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
 
   const jobUrl = normalizeText(input.jobUrl || input.link) || null;
   const sourceJobId = normalizeText(input.sourceJobId || input.jobId || input.id) || null;
+  const postedWithinDays = Number(input.searchPostedWithinDays);
   return {
     id: newId("job"),
     source,
@@ -122,9 +135,13 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
     discoveredAt: new Date().toISOString(),
     searchKeyword: normalizeText(input.searchKeyword || input.keyword) || null,
     searchLocation: normalizeText(input.searchLocation) || null,
+    searchPostedWithinDays: Number.isFinite(postedWithinDays) && postedWithinDays >= 0 ? postedWithinDays : null,
+    runTaskId: normalizeText(input.runTaskId || input.taskId) || null,
+    routineTaskId: normalizeText(input.routineTaskId) || null,
     runId,
     duplicateOf,
-    screening: screenTitle(title, { thresholds })
+    screening: screenTitle(title, { thresholds, preferenceModel }),
+    feedback: null
   };
 }
 
@@ -167,6 +184,7 @@ export function localProfileDraft(resumeText, sourceName = "resume") {
       workTypes: [],
       exclusions: []
     },
+    candidateItems: [],
     source: "local-rules"
   };
 }
@@ -174,8 +192,83 @@ export function localProfileDraft(resumeText, sourceName = "resume") {
 const stringArray = (value, limit = 30) =>
   unique((Array.isArray(value) ? value : []).map((item) => normalizeText(item)).filter(Boolean)).slice(0, limit);
 
+const PROFILE_SUGGESTION_SECTIONS = new Set([
+  "targetRoles",
+  "focusAreas",
+  "skills",
+  "education",
+  "locations",
+  "workTypes",
+  "exclusions"
+]);
+
+export function suggestProfileSection(value) {
+  const text = normalizeText(value).toLowerCase();
+  if (!text) return "focusAreas";
+  if (/\b(bachelor|master|phd|doctorate|degree|diploma|certificate|university|college|unsw|rmit|monash)\b|\b(19|20)\d{2}\b/i.test(text)) return "education";
+  if (/\b(developer|engineer|analyst|consultant|intern|graduate program|specialist|architect)\b/i.test(text)) return "targetRoles";
+  if (/\b(remote|hybrid|on[- ]?site|full[- ]?time|part[- ]?time|contract|casual|internship)\b/i.test(text)) return "workTypes";
+  if (/\b(avoid|exclude|not interested|do not target|no sales|no support)\b/i.test(text)) return "exclusions";
+  if (/\b(melbourne|sydney|brisbane|perth|adelaide|canberra|australia|victoria|new south wales|queensland|nsw|vic|qld|wa|sa|act)\b/i.test(text)) return "locations";
+  if (/\b(python|java(script)?|typescript|react|next\.?js|node\.?js|sql|firebase|tensorflow|pytorch|scikit|git|aws|azure|gcp|docker|kubernetes|c\+\+|c#)\b/i.test(text)) return "skills";
+  return "focusAreas";
+}
+
+export function normalizeEducationEntries(value) {
+  const entries = stringArray(value, 60);
+  const normalized = [];
+  let pending = [];
+  const flush = () => {
+    if (!pending.length) return;
+    normalized.push(pending.join(" | "));
+    pending = [];
+  };
+
+  for (const entry of entries) {
+    const hasDegree = /\b(bachelor|master|phd|doctorate|degree|diploma|certificate|bsc|msc|mba|mit)\b/i.test(entry);
+    const hasInstitution = /\b(university|college|institute|school|unsw|rmit|monash)\b/i.test(entry);
+    const hasDate = /\b(?:19|20)\d{2}(?:\s*[-/]\s*(?:19|20)?\d{2}|\s*(?:to|present|current))?\b/i.test(entry);
+
+    if (hasDegree) {
+      flush();
+      pending = [entry];
+      if (hasInstitution && hasDate) flush();
+      continue;
+    }
+    if (pending.length && (hasInstitution || hasDate)) {
+      pending.push(entry);
+      if (hasDate) flush();
+      continue;
+    }
+    flush();
+    normalized.push(entry);
+  }
+  flush();
+  return unique(normalized);
+}
+
+function normalizeCandidateItems(input) {
+  const suppliedSuggestions = input?.candidateSuggestions && typeof input.candidateSuggestions === "object"
+    ? input.candidateSuggestions
+    : {};
+  const rows = Array.isArray(input?.candidateItems) ? input.candidateItems : [];
+  const items = [];
+  const suggestions = {};
+  for (const row of rows) {
+    const value = normalizeText(typeof row === "string" ? row : row?.value ?? row?.label);
+    if (!value || items.some((item) => item.toLowerCase() === value.toLowerCase())) continue;
+    const suppliedSection = typeof row === "object" ? row?.suggestedSection ?? row?.suggestedCategory : suppliedSuggestions[value];
+    const section = PROFILE_SUGGESTION_SECTIONS.has(suppliedSection) ? suppliedSection : suggestProfileSection(value);
+    items.push(value);
+    suggestions[value] = section;
+    if (items.length >= 80) break;
+  }
+  return { items, suggestions };
+}
+
 export function validateProfileDraft(input) {
   if (!input || typeof input !== "object") throw new Error("Profile draft must be an object.");
+  const candidates = normalizeCandidateItems(input);
   const profile = {
     name: normalizeText(input.name) || "Career profile",
     headline: normalizeText(input.headline) || "Early-career technology candidate",
@@ -183,18 +276,20 @@ export function validateProfileDraft(input) {
     targetRoles: stringArray(input.targetRoles),
     focusAreas: stringArray(input.focusAreas),
     skills: stringArray(input.skills, 60),
-    education: stringArray(input.education),
+    education: normalizeEducationEntries(input.education),
     preferences: {
       locations: stringArray(input.preferences?.locations),
       workTypes: stringArray(input.preferences?.workTypes),
       exclusions: stringArray(input.preferences?.exclusions)
-    }
+    },
+    candidateItems: candidates.items
   };
+  if (candidates.items.length) profile.candidateSuggestions = candidates.suggestions;
   if (!profile.summary) throw new Error("Profile summary is required.");
   return profile;
 }
 
-export function localJdScreen(job, profile, thresholds) {
+export function localJdScreen(job, profile, thresholds, preferenceModel = null) {
   const description = normalizeText(job.description);
   if (!description) throw new Error("A job description is required for JD review.");
   const lower = ` ${description.toLowerCase()} `;
@@ -206,8 +301,12 @@ export function localJdScreen(job, profile, thresholds) {
   if (/\b([5-9]|10)\+? years?\b|\bextensive leadership\b/i.test(description)) concerns.push("experience requirement may exceed an early-career role");
   if (/\b(permanent resident|citizen(ship)? required|security clearance)\b/i.test(description)) concerns.push("eligibility requirement needs confirmation");
   if (/\b(nursing|teaching|civil engineering|accounting|construction)\b/i.test(description)) concerns.push("JD contains a potential non-technology discipline mismatch");
+  const learnedAvoid = matchingPreferenceSignal(job.title, preferenceModel, "avoid");
+  const learnedTarget = matchingPreferenceSignal(job.title, preferenceModel, "target");
+  if (learnedAvoid) concerns.push(`human-review preference: ${learnedAvoid}`);
 
-  let score = 50 + Math.min(30, matchedAreas.length * 8) + Math.min(15, profileSkills.length * 3) - concerns.length * 12;
+  let score = 50 + Math.min(30, matchedAreas.length * 8) + Math.min(15, profileSkills.length * 3) - concerns.length * 12
+    + (learnedTarget ? 10 : 0) - (learnedAvoid ? 20 : 0);
   if (!matchedAreas.length) score -= 20;
   score = Math.max(0, Math.min(100, score));
   const category = categoryForScore(score, thresholds);
@@ -223,7 +322,8 @@ export function localJdScreen(job, profile, thresholds) {
     concerns,
     jdReviewed: true,
     screeningStatus: "JD_SCREENED",
-    engine: "local-rules"
+    engine: learnedAvoid || learnedTarget ? "local-rules+feedback" : "local-rules",
+    preferenceVersion: learnedAvoid || learnedTarget ? Number(preferenceModel?.version) || 0 : null
   };
 }
 
