@@ -95,13 +95,15 @@ try {
   assert.equal(workerResponse.ok, true);
   assert.match(workerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(workerScript, /Job Agent Worker - SEEK/);
-  assert.match(workerScript, /@version\s+2\.2\.1/);
+  assert.match(workerScript, /@version\s+2\.2\.2/);
   assert.match(workerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
   assert.match(workerScript, /@updateURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/seek\/seek-agent-worker\.user\.js/);
   assert.match(workerScript, /@downloadURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/seek\/seek-agent-worker\.user\.js/);
   assert.match(workerScript, /preflight\/pending/);
   assert.match(workerScript, /agentWaitAndClickText/);
   assert.match(workerScript, /agentSeekKeywordForSearch/);
+  assert.match(workerScript, /agentSearchKeyword/);
+  assert.match(workerScript, /agentIncludeKeywordText/);
   assert.match(workerScript, /agentNormalizeSeekKeyword/);
   assert.match(workerScript, /\^graduate\$/i);
   assert.match(workerScript, /agentWaitForSeekSearchMatch/);
@@ -126,8 +128,10 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+2\.2\.1/);
+  assert.match(indeedWorkerScript, /@version\s+2\.2\.2/);
   assert.match(indeedWorkerScript, /preflight\/next-launch/);
+  assert.match(indeedWorkerScript, /agentSearchKeyword/);
+  assert.match(indeedWorkerScript, /agentIncludeKeywordText/);
   assert.match(indeedWorkerScript, /worker\/next-platform-launch/);
   assert.match(indeedWorkerScript, /@updateURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/indeed\/indeed-agent-worker\.user\.js/);
   assert.match(indeedWorkerScript, /@downloadURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/indeed\/indeed-agent-worker\.user\.js/);
@@ -148,7 +152,9 @@ try {
   assert.match(linkedInWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(linkedInWorkerScript, /@name\s+Job Agent Worker - LinkedIn/);
   assert.match(linkedInWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(linkedInWorkerScript, /@version\s+2\.2\.1/);
+  assert.match(linkedInWorkerScript, /@version\s+2\.2\.2/);
+  assert.match(linkedInWorkerScript, /agentSearchKeyword/);
+  assert.match(linkedInWorkerScript, /agentIncludeKeywordText/);
   assert.match(linkedInWorkerScript, /preflight\/next-launch/);
   assert.match(linkedInWorkerScript, /worker\/next-platform-launch/);
   assert.match(linkedInWorkerScript, /@updateURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/linkedin\/linkedin-agent-worker\.user\.js/);
@@ -189,6 +195,7 @@ try {
   assert.match(dashboardHtml, /id="preflight-selected-categories"/);
   assert.match(dashboardHtml, /id="import-selected-categories"/);
   assert.match(dashboardHtml, /id="task-category-dialog"/);
+  assert.match(dashboardHtml, /多个备选词用逗号分隔/);
   const dashboardScriptResponse = await fetch("http://127.0.0.1:" + port + "/app.js");
   const dashboardScript = await dashboardScriptResponse.text();
   assert.match(dashboardScript, /data-install-worker/);
@@ -222,6 +229,19 @@ try {
   assert.match(dashboardScript, /prepareSelectedCategories/);
   assert.match(dashboardScript, /\/api\/task-categories\/prepare/);
   assert.match(dashboardScript, /data-category-select/);
+
+  const normalizedKeywordValidation = await request("/api/task-validations", {
+    platform: "linkedin",
+    keyword: "intern OR internship",
+    location: "Melbourne, Victoria, Australia",
+    postedWithinDays: 7
+  });
+  assert.equal(normalizedKeywordValidation.validation.keyword, "intern, internship");
+  await request("/api/task-validations/" + normalizedKeywordValidation.validation.id, undefined, "DELETE");
+
+  const keywordBootstrap = await request("/api/bootstrap");
+  assert.ok(keywordBootstrap.taskCategories.flatMap((category) => category.tasks)
+    .every((task) => !/\sOR\s/i.test(task.keyword)));
 
   const savedAiConfig = await request("/api/ai-config", {
     baseUrl: "https://example.invalid/v1",

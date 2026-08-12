@@ -246,7 +246,7 @@
               <h2>浏览器 Worker 安装</h2>
               <p>将三份独立 Worker 安装到 Tampermonkey，供预检与每日任务调用。</p>
             </div>
-            <span class="setup-version"><i data-lucide="shield-check"></i><span>当前版本 v2.2.1</span></span>
+            <span class="setup-version"><i data-lucide="shield-check"></i><span>当前版本 v2.2.2</span></span>
           </div>
 
           <section class="setup-guide" aria-labelledby="setup-guide-title">
@@ -289,7 +289,7 @@
           <label class="field"><span>平台</span><select id="routine-task-platform"><option value="linkedin">LinkedIn</option><option value="indeed">Indeed</option><option value="seek">SEEK</option></select></label>
           <label class="field"><span>时间范围</span><select id="routine-task-time"><option value="0">不限</option><option value="1">过去 24 小时</option><option value="3">过去 3 天</option><option value="7">过去 7 天</option><option value="14">过去 14 天</option><option value="30">过去 30 天</option></select></label>
         </div>
-        <label class="field full"><span>职位关键词</span><input id="routine-task-keyword" required maxlength="160"></label>
+        <label class="field full"><span>职位关键词</span><input id="routine-task-keyword" required maxlength="160" placeholder="例如：intern, internship"><small>多个备选词用逗号分隔。平台搜索第一个词，Worker 按任一备选词筛选。</small></label>
         <label class="field full"><span>地点</span><input id="routine-task-location" required maxlength="120"></label>
         <div class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="routine-task-dialog">取消</button><button class="button button-primary" type="submit"><i data-lucide="list-plus"></i><span id="routine-task-submit-label">加入待预检</span></button></div>
       </form>

@@ -21,7 +21,7 @@
     "name": "LinkedIn Intern",
     "builtin": true,
     "tasks": [
-      { "id": "preset_li_intern_melbourne", "platform": "linkedin", "keyword": "intern OR internship", "location": "Melbourne, Victoria, Australia", "postedWithinDays": 7 }
+      { "id": "preset_li_intern_melbourne", "platform": "linkedin", "keyword": "intern, internship", "location": "Melbourne, Victoria, Australia", "postedWithinDays": 7 }
     ]
   },
   {
@@ -47,7 +47,7 @@
     "name": "SEEK Intern · 时间不限",
     "builtin": true,
     "tasks": [
-      { "id": "preset_seek_intern_any_mel", "platform": "seek", "keyword": "intern OR internship", "location": "All Melbourne VIC", "postedWithinDays": 0 }
+      { "id": "preset_seek_intern_any_mel", "platform": "seek", "keyword": "intern, internship", "location": "All Melbourne VIC", "postedWithinDays": 0 }
     ]
   },
   {
@@ -55,7 +55,7 @@
     "name": "SEEK Intern · 过去 7 天",
     "builtin": true,
     "tasks": [
-      { "id": "preset_seek_intern_week_mel", "platform": "seek", "keyword": "intern OR internship", "location": "All Melbourne VIC", "postedWithinDays": 7 }
+      { "id": "preset_seek_intern_week_mel", "platform": "seek", "keyword": "intern, internship", "location": "All Melbourne VIC", "postedWithinDays": 7 }
     ]
   },
   {
@@ -81,7 +81,7 @@
     "name": "Indeed Intern · 时间不限",
     "builtin": true,
     "tasks": [
-      { "id": "preset_indeed_intern_any_mel", "platform": "indeed", "keyword": "intern OR internship", "location": "Melbourne VIC", "postedWithinDays": 0 }
+      { "id": "preset_indeed_intern_any_mel", "platform": "indeed", "keyword": "intern, internship", "location": "Melbourne VIC", "postedWithinDays": 0 }
     ]
   },
   {
@@ -89,7 +89,7 @@
     "name": "Indeed Intern · 过去 7 天",
     "builtin": true,
     "tasks": [
-      { "id": "preset_indeed_intern_week_mel", "platform": "indeed", "keyword": "intern OR internship", "location": "Melbourne VIC", "postedWithinDays": 7 }
+      { "id": "preset_indeed_intern_week_mel", "platform": "indeed", "keyword": "intern, internship", "location": "Melbourne VIC", "postedWithinDays": 7 }
     ]
   }
 ]

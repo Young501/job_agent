@@ -66,9 +66,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v2.2.1", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v2.2.1", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v2.2.1", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v2.2.2", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v2.2.2", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v2.2.2", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -812,7 +812,7 @@ function armHistoryResetTimeout() {
     state.historyReset.window?.close();
     state.historyReset.window = null;
     renderHistoryResetControl();
-    toast("Worker 历史清理未在 45 秒内完成。请确认三份 Worker 已更新到 v2.2.1，然后重试。", "error");
+    toast("Worker 历史清理未在 45 秒内完成。请确认三份 Worker 已更新到 v2.2.2，然后重试。", "error");
   }, 45_000);
 }
 
@@ -1271,7 +1271,7 @@ function categoryTaskEditorRow(task = {}) {
   const timeOptions = Object.entries(postedWithinLabels).map(([value, label]) => '<option value="' + value + '"' + (postedWithinDays === Number(value) ? " selected" : "") + '>' + label + '</option>').join("");
   return '<div class="category-task-editor-row" data-category-task-id="' + escapeHtml(task.id || "") + '">'
     + '<label class="field"><span>平台</span><select data-category-task-field="platform">' + platformOptions + '</select></label>'
-    + '<label class="field category-task-keyword"><span>关键词</span><input data-category-task-field="keyword" required maxlength="160" value="' + escapeHtml(task.keyword || "") + '"></label>'
+    + '<label class="field category-task-keyword"><span>关键词（逗号表示任一）</span><input data-category-task-field="keyword" required maxlength="160" placeholder="intern, internship" value="' + escapeHtml(task.keyword || "") + '"></label>'
     + '<label class="field category-task-location"><span>地点</span><input data-category-task-field="location" required maxlength="120" value="' + escapeHtml(task.location || "") + '"></label>'
     + '<label class="field"><span>时间</span><select data-category-task-field="postedWithinDays">' + timeOptions + '</select></label>'
     + '<button class="icon-button destructive category-task-remove" type="button" data-remove-category-task title="删除子任务"><i data-lucide="trash-2"></i></button>'

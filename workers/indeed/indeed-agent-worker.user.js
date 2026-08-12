@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.1
+// @version      2.2.2
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "2.2.1";
+    const APP_VERSION = "2.2.2";
     const SITE = getSiteAdapter();
     if (!SITE) return;
 
@@ -717,7 +717,10 @@
     function findLine(lines, pattern) { return lines.find((line) => pattern.test(line)) || ""; }
     function cleanText(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
     function normalizeText(value) { return cleanText(String(value || "").normalize("NFKC")).toLocaleLowerCase(); }
-    function parseRules(value) { return [...new Set(String(value || "").split(/[\n,，]+/).map(normalizeText).filter(Boolean))]; }
+    function splitKeywordAlternatives(value) { return [...new Set(String(value || "").split(/[\n,，]+|\s+\bOR\b\s+/i).map(cleanText).filter(Boolean))]; }
+    function parseRules(value) { return splitKeywordAlternatives(value).map(normalizeText); }
+    function agentSearchKeyword(value) { return splitKeywordAlternatives(value)[0] || cleanText(value); }
+    function agentIncludeKeywordText(value) { return splitKeywordAlternatives(value).join("\n"); }
     function canonicalSessionKey(job) { return historyKeysForJob(job)[0] || ""; }
     function historyCount() {
         const jobs = new Set();
@@ -898,7 +901,7 @@
 
     function agentTaskUrl(task) {
         const url = new URL("https://au.indeed.com/jobs");
-        url.searchParams.set("q", task.keyword);
+        url.searchParams.set("q", agentSearchKeyword(task.keyword));
         url.searchParams.set("l", task.location);
         if (Number(task.postedWithinDays) > 0) url.searchParams.set("fromage", String(task.postedWithinDays));
         url.searchParams.set("jobAgentWorker", "1");
@@ -1004,9 +1007,10 @@
         while (!ui && Date.now() < deadline) await sleep(300);
         if (!ui) return agentSubmit("failed", "Job results did not load in the worker tab.", { results: [] });
         agentStartedTaskId = agentTask.id;
-        ui.include.value = agentTask.keyword;
-        settings = { ...settings, include: agentTask.keyword };
-        agentShowOverlay("Indeed 正在运行", `正在搜索“${agentTask.keyword}” · ${agentTask.location}。请勿操作此窗口。`);
+        const includeKeywords = agentIncludeKeywordText(agentTask.keyword);
+        ui.include.value = includeKeywords;
+        settings = { ...settings, include: includeKeywords };
+        agentShowOverlay("Indeed 正在运行", `平台搜索“${agentSearchKeyword(agentTask.keyword)}” · 包含 ${parseRules(agentTask.keyword).join("、")} · ${agentTask.location}。请勿操作此窗口。`);
         agentStartHeartbeat();
         await startScan();
     }
@@ -1285,11 +1289,12 @@
     }
 
     async function agentStartIndeedOfficialSearch(validation) {
+        const searchKeyword = agentSearchKeyword(validation.keyword);
         const keywordInput = await agentWaitFor(["input[name='q']", "input[placeholder*='job title' i]"]);
         const locationInput = await agentWaitFor(["input[name='l']", "input[placeholder*='city' i]"]);
         if (!keywordInput || !locationInput) throw new Error("Indeed primary search inputs were not found.");
-        if (!agentSetInput(keywordInput, validation.keyword)) throw new Error("Keyword input could not retain its value.");
-        log(`预检：已填写关键词 = ${validation.keyword}`);
+        if (!agentSetInput(keywordInput, searchKeyword)) throw new Error("Keyword input could not retain its value.");
+        log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
         await sleep(1000);
         if (!agentSetInput(locationInput, validation.location)) throw new Error("Location input could not retain its value.");
         log(`预检：已填写地点 = ${validation.location}`);
@@ -1302,7 +1307,7 @@
         setStatus("Job Agent: 正在提交搜索条件...");
         log("预检：正在打开 Indeed 官方搜索结果页。");
         const searchUrl = new URL("https://au.indeed.com/jobs");
-        searchUrl.searchParams.set("q", validation.keyword.trim());
+        searchUrl.searchParams.set("q", searchKeyword);
         searchUrl.searchParams.set("l", validation.location.trim());
         window.location.assign(searchUrl.href);
         return true;
@@ -1349,8 +1354,9 @@
                 const location = await agentWaitFor(["input[name='l']", "input[placeholder*='city' i]"]);
                 const submit = await agentWaitFor(["form button[type='submit']", "button[type='submit']"]);
                 if (!keyword || !location || !submit) throw new Error("Indeed search controls were not found.");
-    agentSetInput(keyword, validation.keyword);
-    log(`预检：已填写关键词 = ${validation.keyword}`);
+    const searchKeyword = agentSearchKeyword(validation.keyword);
+    agentSetInput(keyword, searchKeyword);
+    log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
     await sleep(1000);
     agentSetInput(location, validation.location);
     log(`预检：已填写地点 = ${validation.location}`);
@@ -1361,7 +1367,7 @@
                 await sleep(1100);
             }
             const searchState = agentIndeedSearchState();
-            if (searchState.keyword.toLowerCase() !== validation.keyword.trim().toLowerCase() || searchState.location.toLowerCase() !== validation.location.trim().toLowerCase()) {
+            if (searchState.keyword.toLowerCase() !== agentSearchKeyword(validation.keyword).toLowerCase() || searchState.location.toLowerCase() !== validation.location.trim().toLowerCase()) {
                 throw new Error(`关键词或地点未正确应用。页面当前显示：关键词“${searchState.keyword || "空"}”、地点“${searchState.location || "空"}”。`);
             }
             log("预检：关键词和地点已确认。");

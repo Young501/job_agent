@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - SEEK
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.1
+// @version      2.2.2
 // @description  Job Agent worker for SEEK. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "2.2.1";
+    const APP_VERSION = "2.2.2";
     const SITE = getSiteAdapter();
     if (!SITE) return;
 
@@ -668,7 +668,10 @@
     function findLine(lines, pattern) { return lines.find((line) => pattern.test(line)) || ""; }
     function cleanText(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
     function normalizeText(value) { return cleanText(String(value || "").normalize("NFKC")).toLocaleLowerCase(); }
-    function parseRules(value) { return [...new Set(String(value || "").split(/[\n,，]+/).map(normalizeText).filter(Boolean))]; }
+    function splitKeywordAlternatives(value) { return [...new Set(String(value || "").split(/[\n,，]+|\s+\bOR\b\s+/i).map(cleanText).filter(Boolean))]; }
+    function parseRules(value) { return splitKeywordAlternatives(value).map(normalizeText); }
+    function agentSearchKeyword(value) { return splitKeywordAlternatives(value)[0] || cleanText(value); }
+    function agentIncludeKeywordText(value) { return splitKeywordAlternatives(value).join("\n"); }
     function canonicalSessionKey(job) { return historyKeysForJob(job)[0] || ""; }
     function historyCount() {
         const jobs = new Set();
@@ -849,7 +852,7 @@
 
     function agentTaskUrl(task) {
         const url = new URL("https://www.seek.com.au/jobs");
-        url.searchParams.set("keywords", task.keyword);
+        url.searchParams.set("keywords", agentSeekKeywordForSearch(agentSearchKeyword(task.keyword)));
         url.searchParams.set("where", task.location);
         if (Number(task.postedWithinDays) > 0) url.searchParams.set("daterange", String(task.postedWithinDays));
         url.searchParams.set("jobAgentWorker", "1");
@@ -955,9 +958,10 @@
         while (!ui && Date.now() < deadline) await sleep(300);
         if (!ui) return agentSubmit("failed", "Job results did not load in the worker tab.", { results: [] });
         agentStartedTaskId = agentTask.id;
-        ui.include.value = agentTask.keyword;
-        settings = { ...settings, include: agentTask.keyword };
-        agentShowOverlay("SEEK 正在运行", `正在搜索“${agentTask.keyword}” · ${agentTask.location}。请勿操作此窗口。`);
+        const includeKeywords = agentIncludeKeywordText(agentTask.keyword);
+        ui.include.value = includeKeywords;
+        settings = { ...settings, include: includeKeywords };
+        agentShowOverlay("SEEK 正在运行", `平台搜索“${agentSearchKeyword(agentTask.keyword)}” · 包含 ${parseRules(agentTask.keyword).join("、")} · ${agentTask.location}。请勿操作此窗口。`);
         agentStartHeartbeat();
         await startScan();
     }
@@ -1186,7 +1190,7 @@
         const keyword = agentFirst(["input[data-automation='search-keyword']", "input[name='keywords']", "input[placeholder*='keywords' i]"]);
         const location = agentFirst(["input[data-automation='search-location']", "input[data-automation='SearchBar__Where']", "input[placeholder*='suburb' i]", "input[placeholder*='location' i]"]);
         return Boolean(keyword && location
-            && agentNormalizeSeekKeyword(keyword.value) === agentNormalizeSeekKeyword(validation.keyword)
+            && agentNormalizeSeekKeyword(keyword.value) === agentNormalizeSeekKeyword(agentSearchKeyword(validation.keyword))
             && location.value.trim().toLowerCase().includes(validation.location.trim().toLowerCase()));
     }
 
@@ -1242,11 +1246,12 @@
     }
 
     async function agentStartSeekOfficialSearch(validation) {
+        const searchKeyword = agentSearchKeyword(validation.keyword);
         const keywordInput = await agentWaitFor(["input[name='keywords']", "input[data-automation='search-keyword']", "input[placeholder*='looking for' i]"]);
         const locationInput = await agentWaitFor(["input[name='where']", "input[data-automation='SearchBar__Where']", "input[placeholder*='suburb' i]", "input[placeholder*='location' i]"]);
         if (!keywordInput || !locationInput) throw new Error("SEEK primary search inputs were not found.");
-        if (!agentSetInput(keywordInput, validation.keyword)) throw new Error("Keyword input could not retain its value.");
-        log(`预检：已填写关键词 = ${validation.keyword}`);
+        if (!agentSetInput(keywordInput, searchKeyword)) throw new Error("Keyword input could not retain its value.");
+        log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
         await sleep(1000);
         if (!agentSetInput(locationInput, validation.location)) throw new Error("Location input could not retain its value.");
         log(`预检：已填写地点 = ${validation.location}`);
@@ -1259,7 +1264,7 @@
         setStatus("Job Agent: 正在提交搜索条件...");
         log("预检：正在打开 SEEK 官方搜索结果页。");
         const searchUrl = new URL("https://www.seek.com.au/jobs");
-        searchUrl.searchParams.set("keywords", agentSeekKeywordForSearch(validation.keyword));
+        searchUrl.searchParams.set("keywords", agentSeekKeywordForSearch(searchKeyword));
         searchUrl.searchParams.set("where", validation.location.trim());
         window.location.assign(searchUrl.href);
         return true;
@@ -1306,8 +1311,9 @@
                 const location = await agentWaitFor(["input[data-automation='search-location']", "input[data-automation='SearchBar__Where']", "input[placeholder*='suburb' i]", "input[placeholder*='location' i]"]);
                 const submit = await agentWaitFor(["button[data-automation='searchButton']", "button[data-automation='search-submit']", "form button[type='submit']", "button[type='submit']"]);
                 if (!keyword || !location || !submit) throw new Error("SEEK search controls were not found.");
-    agentSetInput(keyword, validation.keyword);
-    log(`预检：已填写关键词 = ${validation.keyword}`);
+    const searchKeyword = agentSearchKeyword(validation.keyword);
+    agentSetInput(keyword, searchKeyword);
+    log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
     await sleep(1000);
     agentSetInput(location, validation.location);
     log(`预检：已填写地点 = ${validation.location}`);

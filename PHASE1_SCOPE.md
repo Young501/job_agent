@@ -23,6 +23,9 @@ The daily workflow is:
 2. Before the task exists in the routine, open that platform's worker to fill
    its real search controls, select the platform's date control, and submit a
    test search. Unsupported or unapplied date choices fail validation.
+   Comma-separated keyword alternatives use the first term for the platform
+   query and all terms as local include rules; raw boolean `OR` is normalized
+   to this representation for backward compatibility.
 3. Start a run from only the validated daily tasks. Tasks run strictly in
    sequence across all platforms.
 4. Open one normal browser Worker tab for the run. The tab navigates between

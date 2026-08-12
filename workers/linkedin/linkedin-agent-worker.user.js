@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - LinkedIn
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.1
+// @version      2.2.2
 // @description  Job Agent worker for LinkedIn. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
@@ -20,7 +20,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "2.2.1";
+    const APP_VERSION = "2.2.2";
     const HISTORY_KEY = "linkedin_seen_history_v19";
     const LEGACY_HISTORY_KEY = "linkedin_opened_history_v2";
     const SETTINGS_KEY = "linkedin_scan_settings_v19";
@@ -2505,12 +2505,23 @@ render();
         }
     }
 
-    function parseRules(text) {
+    function splitKeywordAlternatives(text) {
         return Array.from(new Set(String(text || "")
-            .split(/[\n,，]+/)
+            .split(/[\n,，]+|\s+\bOR\b\s+/i)
             .map((line) => line.replace(/\/\/.*$/, "").trim())
-            .map(normalizeText)
             .filter(Boolean)));
+    }
+
+    function parseRules(text) {
+        return splitKeywordAlternatives(text).map(normalizeText);
+    }
+
+    function agentSearchKeyword(value) {
+        return splitKeywordAlternatives(value)[0] || String(value || "").trim();
+    }
+
+    function agentIncludeKeywordText(value) {
+        return splitKeywordAlternatives(value).join("\n");
     }
 
     function normalizeText(value) {
@@ -2792,7 +2803,7 @@ render();
 
     function agentTaskUrl(task) {
         const url = new URL("https://www.linkedin.com/jobs/search/");
-        url.searchParams.set("keywords", task.keyword);
+        url.searchParams.set("keywords", agentSearchKeyword(task.keyword));
         url.searchParams.set("location", task.location);
         if (Number(task.postedWithinDays) > 0) url.searchParams.set("f_TPR", `r${Number(task.postedWithinDays) * 86400}`);
         url.searchParams.set("jobAgentWorker", "1");
@@ -2898,9 +2909,10 @@ render();
         while (!ui && Date.now() < deadline) await sleep(300);
         if (!ui) return agentSubmit("failed", "Job results did not load in the worker tab.", { results: [] });
         agentStartedTaskId = agentTask.id;
-        ui.target.value = agentTask.keyword;
-        settings = { ...settings, target: agentTask.keyword };
-        agentShowOverlay("LinkedIn 正在运行", `正在搜索“${agentTask.keyword}” · ${agentTask.location}。请勿操作此窗口。`);
+        const includeKeywords = agentIncludeKeywordText(agentTask.keyword);
+        ui.target.value = includeKeywords;
+        settings = { ...settings, target: includeKeywords };
+        agentShowOverlay("LinkedIn 正在运行", `平台搜索“${agentSearchKeyword(agentTask.keyword)}” · 包含 ${parseRules(agentTask.keyword).join("、")} · ${agentTask.location}。请勿操作此窗口。`);
         agentStartHeartbeat();
         await startScan();
     }
@@ -3058,7 +3070,7 @@ render();
 
     function agentLinkedInSearchMatches(validation) {
         const current = agentLinkedInPrimarySearchState();
-        return current.keyword.toLowerCase() === validation.keyword.trim().toLowerCase()
+        return current.keyword.toLowerCase() === agentSearchKeyword(validation.keyword).toLowerCase()
             && current.location.toLowerCase() === validation.location.trim().toLowerCase();
     }
 
@@ -3193,11 +3205,12 @@ render();
     }
 
     async function agentStartLinkedInOfficialSearch(validation) {
+        const searchKeyword = agentSearchKeyword(validation.keyword);
         const keywordInput = await agentWaitFor(LINKEDIN_KEYWORD_INPUT_SELECTORS);
         const locationInput = await agentWaitFor(LINKEDIN_LOCATION_INPUT_SELECTORS);
         if (!keywordInput || !locationInput) throw new Error("LinkedIn primary search inputs were not found.");
-        if (!agentSetInput(keywordInput, validation.keyword)) throw new Error("Keyword input could not retain its value.");
-        log(`预检：已填写关键词 = ${validation.keyword}`);
+        if (!agentSetInput(keywordInput, searchKeyword)) throw new Error("Keyword input could not retain its value.");
+        log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
         await sleep(1000);
         if (!agentSetInput(locationInput, validation.location)) throw new Error("Location input could not retain its value.");
         log(`预检：已填写地点 = ${validation.location}`);
@@ -3210,7 +3223,7 @@ render();
         setStatus("Job Agent: 正在提交搜索条件...");
         log("预检：正在打开 LinkedIn 官方搜索结果页。");
         const searchUrl = new URL("https://www.linkedin.com/jobs/search/");
-        searchUrl.searchParams.set("keywords", validation.keyword.trim());
+        searchUrl.searchParams.set("keywords", searchKeyword);
         searchUrl.searchParams.set("location", validation.location.trim());
         searchUrl.searchParams.set("origin", "JOB_SEARCH_PAGE_SEARCH_BUTTON");
         searchUrl.searchParams.set("refresh", "true");
@@ -3247,8 +3260,9 @@ render();
                 const primaryKeyword = await agentWaitFor(LINKEDIN_KEYWORD_INPUT_SELECTORS);
                 const primaryLocation = await agentWaitFor(LINKEDIN_LOCATION_INPUT_SELECTORS);
                 if (!primaryKeyword || !primaryLocation || !submit) throw new Error("LinkedIn primary search controls were not found.");
-    if (!agentSetInput(primaryKeyword, validation.keyword)) throw new Error("Keyword input could not retain its value.");
-    log(`预检：已填写关键词 = ${validation.keyword}`);
+    const searchKeyword = agentSearchKeyword(validation.keyword);
+    if (!agentSetInput(primaryKeyword, searchKeyword)) throw new Error("Keyword input could not retain its value.");
+    log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
     await sleep(1000);
     if (!agentSetInput(primaryLocation, validation.location)) throw new Error("Location input could not retain its value.");
     log(`预检：已填写地点 = ${validation.location}`);

@@ -22,6 +22,7 @@ import {
   validateProfileDraft
 } from "./src/screening.mjs";
 import { localPreferenceReflection, validatePreferenceModel } from "./src/learning.mjs";
+import { normalizeKeywordAlternatives } from "./src/task-keywords.mjs";
 import { createStorage, newId } from "./src/storage.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -46,6 +47,7 @@ await storage.update((state) => {
   state.settings = safeSettings(state.settings);
   for (const record of state.profiles) record.profile = validateProfileDraft(record.profile);
   if (state.preferenceModel) state.preferenceModel = validatePreferenceModel(state.preferenceModel);
+  migrateKeywordAlternatives(state);
 });
 
 const maxBodyBytes = 7 * 1024 * 1024;
@@ -266,7 +268,7 @@ const supportedPostedWithinDays = new Set([0, 1, 3, 7, 14, 30]);
 
 function safeRoutineTaskInput(input) {
   const platform = String(input.platform ?? "").toLowerCase();
-  const keyword = String(input.keyword ?? "").trim().slice(0, 160);
+  const keyword = normalizeKeywordAlternatives(String(input.keyword ?? "").slice(0, 160));
   const location = String(input.location ?? "").trim().slice(0, 120);
   const postedWithinDays = Number(input.postedWithinDays ?? 0);
   if (!allowedPlatforms.has(platform)) throw new Error("Choose LinkedIn, Indeed, or SEEK.");
@@ -274,6 +276,28 @@ function safeRoutineTaskInput(input) {
   if (!location) throw new Error("Enter a location.");
   if (!supportedPostedWithinDays.has(postedWithinDays)) throw new Error("Choose a supported posted-within value.");
   return { platform, keyword, location, postedWithinDays };
+}
+
+function migrateKeywordAlternatives(state) {
+  const changedValidationIds = new Set();
+  for (const validation of state.validations) {
+    const normalized = normalizeKeywordAlternatives(validation.keyword);
+    if (!normalized || normalized === validation.keyword) continue;
+    validation.keyword = normalized;
+    validation.status = "WAITING_FOR_WORKER";
+    validation.reason = "关键词备选规则已更新，请重新预检。";
+    validation.preflightAttempt = Math.max(1, Number(validation.preflightAttempt) || 1) + 1;
+    validation.workerStartedAt = null;
+    validation.workerHeartbeatAt = null;
+    validation.completedAt = null;
+    changedValidationIds.add(validation.id);
+  }
+  for (const category of state.taskCategories) {
+    for (const task of category.tasks ?? []) task.keyword = normalizeKeywordAlternatives(task.keyword);
+  }
+  state.routineTasks = state.routineTasks
+    .map((task) => ({ ...task, keyword: normalizeKeywordAlternatives(task.keyword) }))
+    .filter((task) => !changedValidationIds.has(task.validationId));
 }
 
 function sameRoutineTask(left, right) {
