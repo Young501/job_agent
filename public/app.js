@@ -230,7 +230,7 @@ function renderCurrentRunStats() {
     ? `共 ${total.entered} 个职位 · 选中 ${total.selected} · 待定 ${total.pending} · 不符合 ${total.rejected}`
     : "尚未运行";
   if (!run) {
-    el("#job-run-stats-body").innerHTML = '<tr><td colspan="7" class="empty-cell">开始每日任务后，这里会按平台和搜索条件显示统计。</td></tr>';
+    el("#job-run-stats-body").innerHTML = '<tr><td colspan="8" class="empty-cell">开始每日任务后，这里会按平台和搜索条件显示统计。</td></tr>';
     return;
   }
 
@@ -253,9 +253,10 @@ function renderCurrentRunStats() {
     const tasks = run.tasks.filter((task) => task.platform === platform);
     const platformJobs = [...tasks.flatMap((task) => jobsByTask.get(task.id) || []), ...(unassignedByPlatform.get(platform) || [])];
     const platformStats = jobStats(platformJobs);
-    rows.push('<tr class="job-stats-platform-row"><th colspan="7"><span>' + escapeHtml(names[platform] || platform) + '</span><small>进入 ' + platformStats.entered + ' · 选中 ' + platformStats.selected + ' · 待定 ' + platformStats.pending + ' · 不符合 ' + platformStats.rejected + "</small></th></tr>");
+    rows.push('<tr class="job-stats-platform-row"><th colspan="8"><span>' + escapeHtml(names[platform] || platform) + '</span><small>进入 ' + platformStats.entered + ' · 选中 ' + platformStats.selected + ' · 待定 ' + platformStats.pending + ' · 不符合 ' + platformStats.rejected + "</small></th></tr>");
     for (const task of tasks) {
       const stats = jobStats(jobsByTask.get(task.id) || []);
+      const canDelete = !["queued", "running", "needs_user_action"].includes(task.status);
       rows.push("<tr>"
         + '<td><strong>' + escapeHtml(task.keyword) + '</strong><small>' + escapeHtml(task.location) + "</small></td>"
         + "<td>" + escapeHtml(postedWithinLabels[Number(task.postedWithinDays)] || "不限") + "</td>"
@@ -263,7 +264,10 @@ function renderCurrentRunStats() {
         + '<td class="job-stat-number">' + stats.entered + "</td>"
         + '<td class="job-stat-number stat-selected">' + stats.selected + "</td>"
         + '<td class="job-stat-number stat-pending">' + stats.pending + "</td>"
-        + '<td class="job-stat-number stat-rejected">' + stats.rejected + "</td></tr>");
+        + '<td class="job-stat-number stat-rejected">' + stats.rejected + "</td>"
+        + '<td class="action-cell job-stat-actions"><button class="icon-button destructive" data-delete-job-stat-task="' + task.id
+        + '" type="button" title="' + (canDelete ? "删除此任务统计及关联职位" : "请先在每日任务中结束或移除此任务") + '"'
+        + (canDelete ? "" : " disabled") + '><i data-lucide="trash-2"></i></button></td></tr>');
     }
     const unassigned = unassignedByPlatform.get(platform) || [];
     if (unassigned.length) {
@@ -272,10 +276,10 @@ function renderCurrentRunStats() {
         + '<td class="job-stat-number">' + stats.entered + "</td>"
         + '<td class="job-stat-number stat-selected">' + stats.selected + "</td>"
         + '<td class="job-stat-number stat-pending">' + stats.pending + "</td>"
-        + '<td class="job-stat-number stat-rejected">' + stats.rejected + "</td></tr>");
+        + '<td class="job-stat-number stat-rejected">' + stats.rejected + "</td><td></td></tr>");
     }
   }
-  el("#job-run-stats-body").innerHTML = rows.join("") || '<tr><td colspan="7" class="empty-cell">本次运行没有可统计的任务。</td></tr>';
+  el("#job-run-stats-body").innerHTML = rows.join("") || '<tr><td colspan="8" class="empty-cell">本次运行没有可统计的任务。</td></tr>';
 }
 
 function sortJobs(jobs, sort) {
@@ -356,12 +360,14 @@ function renderHistoryRunOptions() {
     if (job.runId && state.data.runs.some((run) => run.id === job.runId)) counts.set(job.runId, (counts.get(job.runId) || 0) + 1);
     else unassigned += 1;
   }
-  const runs = state.data.runs.filter((run) => run.id !== currentId && counts.has(run.id));
+  const runs = state.data.runs.filter((run) => run.id !== currentId);
   const validValues = new Set(["", ...runs.map((run) => run.id), ...(unassigned ? ["__unassigned"] : [])]);
   if (!validValues.has(state.historyRunId)) state.historyRunId = "";
   el("#job-history-run").innerHTML = '<option value="">全部历史批次</option>'
-    + runs.map((run) => '<option value="' + escapeHtml(run.id) + '"' + (state.historyRunId === run.id ? " selected" : "") + ">" + escapeHtml(dateTime(run.startedAt)) + " · " + counts.get(run.id) + " 个职位</option>").join("")
+    + runs.map((run) => '<option value="' + escapeHtml(run.id) + '"' + (state.historyRunId === run.id ? " selected" : "") + ">" + escapeHtml(dateTime(run.startedAt)) + " · " + (counts.get(run.id) || 0) + " 个职位</option>").join("")
     + (unassigned ? '<option value="__unassigned"' + (state.historyRunId === "__unassigned" ? " selected" : "") + ">未关联运行 · " + unassigned + " 个职位</option>" : "");
+  const selectedRun = state.data.runs.find((run) => run.id === state.historyRunId);
+  el("#delete-selected-history-run").disabled = !selectedRun || !["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(selectedRun.state);
 }
 
 function selectedReviewRun() {
@@ -586,11 +592,17 @@ function renderRoutine() {
     notifyPausedTasks(run);
   }
   if (!run) el("#clear-run-queue").disabled = true;
-  el("#runs-list").innerHTML = state.data.runs.map((run) => '<article class="run-row"><div><strong>'
-    + dateTime(run.startedAt) + "</strong><span>" + run.tasks.length + " 项任务</span></div><div>"
-    + badge(run.state, "run-state-badge") + '</div><div class="run-platform-counts"><span>LI '
-    + run.counters.linkedin.newJobs + "</span><span>IN " + run.counters.indeed.newJobs
-    + "</span><span>SEEK " + run.counters.seek.newJobs + "</span></div></article>").join("")
+  el("#runs-list").innerHTML = state.data.runs.map((run) => {
+    const canDelete = ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state);
+    return '<article class="run-row"><div><strong>'
+      + dateTime(run.startedAt) + "</strong><span>" + run.tasks.length + " 项任务</span></div><div>"
+      + badge(run.state, "run-state-badge") + '</div><div class="run-platform-counts"><span>LI '
+      + run.counters.linkedin.newJobs + "</span><span>IN " + run.counters.indeed.newJobs
+      + "</span><span>SEEK " + run.counters.seek.newJobs + '</span></div><div class="run-history-actions">'
+      + '<button class="icon-button destructive" data-delete-run-history="' + run.id + '" type="button" title="'
+      + (canDelete ? "删除此次运行及关联职位" : "运行结束后才能删除历史") + '"' + (canDelete ? "" : " disabled")
+      + '><i data-lucide="trash-2"></i></button></div></article>';
+  }).join("")
     || '<div class="empty-state compact-empty"><p>没有运行记录。</p></div>';
 }
 
@@ -1531,6 +1543,38 @@ async function deleteRunTask(id, isRunning) {
   }
 }
 
+async function deleteJobStatTask(id) {
+  const run = currentRun();
+  const task = run?.tasks.find((item) => item.id === id);
+  if (!run || !task) return;
+  const jobCount = currentRunJobs().filter((job) => matchingRunTask(run, job)?.id === id).length;
+  const message = `删除“${task.keyword} / ${task.location}”的任务统计及 ${jobCount} 个关联职位？\n\n每日任务和任务类别不会被删除。`;
+  if (!window.confirm(message)) return;
+  try {
+    const result = await api("/api/runs/" + run.id + "/tasks/" + id + "/results", { method: "DELETE" });
+    await reload();
+    toast("已删除该任务统计及 " + result.removed.jobs + " 个关联职位。");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function deleteRunHistory(id) {
+  const run = state.data.runs.find((item) => item.id === id);
+  if (!run) return;
+  const jobCount = state.data.jobs.filter((job) => job.runId === id).length;
+  const message = `删除 ${dateTime(run.startedAt)} 的运行历史、${run.tasks.length} 项任务统计及 ${jobCount} 个关联职位？\n\n每日任务、内置预设和自定义任务类别不会被删除。`;
+  if (!window.confirm(message)) return;
+  try {
+    const result = await api("/api/runs/" + id, { method: "DELETE" });
+    if (state.historyRunId === id) state.historyRunId = "";
+    await reload();
+    toast("已删除该次运行及 " + result.removed.jobs + " 个关联职位。");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
 async function clearRunQueue() {
   const run = currentRun();
   if (!run || !window.confirm("清空本次运行队列？正在执行的任务会被取消，其稍后回传的结果不会导入。")) return;
@@ -1685,7 +1729,8 @@ async function clearAllHistory() {
     armHistoryResetTimeout();
     resetWindow.location.href = "https://www.linkedin.com/jobs/search/?jobAgentReset=1&jobAgentResetAll=1";
     const count = Object.values(result.cleared || {}).reduce((total, value) => total + Number(value || 0), 0);
-    toast(`Agent 已清除 ${count} 条记录，正在依次清理三个 Worker。`);
+    const preservedCategories = Number(result.preserved?.taskCategories || 0);
+    toast(`Agent 已清除 ${count} 条记录，保留 ${preservedCategories} 个任务类别；正在依次清理三个 Worker。`);
   } catch (error) {
     clearTimeout(state.historyReset.timeout);
     state.historyReset.running = false;
@@ -1930,6 +1975,10 @@ document.addEventListener("click", (event) => {
   if (rerunTaskButton) return rerunTask(rerunTaskButton.dataset.rerunTask);
   const deleteRunTaskButton = event.target.closest("[data-delete-run-task]");
   if (deleteRunTaskButton) return deleteRunTask(deleteRunTaskButton.dataset.deleteRunTask, deleteRunTaskButton.dataset.running === "true");
+  const deleteJobStatTaskButton = event.target.closest("[data-delete-job-stat-task]");
+  if (deleteJobStatTaskButton) return deleteJobStatTask(deleteJobStatTaskButton.dataset.deleteJobStatTask);
+  const deleteRunHistoryButton = event.target.closest("[data-delete-run-history]");
+  if (deleteRunHistoryButton) return deleteRunHistory(deleteRunHistoryButton.dataset.deleteRunHistory);
   const copyWorkerButton = event.target.closest("[data-copy-worker]");
   if (copyWorkerButton) return copyWorkerScript(copyWorkerButton);
   const closeDialog = event.target.closest("[data-close-dialog]");
@@ -2031,6 +2080,7 @@ el("#import-selected-categories").addEventListener("click", () => prepareSelecte
 el("#start-preflight-batch").addEventListener("click", startPreflightBatch);
 el("#clear-routine-tasks").addEventListener("click", clearRoutineTasks);
 el("#clear-run-queue").addEventListener("click", clearRunQueue);
+el("#delete-selected-history-run").addEventListener("click", () => deleteRunHistory(state.historyRunId));
 el("#open-import").addEventListener("click", openImport);
 el("#extract-resume").addEventListener("click", uploadResume);
 el("#copy-external-profile-prompt").addEventListener("click", copyExternalGptPrompt);

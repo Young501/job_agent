@@ -572,6 +572,79 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
   return jobs;
 }
 
+function jobBelongsToRunTask(job, task, run) {
+  if (job.runTaskId) return job.runTaskId === task.id;
+  const normalized = (value) => String(value ?? "").trim().toLowerCase();
+  const candidates = run.tasks.filter((candidate) => job.source === candidate.platform
+    && normalized(job.searchKeyword) === normalized(candidate.keyword)
+    && normalized(job.searchLocation) === normalized(candidate.location)
+    && (job.searchPostedWithinDays === null || job.searchPostedWithinDays === undefined
+      || Number(job.searchPostedWithinDays) === Number(candidate.postedWithinDays)));
+  return candidates.length === 1 && candidates[0].id === task.id;
+}
+
+function reconcileLearningAfterJobDeletion(state, removedJobs) {
+  const removedIds = new Set(removedJobs.map((job) => job.id));
+  const removedFeedback = removedJobs.some((job) => job.feedback?.helpfulness === "NOT_HELPFUL");
+  const invalidReflectionRunIds = new Set(state.reviewReflections
+    .filter((reflection) => (reflection.feedbackJobIds ?? []).some((id) => removedIds.has(id)))
+    .map((reflection) => reflection.runId));
+  if (invalidReflectionRunIds.size) {
+    state.reviewReflections = state.reviewReflections.filter((reflection) => !invalidReflectionRunIds.has(reflection.runId));
+    for (const run of state.runs.filter((item) => invalidReflectionRunIds.has(item.id))) {
+      run.reviewReflectionId = null;
+      run.reviewCompletedAt = null;
+    }
+  }
+  if (!removedFeedback) return;
+  const activeFeedback = state.jobs
+    .filter((job) => job.feedback?.helpfulness === "NOT_HELPFUL")
+    .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
+    .slice(0, 120);
+  if (!activeFeedback.length) {
+    state.preferenceModel = null;
+    return;
+  }
+  const now = new Date().toISOString();
+  state.preferenceModel = validatePreferenceModel(localPreferenceReflection(activeFeedback), {
+    version: (Number(state.preferenceModel?.version) || 0) + 1,
+    feedbackCount: activeFeedback.length,
+    sourceRunId: null,
+    engine: "local-rules-after-deletion",
+    updatedAt: now
+  });
+}
+
+function removeJobs(state, predicate) {
+  const removedJobs = state.jobs.filter(predicate);
+  if (!removedJobs.length) return [];
+  const removedIds = new Set(removedJobs.map((job) => job.id));
+  state.jobs = state.jobs.filter((job) => !removedIds.has(job.id));
+  for (const job of state.jobs) {
+    if (removedIds.has(job.duplicateOf)) job.duplicateOf = null;
+  }
+  reconcileLearningAfterJobDeletion(state, removedJobs);
+  return removedJobs;
+}
+
+function recalculateRunCounters(state, run) {
+  ensureRunCounterShape(run);
+  const jobs = state.jobs.filter((job) => job.runId === run.id);
+  for (const platform of ["linkedin", "indeed", "seek"]) {
+    const platformJobs = jobs.filter((job) => job.source === platform);
+    run.counters[platform].tasks = run.tasks.filter((task) => task.platform === platform).length;
+    run.counters[platform].newJobs = platformJobs.filter((job) => !job.duplicateOf).length;
+    run.counters[platform].repeatedImports = platformJobs.filter((job) => job.duplicateOf).length;
+    run.counters[platform].failed = run.tasks.filter((task) => task.platform === platform && task.status === "failed").length;
+  }
+  run.counters.ai.titleScreened = jobs.length;
+  run.counters.ai.jdReviewed = jobs.filter((job) => job.screening?.jdReviewed).length;
+  run.counters.ai.clearMatches = jobs.filter((job) => job.screening?.titleClassification === "CLEAR_MATCH").length;
+  run.counters.ai.rejected = jobs.filter((job) => job.screening?.titleClassification === "CLEAR_REJECT").length;
+  run.counters.ai.errors = jobs.filter((job) => job.screening?.screeningStatus === "AI_ERROR").length;
+  run.counters.ai.reflections = state.reviewReflections.filter((reflection) => reflection.runId === run.id).length;
+}
+
 function createRun(settings, routineTasks, routineTaskIds = null) {
   const requestedIds = Array.isArray(routineTaskIds) && routineTaskIds.length
     ? new Set(routineTaskIds.map((id) => String(id)))
@@ -693,7 +766,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ai: await saveAiConfig(mergedAiConfig({}, true)) });
   }
   if (request.method === "DELETE" && path === "/api/records") {
-    const cleared = await storage.update((state) => {
+    const result = await storage.update((state) => {
       const counts = {
         jobs: state.jobs.length,
         runs: state.runs.length,
@@ -713,9 +786,19 @@ async function handleApi(request, response, url) {
       state.importBatches = [];
       state.reviewReflections = [];
       state.preferenceModel = null;
-      return counts;
+      return {
+        cleared: counts,
+        preserved: {
+          taskCategories: state.taskCategories.length,
+          builtinTaskCategories: state.taskCategories.filter((category) => category.builtin).length,
+          customTaskCategories: state.taskCategories.filter((category) => !category.builtin).length,
+          profiles: state.profiles.length,
+          settings: 1,
+          aiConfig: 1
+        }
+      };
     });
-    return sendJson(response, 200, { cleared });
+    return sendJson(response, 200, result);
   }
   if (request.method === "PUT" && path === "/api/settings") {
     const body = await readJson(request);
@@ -1132,6 +1215,30 @@ async function handleApi(request, response, url) {
     });
     return sendJson(response, 201, { run, launchUrls: workerLaunchUrls(run) });
   }
+
+  const runHistoryMatch = /^\/api\/runs\/([^/]+)$/.exec(path);
+  if (request.method === "DELETE" && runHistoryMatch) {
+    const result = await storage.update((state) => {
+      const index = state.runs.findIndex((item) => item.id === runHistoryMatch[1]);
+      if (index < 0) throw new Error("Run was not found.");
+      const run = state.runs[index];
+      if (!["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state)) {
+        throw new Error("Only completed run history can be deleted. Finish or clear its queue first.");
+      }
+      const reflectionCount = state.reviewReflections.filter((reflection) => reflection.runId === run.id).length;
+      const jobs = removeJobs(state, (job) => job.runId === run.id);
+      const importBatchCount = state.importBatches.filter((batch) => batch.runId === run.id).length;
+      state.importBatches = state.importBatches.filter((batch) => batch.runId !== run.id);
+      state.reviewReflections = state.reviewReflections.filter((reflection) => reflection.runId !== run.id);
+      state.runs.splice(index, 1);
+      return {
+        run,
+        removed: { runs: 1, tasks: run.tasks.length, jobs: jobs.length, importBatches: importBatchCount, reviewReflections: reflectionCount }
+      };
+    });
+    return sendJson(response, 200, result);
+  }
+
   if (request.method === "GET" && path === "/api/worker/next-platform-launch") {
     const runId = String(url.searchParams.get("runId") ?? "");
     const currentPlatform = String(url.searchParams.get("platform") ?? "").toLowerCase();
@@ -1265,6 +1372,30 @@ async function handleApi(request, response, url) {
       run.completedAt = null;
       updateRunState(run);
       return { run, task, launchUrl: workerLandingUrl(task.platform, run.id) };
+    });
+    return sendJson(response, 200, result);
+  }
+
+  const runTaskResultsMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/results$/.exec(path);
+  if (request.method === "DELETE" && runTaskResultsMatch) {
+    const result = await storage.update((state) => {
+      const run = state.runs.find((item) => item.id === runTaskResultsMatch[1]);
+      const index = run?.tasks.findIndex((item) => item.id === runTaskResultsMatch[2]) ?? -1;
+      if (!run) throw new Error("Run was not found.");
+      if (index < 0) throw new Error("Run task was not found.");
+      const task = run.tasks[index];
+      if (["queued", "running", "needs_user_action"].includes(task.status)) {
+        throw new Error("An active task cannot be deleted from review statistics. Finish or remove it from the run queue first.");
+      }
+      const jobs = removeJobs(state, (job) => job.runId === run.id && jobBelongsToRunTask(job, task, run));
+      const importBatchCount = state.importBatches
+        .filter((batch) => batch.runId === run.id && batch.taskId === task.id).length;
+      state.importBatches = state.importBatches
+        .filter((batch) => batch.runId !== run.id || batch.taskId !== task.id);
+      run.tasks.splice(index, 1);
+      recalculateRunCounters(state, run);
+      updateRunState(run);
+      return { run, task, removed: { tasks: 1, jobs: jobs.length, importBatches: importBatchCount } };
     });
     return sendJson(response, 200, result);
   }

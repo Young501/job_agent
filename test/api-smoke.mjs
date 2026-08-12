@@ -181,6 +181,7 @@ try {
   assert.match(dashboardHtml, /data-jobs-pane="current"/);
   assert.match(dashboardHtml, /data-jobs-pane="history"/);
   assert.match(dashboardHtml, /id="job-history-run"/);
+  assert.match(dashboardHtml, /id="delete-selected-history-run"/);
   assert.match(dashboardHtml, /id="job-run-stats"/);
   assert.match(dashboardHtml, /id="review-learning"/);
   assert.match(dashboardHtml, /id="complete-run-review"/);
@@ -191,6 +192,7 @@ try {
   assert.match(dashboardHtml, /id="open-clear-all-history"/);
   assert.match(dashboardHtml, /id="clear-all-history-dialog"/);
   assert.match(dashboardHtml, /id="confirm-clear-all-history"/);
+  assert.match(dashboardHtml, /内置预设、自定义任务类别/);
   assert.match(dashboardHtml, /id="task-category-list"/);
   assert.match(dashboardHtml, /id="preflight-selected-categories"/);
   assert.match(dashboardHtml, /id="import-selected-categories"/);
@@ -218,6 +220,10 @@ try {
   assert.match(dashboardScript, /ai-review-badge/);
   assert.match(dashboardScript, /job-agent-run-finished/);
   assert.match(dashboardScript, /renderCurrentRunStats/);
+  assert.match(dashboardScript, /data-delete-job-stat-task/);
+  assert.match(dashboardScript, /data-delete-run-history/);
+  assert.match(dashboardScript, /function deleteJobStatTask/);
+  assert.match(dashboardScript, /function deleteRunHistory/);
   assert.match(dashboardScript, /renderReviewLearning/);
   assert.match(dashboardScript, /saveJobFeedback/);
   assert.match(dashboardScript, /completeRunReview/);
@@ -609,6 +615,9 @@ try {
   assert.equal(clearedRecords.cleared.reviewReflections, 1);
   assert.ok(clearedRecords.cleared.runs >= 2);
   assert.ok(clearedRecords.cleared.validations > 0);
+  assert.equal(clearedRecords.preserved.taskCategories, 10);
+  assert.equal(clearedRecords.preserved.builtinTaskCategories, 10);
+  assert.equal(clearedRecords.preserved.customTaskCategories, 0);
   const afterRecordClear = await request("/api/bootstrap");
   assert.equal(afterRecordClear.jobs.length, 0);
   assert.equal(afterRecordClear.runs.length, 0);
@@ -621,6 +630,34 @@ try {
   assert.ok(afterRecordClear.taskCategories.every((category) => category.builtin));
   assert.equal(afterRecordClear.reviewReflections.length, 0);
   assert.equal(afterRecordClear.preferenceModel, null);
+
+  const removableDailyTask = await validateRoutineTask("seek", 3);
+  const removableRun = await request("/api/runs", { routineTaskIds: [removableDailyTask.routineTask.id] });
+  const removableClaim = await request("/api/worker/next?runId=" + removableRun.run.id + "&platform=seek&workerId=remove-test-worker");
+  assert.equal(removableClaim.task.id, removableRun.run.tasks[0].id);
+  const removableResult = await request("/api/worker/result", {
+    runId: removableRun.run.id,
+    taskId: removableClaim.task.id,
+    taskAttempt: removableClaim.task.attempt,
+    workerId: "remove-test-worker",
+    status: "completed",
+    jobs: [{ source: "seek", sourceJobId: "remove-test-job", title: "Museum Digitisation Coordinator", location: "Melbourne VIC" }]
+  });
+  assert.equal(removableResult.jobs.length, 1);
+  const removedTaskResults = await request("/api/runs/" + removableRun.run.id + "/tasks/" + removableClaim.task.id + "/results", undefined, "DELETE");
+  assert.equal(removedTaskResults.removed.tasks, 1);
+  assert.equal(removedTaskResults.removed.jobs, 1);
+  assert.equal(removedTaskResults.removed.importBatches, 1);
+  assert.equal(removedTaskResults.run.tasks.length, 0);
+  const removedRunHistory = await request("/api/runs/" + removableRun.run.id, undefined, "DELETE");
+  assert.equal(removedRunHistory.removed.runs, 1);
+  assert.equal(removedRunHistory.removed.jobs, 0);
+  const afterTargetedDeletes = await request("/api/bootstrap");
+  assert.equal(afterTargetedDeletes.jobs.length, 0);
+  assert.equal(afterTargetedDeletes.runs.length, 0);
+  assert.equal(afterTargetedDeletes.routineTasks.length, 1);
+  await request("/api/routine-tasks", undefined, "DELETE");
+  await request("/api/records", undefined, "DELETE");
 
   const customCategory = await request("/api/task-categories", {
     name: "Custom technology searches",
@@ -674,8 +711,16 @@ try {
   assert.equal(afterCategoryImport.routineTasks.length, 2);
   assert.ok(afterCategoryImport.routineTasks.every((task) => task.categoryId === customCategory.category.id));
   await request("/api/routine-tasks", undefined, "DELETE");
+  const clearedWithCustomCategory = await request("/api/records", undefined, "DELETE");
+  assert.equal(clearedWithCustomCategory.preserved.taskCategories, 11);
+  assert.equal(clearedWithCustomCategory.preserved.builtinTaskCategories, 10);
+  assert.equal(clearedWithCustomCategory.preserved.customTaskCategories, 1);
+  const afterCustomRecordClear = await request("/api/bootstrap");
+  assert.equal(afterCustomRecordClear.taskCategories.length, 11);
+  assert.ok(afterCustomRecordClear.taskCategories.some((category) => category.id === customCategory.category.id));
+  assert.ok(afterCustomRecordClear.taskCategories.find((category) => category.id === customCategory.category.id)
+    .tasks.every((task) => task.validationId === null));
   await request("/api/task-categories/" + customCategory.category.id, undefined, "DELETE");
-  await request("/api/records", undefined, "DELETE");
   const afterCategoryCleanup = await request("/api/bootstrap");
   assert.equal(afterCategoryCleanup.taskCategories.length, 10);
   assert.equal(afterCategoryCleanup.validations.length, 0);

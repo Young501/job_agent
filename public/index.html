@@ -74,7 +74,13 @@
               <button class="routine-tab is-active" type="button" role="tab" data-jobs-pane="current" aria-controls="jobs-table"><i data-lucide="list-checks"></i><span>本次任务</span><small id="current-jobs-count">0</small></button>
               <button class="routine-tab" type="button" role="tab" data-jobs-pane="history" aria-controls="jobs-table"><i data-lucide="history"></i><span>历史记录</span><small id="history-jobs-count">0</small></button>
             </div>
-            <label class="jobs-run-filter" id="jobs-run-filter" hidden><span>运行批次</span><select id="job-history-run"><option value="">全部历史批次</option></select></label>
+            <div class="jobs-run-filter" id="jobs-run-filter" hidden>
+              <span>运行批次</span>
+              <div class="jobs-run-filter-controls">
+                <select id="job-history-run"><option value="">全部历史批次</option></select>
+                <button class="icon-button destructive" id="delete-selected-history-run" type="button" title="删除所选运行历史" disabled><i data-lucide="trash-2"></i></button>
+              </div>
+            </div>
           </div>
           <section class="job-run-stats" id="job-run-stats" aria-labelledby="job-run-stats-title">
             <div class="job-run-stats-heading">
@@ -83,7 +89,7 @@
             </div>
             <div class="data-table-wrap">
               <table class="data-table job-stats-table">
-                <thead><tr><th>关键词与地点</th><th>时间段</th><th>任务状态</th><th>进入 Agent</th><th>Agent 选中</th><th>待定 / 待 JD</th><th>明确不符合</th></tr></thead>
+                <thead><tr><th>关键词与地点</th><th>时间段</th><th>任务状态</th><th>进入 Agent</th><th>Agent 选中</th><th>待定 / 待 JD</th><th>明确不符合</th><th>操作</th></tr></thead>
                 <tbody id="job-run-stats-body"></tbody>
               </table>
             </div>
@@ -265,7 +271,7 @@
           <p class="setup-note"><i data-lucide="info"></i><span>“安装 / 更新”会替换同平台的旧版 <strong>Job Agent Worker</strong>，不会覆盖原有 LinkedIn/Indeed/SEEK helper。复制代码保留为浏览器未唤起 Tampermonkey 时的备用方式。</span></p>
           <div class="worker-script-list" id="worker-script-list" aria-live="polite"></div>
           <section class="setup-danger-zone" aria-labelledby="setup-danger-title">
-            <div><h3 id="setup-danger-title">调试数据清理</h3><p>清除 Agent 记录以及 LinkedIn、Indeed、SEEK Worker 的已扫描和汇总历史。</p></div>
+            <div><h3 id="setup-danger-title">调试数据清理</h3><p>清除 Agent 记录以及三个 Worker 的历史；内置预设与自定义任务类别会保留。</p></div>
             <button class="button button-danger" id="open-clear-all-history" type="button"><i data-lucide="eraser"></i><span>清除全部历史记录</span></button>
           </section>
         </section>
@@ -334,7 +340,7 @@
     <dialog id="clear-all-history-dialog" class="dialog confirm-dialog">
       <form method="dialog">
         <div class="dialog-heading"><div><p class="eyebrow">调试清理</p><h2>清除全部历史记录？</h2></div><button class="icon-button" value="cancel" title="关闭"><i data-lucide="x"></i></button></div>
-        <p class="confirm-copy">将删除 Agent 中的职位、运行、每日任务、预检记录，以及三个 Worker 的已扫描和汇总历史。职业画像、搜索设置和 AI Key 会保留。</p>
+        <p class="confirm-copy">将删除 Agent 中的职位、运行、每日任务、预检记录，以及三个 Worker 的已扫描和汇总历史。内置预设、自定义任务类别、职业画像、搜索设置和 AI Key 均会保留。</p>
         <p class="form-note warning-note">此操作无法撤销。清理期间会依次打开三个招聘平台，请勿关闭清理窗口。</p>
         <div class="dialog-actions"><button class="button button-quiet" value="cancel">取消</button><button class="button button-danger" id="confirm-clear-all-history" type="button"><i data-lucide="eraser"></i><span>确认清除</span></button></div>
       </form>
