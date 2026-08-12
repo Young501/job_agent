@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.2
+// @version      2.2.3
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -1166,6 +1166,26 @@
         return null;
     }
 
+    function agentFindIndeedDateUpdateButton(listbox) {
+        let container = listbox;
+        while (container && container !== document.body) {
+            const update = Array.from(container.querySelectorAll("button, [role='button']"))
+                .find((node) => agentVisible(node) && /^update$/i.test((node.innerText || node.textContent || "").trim()));
+            if (update) return update;
+            container = container.parentElement;
+        }
+        return null;
+    }
+
+    async function agentWaitForIndeedDateParameter(days, timeout = 10000) {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+            if (Number(new URL(location.href).searchParams.get("fromage")) === days) return true;
+            await sleep(200);
+        }
+        return false;
+    }
+
     function agentIndeedSearchState() {
         const keyword = agentFirst(["input[name='q']", "input[placeholder*='job title' i]"]);
         const location = agentFirst(["input[name='l']", "input[placeholder*='city' i]"]);
@@ -1255,7 +1275,7 @@
 
     async function agentApplyIndeedDateFilter(validation) {
         const days = Number(validation.postedWithinDays);
-        if (!days) return;
+        if (!days) return true;
         const labels = {
             1: /last 24 hours|past 24 hours/i,
             3: /last 3 days|past 3 days/i,
@@ -1280,12 +1300,26 @@
                 .join("、");
             throw new Error(`Date posted 已打开，但 8 秒内未找到可点击的所选时间范围。当前选项：${available || "未加载"}。`);
         }
+        const listbox = option.closest("[role='listbox']");
+        let updateButton = agentFindIndeedDateUpdateButton(listbox);
         option.click();
         log("预检：已选择 Date posted 时间范围。");
         setStatus("Job Agent: 正在应用 Date posted...");
         log("预检：正在点击 Indeed 的 Update 确认按钮。");
-        if (!await agentWaitAndClickText(/^update$/i, 4000)) throw new Error("已选择 Date posted，但未找到 Indeed 的 Update 确认按钮。");
-        await sleep(900);
+        if (!agentVisible(updateButton)) updateButton = agentFindIndeedDateUpdateButton(listbox);
+        if (updateButton) updateButton.click();
+        else if (!await agentWaitAndClickText(/^update$/i, 4000)) throw new Error("已选择 Date posted，但未找到 Indeed 的 Update 确认按钮。");
+        log("预检：等待 Indeed 应用 Date posted 并更新结果 URL。");
+        if (await agentWaitForIndeedDateParameter(days)) {
+            log(`预检：Date posted 已生效，fromage=${days}。`);
+            return true;
+        }
+        const directUrl = new URL(location.href);
+        directUrl.searchParams.set("fromage", String(days));
+        directUrl.searchParams.delete("start");
+        log(`预检：Indeed 未及时更新 URL，正在使用官方 fromage=${days} 参数重新打开结果页。`);
+        window.location.assign(directUrl.href);
+        return false;
     }
 
     async function agentStartIndeedOfficialSearch(validation) {
@@ -1373,7 +1407,7 @@
             log("预检：关键词和地点已确认。");
             if ((agentPreflightState(validation).stage || "date") === "date") {
                 gmSet(AGENT.preflightKey, { validationId: validation.id, preflightAttempt: Number(validation.preflightAttempt || 1), stage: "verify" });
-                await agentApplyIndeedDateFilter(validation);
+                if (!await agentApplyIndeedDateFilter(validation)) return true;
                 await sleep(800);
             }
             const appliedDays = Number(validation.postedWithinDays);

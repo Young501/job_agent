@@ -128,7 +128,7 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+2\.2\.2/);
+  assert.match(indeedWorkerScript, /@version\s+2\.2\.3/);
   assert.match(indeedWorkerScript, /preflight\/next-launch/);
   assert.match(indeedWorkerScript, /agentSearchKeyword/);
   assert.match(indeedWorkerScript, /agentIncludeKeywordText/);
@@ -137,7 +137,10 @@ try {
   assert.match(indeedWorkerScript, /@downloadURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/indeed\/indeed-agent-worker\.user\.js/);
   assert.match(indeedWorkerScript, /agentWaitAndClickText\(\/\^update\$\/i/);
   assert.match(indeedWorkerScript, /agentWaitForIndeedDateOption/);
+  assert.match(indeedWorkerScript, /agentFindIndeedDateUpdateButton/);
+  assert.match(indeedWorkerScript, /agentWaitForIndeedDateParameter/);
   assert.match(indeedWorkerScript, /Date posted options/);
+  assert.match(indeedWorkerScript, /directUrl\.searchParams\.set\("fromage"/);
   assert.match(indeedWorkerScript, /window\.location\.assign\(searchUrl\.href\)/);
   assert.match(indeedWorkerScript, /current\.get\("fromage"\)/);
   assert.match(indeedWorkerScript, /worker\/progress/);
