@@ -205,6 +205,8 @@ try {
   const dashboardScript = await dashboardScriptResponse.text();
   assert.match(dashboardScript, /data-install-worker/);
   assert.match(dashboardScript, /安装 \/ 更新/);
+  assert.match(dashboardScript, /name: "Indeed", version: "v2\.2\.3"/);
+  assert.match(dashboardScript, /\?version=/);
   assert.match(dashboardScript, /data-copy-worker/);
   assert.match(dashboardScript, /loadWorkerScripts/);
   assert.match(dashboardScript, /job-agent:view/);

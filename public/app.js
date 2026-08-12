@@ -67,7 +67,7 @@ const pages = {
 };
 const workerDefinitions = [
   { id: "linkedin", name: "LinkedIn", version: "v2.2.2", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v2.2.2", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v2.2.3", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
   { id: "seek", name: "SEEK", version: "v2.2.2", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
@@ -788,7 +788,8 @@ function workerCopyMarkup(worker, disabled = false) {
 }
 
 function workerInstallMarkup(worker) {
-  return '<a class="button button-primary" data-install-worker="' + worker.id + '" href="' + worker.path
+  const installPath = worker.path + "?version=" + encodeURIComponent(worker.version.replace(/^v/i, ""));
+  return '<a class="button button-primary" data-install-worker="' + worker.id + '" href="' + installPath
     + '" target="_blank" rel="noopener"><i data-lucide="download"></i><span>安装 / 更新</span></a>';
 }
 
@@ -824,7 +825,7 @@ function armHistoryResetTimeout() {
     state.historyReset.window?.close();
     state.historyReset.window = null;
     renderHistoryResetControl();
-    toast("Worker 历史清理未在 45 秒内完成。请确认三份 Worker 已更新到 v2.2.2，然后重试。", "error");
+    toast("Worker 历史清理未在 45 秒内完成。请在安装设置中更新三份 Worker 后重试。", "error");
   }, 45_000);
 }
 
