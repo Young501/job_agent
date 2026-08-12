@@ -1639,6 +1639,11 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url, "http://127.0.0.1");
     if (url.pathname.startsWith("/api/")) return await handleApi(request, response, url);
+    const workerInstallMatch = /^\/workers\/install\/(linkedin|indeed|seek)-agent-worker-v[\d.]+\.user\.js$/.exec(url.pathname);
+    if (workerInstallMatch) {
+      const platform = workerInstallMatch[1];
+      return await serveStatic(response, `${platform}/${platform}-agent-worker.user.js`, workerDirectory);
+    }
     if (url.pathname.startsWith("/workers/")) return await serveStatic(response, url.pathname.slice("/workers/".length), workerDirectory);
     return await serveStatic(response, url.pathname);
   } catch (error) {

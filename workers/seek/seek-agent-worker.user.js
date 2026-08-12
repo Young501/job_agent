@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - SEEK
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.2
+// @version      2.2.3
 // @description  Job Agent worker for SEEK. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "2.2.2";
+    const APP_VERSION = "2.2.3";
     const SITE = getSiteAdapter();
     if (!SITE) return;
 
@@ -722,9 +722,9 @@
         if (!overlay) {
             overlay = document.createElement("div");
             overlay.id = "job-agent-operation-overlay";
-            overlay.innerHTML = '<div class="ja-operation-card"><span class="ja-operation-spinner"></span><strong></strong><p></p><small>Job Agent 专用窗口</small></div>';
+            overlay.innerHTML = '<div class="ja-operation-card"><span class="ja-operation-spinner"></span><strong></strong><p></p><small>页面操作可见 · 请勿手动操作</small></div>';
             const style = document.createElement("style");
-            style.textContent = "#job-agent-operation-overlay{position:fixed;z-index:2147483646;inset:0;display:grid;place-items:center;padding:24px;background:rgba(245,248,246,.9);backdrop-filter:blur(2px);pointer-events:all;font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17231d}#job-agent-operation-overlay .ja-operation-card{display:grid;justify-items:center;width:min(420px,calc(100vw - 40px));padding:28px;background:#fff;border:1px solid #aeb9b2;border-radius:4px;box-shadow:0 18px 48px rgba(22,35,29,.2);text-align:center}#job-agent-operation-overlay strong{margin-top:14px;font-size:18px}#job-agent-operation-overlay p{margin:7px 0 14px;color:#57645d}#job-agent-operation-overlay small{color:#1f6b4f;font-weight:700}#job-agent-operation-overlay .ja-operation-spinner{width:28px;height:28px;border:3px solid #d9e4de;border-top-color:#1f6b4f;border-radius:50%;animation:ja-operation-spin .8s linear infinite}@keyframes ja-operation-spin{to{transform:rotate(360deg)}}";
+            style.textContent = "#job-agent-operation-overlay{position:fixed;z-index:2147483646;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:12px;background:transparent;pointer-events:none;font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17231d}#job-agent-operation-overlay .ja-operation-card{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:2px 10px;width:min(720px,calc(100vw - 24px));padding:10px 12px;background:rgba(255,255,255,.97);border:1px solid #8fa097;border-radius:4px;box-shadow:0 6px 22px rgba(22,35,29,.18);text-align:left}#job-agent-operation-overlay strong{font-size:14px}#job-agent-operation-overlay p{grid-column:2/4;margin:0;color:#57645d}#job-agent-operation-overlay small{color:#1f6b4f;font-weight:700;white-space:nowrap}#job-agent-operation-overlay .ja-operation-spinner{grid-row:1/3;width:16px;height:16px;border:2px solid #d9e4de;border-top-color:#1f6b4f;border-radius:50%;animation:ja-operation-spin .8s linear infinite}@keyframes ja-operation-spin{to{transform:rotate(360deg)}}";
             document.documentElement.append(style, overlay);
         }
         overlay.querySelector("strong").textContent = title;
