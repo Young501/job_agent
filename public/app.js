@@ -21,6 +21,7 @@ const state = {
   notifiedTaskIds: new Set(),
   jobsPane: "current",
   historyRunId: "",
+  currentRunTaskId: "",
   routinePane: "plan",
   selectedCategoryIds: new Set(),
   expandedCategoryIds: new Set(),
@@ -151,10 +152,20 @@ function badge(value, type = "") {
   return '<span class="badge ' + type + '">' + escapeHtml(nice(value)) + "</span>";
 }
 
-function aiReviewBadge(job) {
-  return /^ai(?:$|-)/i.test(job.screening?.engine || "")
-    ? '<span class="badge ai-review-badge" title="此职位的 JD 已经过 AI 审阅"><i data-lucide="sparkles"></i>AI 审阅</span>'
-    : "";
+function screeningMethodBadge(job) {
+  const screening = job.screening || {};
+  const ai = /^ai(?:$|-)/i.test(screening.engine || "");
+  if (screening.screeningStatus === "AI_ERROR") {
+    return '<span class="badge screening-method-badge is-error" title="AI 审阅发生错误，结果未确认"><i data-lucide="triangle-alert"></i>AI 审阅失败</span>';
+  }
+  if (screening.jdReviewed) {
+    return ai
+      ? '<span class="badge screening-method-badge ai-review-badge" title="此职位的 JD 已由 AI 审阅"><i data-lucide="sparkles"></i>AI 已审阅 JD</span>'
+      : '<span class="badge screening-method-badge" title="此职位的 JD 使用本地规则审阅"><i data-lucide="cpu"></i>本地已审阅 JD</span>';
+  }
+  return ai
+    ? '<span class="badge screening-method-badge ai-review-badge" title="此职位已由 AI 筛查"><i data-lucide="sparkles"></i>AI 已筛查</span>'
+    : '<span class="badge screening-method-badge" title="当前只完成了本地标题筛查，尚未进行 AI JD 审阅"><i data-lucide="text-search"></i>本地标题筛查</span>';
 }
 
 function feedbackBadge(job) {
@@ -180,6 +191,14 @@ function currentRunJobs() {
   return run ? state.data.jobs.filter((job) => job.runId === run.id) : [];
 }
 
+function selectedCurrentRunTask() {
+  const run = currentRun();
+  if (!run || !state.currentRunTaskId) return null;
+  const task = run.tasks.find((item) => item.id === state.currentRunTaskId) || null;
+  if (!task) state.currentRunTaskId = "";
+  return task;
+}
+
 function historicalJobs() {
   const run = currentRun();
   return state.data.jobs.filter((job) => !run || job.runId !== run.id);
@@ -190,7 +209,12 @@ function runForJob(job) {
 }
 
 function jobsInSelectedPane() {
-  if (state.jobsPane === "current") return currentRunJobs();
+  if (state.jobsPane === "current") {
+    const jobs = currentRunJobs();
+    const run = currentRun();
+    const task = selectedCurrentRunTask();
+    return run && task ? jobs.filter((job) => matchingRunTask(run, job)?.id === task.id) : jobs;
+  }
   const jobs = historicalJobs();
   if (!state.historyRunId) return jobs;
   if (state.historyRunId === "__unassigned") return jobs.filter((job) => !runForJob(job));
@@ -217,8 +241,10 @@ function matchingRunTask(run, job) {
 }
 
 function jobStats(jobs) {
-  const counts = { entered: jobs.length, selected: 0, pending: 0, rejected: 0 };
+  const counts = { entered: jobs.length, selected: 0, pending: 0, rejected: 0, viewed: 0, unviewed: 0 };
   for (const job of jobs) counts[screeningBucket(job)] += 1;
+  counts.viewed = jobs.filter((job) => Boolean(job.viewedAt)).length;
+  counts.unviewed = counts.entered - counts.viewed;
   return counts;
 }
 
@@ -227,7 +253,7 @@ function renderCurrentRunStats() {
   const jobs = currentRunJobs();
   const total = jobStats(jobs);
   el("#job-run-stats-total").textContent = run
-    ? `共 ${total.entered} 个职位 · 选中 ${total.selected} · 待定 ${total.pending} · 不符合 ${total.rejected}`
+    ? `共 ${total.entered} 个职位 · 未看 ${total.unviewed} · 选中 ${total.selected} · 待定 ${total.pending} · 不符合 ${total.rejected}`
     : "尚未运行";
   if (!run) {
     el("#job-run-stats-body").innerHTML = '<tr><td colspan="8" class="empty-cell">开始每日任务后，这里会按平台和搜索条件显示统计。</td></tr>';
@@ -253,14 +279,15 @@ function renderCurrentRunStats() {
     const tasks = run.tasks.filter((task) => task.platform === platform);
     const platformJobs = [...tasks.flatMap((task) => jobsByTask.get(task.id) || []), ...(unassignedByPlatform.get(platform) || [])];
     const platformStats = jobStats(platformJobs);
-    rows.push('<tr class="job-stats-platform-row"><th colspan="8"><span>' + escapeHtml(names[platform] || platform) + '</span><small>进入 ' + platformStats.entered + ' · 选中 ' + platformStats.selected + ' · 待定 ' + platformStats.pending + ' · 不符合 ' + platformStats.rejected + "</small></th></tr>");
+    rows.push('<tr class="job-stats-platform-row"><th colspan="8"><span>' + escapeHtml(names[platform] || platform) + '</span><small>进入 ' + platformStats.entered + ' · 未看 ' + platformStats.unviewed + ' · 选中 ' + platformStats.selected + ' · 待定 ' + platformStats.pending + ' · 不符合 ' + platformStats.rejected + "</small></th></tr>");
     for (const task of tasks) {
       const stats = jobStats(jobsByTask.get(task.id) || []);
       const canDelete = !["queued", "running", "needs_user_action"].includes(task.status);
-      rows.push("<tr>"
-        + '<td><strong>' + escapeHtml(task.keyword) + '</strong><small>' + escapeHtml(task.location) + "</small></td>"
+      const active = state.currentRunTaskId === task.id;
+      rows.push('<tr class="job-stats-task-row' + (active ? " is-active" : "") + '" data-filter-job-stat-task="' + task.id + '" title="只看这个任务的职位；再次点击取消筛选">'
+        + '<td><button class="job-stat-task-button" data-filter-job-stat-task="' + task.id + '" type="button" title="只看这个任务的职位"><strong>' + escapeHtml(task.keyword) + '</strong><small>' + escapeHtml(task.location) + "</small></button></td>"
         + "<td>" + escapeHtml(postedWithinLabels[Number(task.postedWithinDays)] || "不限") + "</td>"
-        + "<td>" + badge(task.status, "status-badge") + "</td>"
+        + "<td>" + badge(task.status, "status-badge") + '<small>未看 ' + stats.unviewed + "</small></td>"
         + '<td class="job-stat-number">' + stats.entered + "</td>"
         + '<td class="job-stat-number stat-selected">' + stats.selected + "</td>"
         + '<td class="job-stat-number stat-pending">' + stats.pending + "</td>"
@@ -284,6 +311,14 @@ function renderCurrentRunStats() {
 
 function sortJobs(jobs, sort) {
   return [...jobs].sort((a, b) => {
+    if (sort === "priority") {
+      const rank = { STRONG_MATCH: 0, GOOD_MATCH: 1, MAYBE: 2, LOW_MATCH: 3, REJECTED: 4 };
+      const categoryOrder = (rank[a.screening?.category] ?? 5) - (rank[b.screening?.category] ?? 5);
+      if (categoryOrder) return categoryOrder;
+      const scoreOrder = Number(b.screening?.score || 0) - Number(a.screening?.score || 0);
+      if (scoreOrder) return scoreOrder;
+      return String(b.discoveredAt).localeCompare(String(a.discoveredAt));
+    }
     if (sort === "score") return b.screening.score - a.screening.score;
     if (sort === "source") return a.source.localeCompare(b.source);
     if (sort === "company") return String(a.company || "").localeCompare(String(b.company || ""));
@@ -297,13 +332,15 @@ function visibleJobs() {
   const category = el("#job-category").value;
   const source = el("#job-source").value;
   const status = el("#job-status").value;
+  const viewed = el("#job-viewed").value;
   const sort = el("#job-sort").value;
   const jobs = jobsInSelectedPane().filter((job) => {
     const words = [job.title, job.company, job.location, job.searchKeyword].join(" ").toLowerCase();
     return (!query || words.includes(query))
       && (!category || job.screening.category === category)
       && (!source || job.source === source)
-      && (!status || job.screening.screeningStatus === status);
+      && (!status || job.screening.screeningStatus === status)
+      && (viewed === "all" || (viewed === "viewed" ? Boolean(job.viewedAt) : !job.viewedAt));
   });
   return sortJobs(jobs, sort);
 }
@@ -313,8 +350,10 @@ function actionButtons(job) {
     ? '<a class="icon-button" href="' + escapeHtml(job.jobUrl) + '" target="_blank" rel="noreferrer" title="打开原职位"><i data-lucide="external-link"></i></a>'
     : "";
   const feedbackActive = job.feedback?.helpfulness === "NOT_HELPFUL";
+  const viewed = Boolean(job.viewedAt);
   return open
     + '<button class="icon-button" data-review="' + job.id + '" title="查看或审阅 JD"><i data-lucide="scan-search"></i></button>'
+    + '<button class="viewed-action' + (viewed ? " is-active" : "") + '" data-toggle-viewed="' + job.id + '" data-viewed="' + String(viewed) + '" type="button" title="' + (viewed ? "点击恢复为未看" : "标记为已看") + '"><i data-lucide="' + (viewed ? "check" : "eye") + '"></i><span>' + (viewed ? "已看" : "看过了") + "</span></button>"
     + '<button class="feedback-action' + (feedbackActive ? " is-active" : "") + '" data-feedback="' + job.id + '" type="button" aria-pressed="' + String(feedbackActive) + '" title="' + (feedbackActive ? "修改没帮助反馈" : "标记为没帮助") + '"><i data-lucide="thumbs-down"></i><span>没帮助</span></button>';
 }
 
@@ -325,13 +364,15 @@ function jobRow(job, compact = false, includeBatch = false) {
   const batch = includeBatch
     ? '<td><span>' + escapeHtml(run ? dateTime(run.startedAt) : "未关联运行") + '</span><small>' + escapeHtml(run ? nice(run.state) : "手动或旧版导入") + "</small></td>"
     : "";
-  return '<tr' + (job.feedback?.helpfulness === "NOT_HELPFUL" ? ' class="job-not-helpful"' : "") + '>'
-    + '<td><strong>' + escapeHtml(job.title) + "</strong>" + duplicate + feedbackBadge(job) + "</td>"
+  const rowClasses = [job.feedback?.helpfulness === "NOT_HELPFUL" ? "job-not-helpful" : "", job.viewedAt ? "job-viewed" : ""].filter(Boolean).join(" ");
+  const viewed = job.viewedAt ? '<span class="viewed-badge"><i data-lucide="check"></i>已看</span>' : "";
+  return '<tr' + (rowClasses ? ' class="' + rowClasses + '"' : "") + '>'
+    + '<td><strong>' + escapeHtml(job.title) + "</strong>" + duplicate + viewed + feedbackBadge(job) + "</td>"
     + '<td><span>' + escapeHtml(job.company || "-") + "</span><small>" + escapeHtml(job.location || "-") + "</small></td>"
     + '<td>' + badge(names[job.source] || job.source, "source-" + job.source) + "</td>"
     + search
-    + '<td><span class="score">' + job.screening.score + "</span>" + badge(job.screening.category, "category-" + job.screening.category.toLowerCase()) + aiReviewBadge(job) + "</td>"
-    + '<td>' + badge(job.screening.screeningStatus, "status-badge") + "</td>"
+    + '<td><span class="score">' + job.screening.score + "</span>" + badge(job.screening.category, "category-" + job.screening.category.toLowerCase()) + "</td>"
+    + '<td>' + badge(job.screening.screeningStatus, "status-badge") + screeningMethodBadge(job) + "</td>"
     + batch
     + '<td class="action-cell">' + actionButtons(job) + "</td></tr>";
 }
@@ -439,18 +480,28 @@ function renderJobs() {
   el("#jobs-run-filter").hidden = state.jobsPane !== "history";
   el("#job-run-stats").hidden = state.jobsPane !== "current";
   if (state.jobsPane === "current") renderCurrentRunStats();
+  const selectedTask = state.jobsPane === "current" ? selectedCurrentRunTask() : null;
+  const taskFilter = el("#active-job-task-filter");
+  taskFilter.hidden = !selectedTask;
+  if (selectedTask) {
+    el("#active-job-task-filter-label").textContent = `${names[selectedTask.platform] || selectedTask.platform} · ${selectedTask.keyword} · ${selectedTask.location} · ${postedWithinLabels[Number(selectedTask.postedWithinDays)] || "不限"}`;
+  }
   renderReviewLearning();
   el("#jobs-list-title").textContent = state.jobsPane === "history" ? "历史职位" : "本次任务职位";
   const jobs = visibleJobs();
   const paneTotal = jobsInSelectedPane().length;
+  const viewedLabel = el("#job-viewed").selectedOptions[0]?.textContent || "全部";
   el("#jobs-summary").textContent = state.jobsPane === "history"
-    ? jobs.length + " / " + paneTotal + " 个历史职位"
-    : currentRun() ? jobs.length + " / " + paneTotal + " 个本次任务职位" : "尚未开始本次任务";
+    ? jobs.length + " / " + paneTotal + " 个历史职位 · " + viewedLabel
+    : currentRun() ? jobs.length + " / " + paneTotal + " 个本次任务职位 · " + viewedLabel : "尚未开始本次任务";
   el("#jobs-table-head").innerHTML = state.jobsPane === "history"
-    ? "<tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>状态</th><th>运行批次</th><th></th></tr>"
-    : "<tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>状态</th><th></th></tr>";
+    ? "<tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>筛查状态 / 方法</th><th>运行批次</th><th></th></tr>"
+    : "<tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>筛查状态 / 方法</th><th></th></tr>";
+  const emptyMessage = el("#job-viewed").value === "unviewed"
+    ? "当前筛选没有未看职位；可将“查看进度”切换到“已看”或“全部”。"
+    : state.jobsPane === "history" ? "没有匹配当前筛选条件的历史职位。" : "本次任务尚未导入职位。";
   el("#jobs-table").innerHTML = jobs.map((job) => jobRow(job, false, state.jobsPane === "history")).join("")
-    || '<tr><td colspan="' + (state.jobsPane === "history" ? "8" : "7") + '" class="empty-cell">' + (state.jobsPane === "history" ? "没有匹配当前筛选条件的历史职位。" : "本次任务尚未导入职位。") + "</td></tr>";
+    || '<tr><td colspan="' + (state.jobsPane === "history" ? "8" : "7") + '" class="empty-cell">' + emptyMessage + "</td></tr>";
 }
 
 function taskCategoryValidation(task) {
@@ -899,6 +950,7 @@ async function launchRun(routineTaskIds = null) {
     } else launcher?.close();
     state.jobsPane = "current";
     state.historyRunId = "";
+    state.currentRunTaskId = "";
     state.routinePane = "monitor";
     await reload();
     state.view = "routine";
@@ -1860,11 +1912,24 @@ function openReview(id) {
   state.jobId = id;
   el("#review-source").textContent = names[job.source] || job.source;
   el("#review-title").textContent = job.title;
-  el("#review-meta").innerHTML = escapeHtml(job.company || "-") + " · " + escapeHtml(job.location || "-") + " " + badge(job.screening.category, "category-" + job.screening.category.toLowerCase()) + aiReviewBadge(job);
+  el("#review-meta").innerHTML = escapeHtml(job.company || "-") + " · " + escapeHtml(job.location || "-") + " " + badge(job.screening.category, "category-" + job.screening.category.toLowerCase()) + screeningMethodBadge(job);
   el("#review-description").value = job.description || "";
   el("#review-note").textContent = job.screening.reason || "";
   el("#review-dialog").showModal();
   refreshIcons();
+}
+
+async function toggleJobViewed(id, viewed) {
+  try {
+    await api("/api/jobs/" + id + "/viewed", {
+      method: "PUT",
+      body: JSON.stringify({ viewed: !viewed })
+    });
+    await reload();
+    toast(viewed ? "已恢复为未看。" : "已标记为看过；下次会从其后的未看职位继续。");
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 async function reviewJob(event) {
@@ -1898,6 +1963,7 @@ document.addEventListener("click", (event) => {
     if (view.dataset.view === "jobs" && state.view !== "jobs") {
       state.jobsPane = "current";
       state.historyRunId = "";
+      state.currentRunTaskId = "";
     }
     state.view = view.dataset.view;
     return render();
@@ -1906,6 +1972,7 @@ document.addEventListener("click", (event) => {
   if (jobsPane) {
     state.jobsPane = jobsPane.dataset.jobsPane;
     state.historyRunId = "";
+    state.currentRunTaskId = "";
     renderJobs();
     return refreshIcons();
   }
@@ -1917,6 +1984,14 @@ document.addEventListener("click", (event) => {
   if (review) return openReview(review.dataset.review);
   const feedback = event.target.closest("[data-feedback]");
   if (feedback) return openFeedback(feedback.dataset.feedback);
+  const viewedButton = event.target.closest("[data-toggle-viewed]");
+  if (viewedButton) return toggleJobViewed(viewedButton.dataset.toggleViewed, viewedButton.dataset.viewed === "true");
+  const clearJobTaskFilter = event.target.closest("[data-clear-job-task-filter]");
+  if (clearJobTaskFilter) {
+    state.currentRunTaskId = "";
+    renderJobs();
+    return refreshIcons();
+  }
   const profile = event.target.closest("[data-profile]");
   if (profile) { state.profileId = profile.dataset.profile; state.profilePane = "editor"; renderProfile(); return refreshIcons(); }
   const profileChip = event.target.closest("[data-profile-chip]");
@@ -1978,6 +2053,15 @@ document.addEventListener("click", (event) => {
   if (deleteRunTaskButton) return deleteRunTask(deleteRunTaskButton.dataset.deleteRunTask, deleteRunTaskButton.dataset.running === "true");
   const deleteJobStatTaskButton = event.target.closest("[data-delete-job-stat-task]");
   if (deleteJobStatTaskButton) return deleteJobStatTask(deleteJobStatTaskButton.dataset.deleteJobStatTask);
+  const filterJobStatTask = event.target.closest("[data-filter-job-stat-task]");
+  if (filterJobStatTask) {
+    const id = filterJobStatTask.dataset.filterJobStatTask;
+    state.currentRunTaskId = state.currentRunTaskId === id ? "" : id;
+    renderJobs();
+    refreshIcons();
+    el("#active-job-task-filter").scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
   const deleteRunHistoryButton = event.target.closest("[data-delete-run-history]");
   if (deleteRunHistoryButton) return deleteRunHistory(deleteRunHistoryButton.dataset.deleteRunHistory);
   const copyWorkerButton = event.target.closest("[data-copy-worker]");
@@ -2012,7 +2096,7 @@ document.addEventListener("pointermove", moveProfileChipPointer, { passive: fals
 document.addEventListener("pointerup", finishProfileChipPointerDrag);
 document.addEventListener("pointercancel", finishProfileChipPointerDrag);
 document.addEventListener("change", (event) => {
-  if (event.target.matches("#job-category, #job-source, #job-status, #job-sort")) renderJobs();
+  if (event.target.matches("#job-category, #job-source, #job-status, #job-viewed, #job-sort")) renderJobs();
   if (event.target.matches("#job-history-run")) {
     state.historyRunId = event.target.value;
     renderJobs();

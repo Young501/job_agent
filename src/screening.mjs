@@ -141,7 +141,8 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
     runId,
     duplicateOf,
     screening: screenTitle(title, { thresholds, preferenceModel }),
-    feedback: null
+    feedback: null,
+    viewedAt: null
   };
 }
 

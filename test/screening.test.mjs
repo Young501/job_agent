@@ -81,6 +81,7 @@ test("normalization preserves source keys and missing optional data", () => {
   assert.equal(job.runTaskId, "task_123");
   assert.equal(job.routineTaskId, "routine_456");
   assert.equal(job.searchPostedWithinDays, 7);
+  assert.equal(job.viewedAt, null);
   assert.equal(strongSourceKey(job), "seek:id:987");
 });
 

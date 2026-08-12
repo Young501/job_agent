@@ -1471,6 +1471,18 @@ async function handleApi(request, response, url) {
     return sendJson(response, 201, { jobs });
   }
 
+  const viewedMatch = /^\/api\/jobs\/([^/]+)\/viewed$/.exec(path);
+  if (request.method === "PUT" && viewedMatch) {
+    const body = await readJson(request);
+    const job = await storage.update((state) => {
+      const job = state.jobs.find((item) => item.id === viewedMatch[1]);
+      if (!job) throw new Error("Job was not found.");
+      job.viewedAt = body.viewed === false ? null : new Date().toISOString();
+      return job;
+    });
+    return sendJson(response, 200, { job });
+  }
+
   const feedbackMatch = /^\/api\/jobs\/([^/]+)\/feedback$/.exec(path);
   if (request.method === "PUT" && feedbackMatch) {
     const body = await readJson(request);

@@ -101,12 +101,17 @@
             </div>
             <div class="review-learning-content" id="review-learning-content"></div>
           </section>
+          <div class="active-job-filter" id="active-job-task-filter" hidden>
+            <div><i data-lucide="list-filter"></i><span id="active-job-task-filter-label"></span></div>
+            <button class="icon-button" data-clear-job-task-filter type="button" title="显示本次运行的全部任务"><i data-lucide="x"></i></button>
+          </div>
           <div class="filter-bar">
             <label class="search-control"><i data-lucide="search"></i><input id="job-search" type="search" placeholder="搜索职位、公司或地点"></label>
             <label><span>匹配级别</span><select id="job-category"><option value="">全部</option><option>STRONG_MATCH</option><option>GOOD_MATCH</option><option>MAYBE</option><option>LOW_MATCH</option><option>REJECTED</option></select></label>
             <label><span>平台</span><select id="job-source"><option value="">全部平台</option><option value="linkedin">LinkedIn</option><option value="indeed">Indeed</option><option value="seek">SEEK</option><option value="manual">手动</option></select></label>
-            <label><span>审阅状态</span><select id="job-status"><option value="">全部</option><option value="NEEDS_JD_REVIEW">待 JD 审阅</option><option value="JD_SCREENED">已审阅 JD</option><option value="TITLE_SCREENED">标题已筛查</option><option value="AI_ERROR">AI 错误</option></select></label>
-            <label><span>排序</span><select id="job-sort"><option value="discoveredAt">最新发现</option><option value="score">匹配分数</option><option value="source">平台</option><option value="company">公司</option><option value="title">职位名称</option></select></label>
+            <label><span>筛查状态</span><select id="job-status"><option value="">全部</option><option value="NEEDS_JD_REVIEW">待 JD 审阅</option><option value="JD_SCREENED">已审阅 JD</option><option value="TITLE_SCREENED">标题已筛查</option><option value="AI_ERROR">AI 错误</option></select></label>
+            <label><span>查看进度</span><select id="job-viewed"><option value="unviewed">未看（默认）</option><option value="viewed">已看</option><option value="all">全部</option></select></label>
+            <label><span>排序</span><select id="job-sort"><option value="priority">Strong 优先</option><option value="discoveredAt">最新发现</option><option value="score">匹配分数</option><option value="source">平台</option><option value="company">公司</option><option value="title">职位名称</option></select></label>
           </div>
           <div class="data-table-wrap">
             <table class="data-table jobs-table">

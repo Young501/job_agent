@@ -209,6 +209,9 @@ try {
   assert.match(dashboardHtml, /id="job-history-run"/);
   assert.match(dashboardHtml, /id="delete-selected-history-run"/);
   assert.match(dashboardHtml, /id="job-run-stats"/);
+  assert.match(dashboardHtml, /id="active-job-task-filter"/);
+  assert.match(dashboardHtml, /id="job-viewed"/);
+  assert.match(dashboardHtml, /value="priority"/);
   assert.match(dashboardHtml, /id="review-learning"/);
   assert.match(dashboardHtml, /id="complete-run-review"/);
   assert.match(dashboardHtml, /id="feedback-dialog"/);
@@ -247,6 +250,10 @@ try {
   assert.match(dashboardScript, /acceptSuggestedGroup/);
   assert.match(dashboardScript, /candidateItems/);
   assert.match(dashboardScript, /function currentRunJobs\(\)/);
+  assert.match(dashboardScript, /function screeningMethodBadge\(job\)/);
+  assert.match(dashboardScript, /data-filter-job-stat-task/);
+  assert.match(dashboardScript, /data-toggle-viewed/);
+  assert.match(dashboardScript, /STRONG_MATCH: 0/);
   assert.match(dashboardScript, /function historicalJobs\(\)/);
   assert.match(dashboardScript, /state\.jobsPane === "history"/);
   assert.match(dashboardScript, /data-run-routine-task/);
@@ -593,6 +600,13 @@ try {
     description: imported.jobs[0].description
   });
   assert.equal(reviewed.job.screening.screeningStatus, "JD_SCREENED");
+
+  const viewed = await request("/api/jobs/" + imported.jobs[0].id + "/viewed", { viewed: true }, "PUT");
+  assert.ok(viewed.job.viewedAt);
+  const viewedBootstrap = await request("/api/bootstrap");
+  assert.ok(viewedBootstrap.jobs.find((job) => job.id === imported.jobs[0].id).viewedAt);
+  const restoredUnread = await request("/api/jobs/" + imported.jobs[0].id + "/viewed", { viewed: false }, "PUT");
+  assert.equal(restoredUnread.job.viewedAt, null);
 
   const feedback = await request("/api/jobs/" + imported.jobs[0].id + "/feedback", {
     notHelpful: true,
