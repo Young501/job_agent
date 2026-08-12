@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - LinkedIn
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.3
+// @version      2.2.4
 // @description  Job Agent worker for LinkedIn. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
@@ -20,7 +20,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "2.2.3";
+    const APP_VERSION = "2.2.4";
     const HISTORY_KEY = "linkedin_seen_history_v19";
     const LEGACY_HISTORY_KEY = "linkedin_opened_history_v2";
     const SETTINGS_KEY = "linkedin_scan_settings_v19";
@@ -2671,9 +2671,9 @@ render();
         if (!overlay) {
             overlay = document.createElement("div");
             overlay.id = "job-agent-operation-overlay";
-            overlay.innerHTML = '<div class="ja-operation-card"><span class="ja-operation-spinner"></span><strong></strong><p></p><small>页面操作可见 · 请勿手动操作</small></div>';
+            overlay.innerHTML = '<div class="ja-operation-card"><span class="ja-operation-spinner"></span><strong></strong><p></p><small>脚本正在操作 · 请勿操作此窗口</small></div>';
             const style = document.createElement("style");
-            style.textContent = "#job-agent-operation-overlay{position:fixed;z-index:2147483646;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:12px;background:transparent;pointer-events:none;font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17231d}#job-agent-operation-overlay .ja-operation-card{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:2px 10px;width:min(720px,calc(100vw - 24px));padding:10px 12px;background:rgba(255,255,255,.97);border:1px solid #8fa097;border-radius:4px;box-shadow:0 6px 22px rgba(22,35,29,.18);text-align:left}#job-agent-operation-overlay strong{font-size:14px}#job-agent-operation-overlay p{grid-column:2/4;margin:0;color:#57645d}#job-agent-operation-overlay small{color:#1f6b4f;font-weight:700;white-space:nowrap}#job-agent-operation-overlay .ja-operation-spinner{grid-row:1/3;width:16px;height:16px;border:2px solid #d9e4de;border-top-color:#1f6b4f;border-radius:50%;animation:ja-operation-spin .8s linear infinite}@keyframes ja-operation-spin{to{transform:rotate(360deg)}}";
+            style.textContent = "#job-agent-operation-overlay{position:fixed;z-index:2147483646;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:14px;background:transparent;pointer-events:none;font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#fff}#job-agent-operation-overlay .ja-operation-card{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:2px 10px;width:min(700px,calc(100vw - 28px));padding:9px 12px;background:rgba(24,33,29,.94);border:1px solid rgba(255,255,255,.3);border-radius:4px;box-shadow:0 6px 20px rgba(22,35,29,.2);text-align:left;animation:ja-operation-float 2.4s ease-in-out infinite}#job-agent-operation-overlay strong{font-size:14px}#job-agent-operation-overlay p{grid-column:2/4;margin:0;color:#dbe5df}#job-agent-operation-overlay small{color:#a9e6cc;font-weight:700;white-space:nowrap}#job-agent-operation-overlay .ja-operation-spinner{grid-row:1/3;width:16px;height:16px;border:2px solid #74827a;border-top-color:#79d5ad;border-radius:50%;animation:ja-operation-spin .8s linear infinite}@keyframes ja-operation-spin{to{transform:rotate(360deg)}}@keyframes ja-operation-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}";
             document.documentElement.append(style, overlay);
         }
         overlay.querySelector("strong").textContent = title;

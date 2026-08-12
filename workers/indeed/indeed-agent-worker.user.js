@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.4
+// @version      2.2.5
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "2.2.4";
+    const APP_VERSION = "2.2.5";
     const SITE = getSiteAdapter();
     if (!SITE) return;
 
@@ -771,9 +771,9 @@
         if (!overlay) {
             overlay = document.createElement("div");
             overlay.id = "job-agent-operation-overlay";
-            overlay.innerHTML = '<div class="ja-operation-card"><span class="ja-operation-spinner"></span><strong></strong><p></p><small>页面操作可见 · 请勿手动操作</small></div>';
+            overlay.innerHTML = '<div class="ja-operation-card"><span class="ja-operation-spinner"></span><strong></strong><p></p><small>脚本正在操作 · 请勿操作此窗口</small></div>';
             const style = document.createElement("style");
-            style.textContent = "#job-agent-operation-overlay{position:fixed;z-index:2147483646;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:12px;background:transparent;pointer-events:none;font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#17231d}#job-agent-operation-overlay .ja-operation-card{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:2px 10px;width:min(720px,calc(100vw - 24px));padding:10px 12px;background:rgba(255,255,255,.97);border:1px solid #8fa097;border-radius:4px;box-shadow:0 6px 22px rgba(22,35,29,.18);text-align:left}#job-agent-operation-overlay strong{font-size:14px}#job-agent-operation-overlay p{grid-column:2/4;margin:0;color:#57645d}#job-agent-operation-overlay small{color:#1f6b4f;font-weight:700;white-space:nowrap}#job-agent-operation-overlay .ja-operation-spinner{grid-row:1/3;width:16px;height:16px;border:2px solid #d9e4de;border-top-color:#1f6b4f;border-radius:50%;animation:ja-operation-spin .8s linear infinite}@keyframes ja-operation-spin{to{transform:rotate(360deg)}}";
+            style.textContent = "#job-agent-operation-overlay{position:fixed;z-index:2147483646;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:14px;background:transparent;pointer-events:none;font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:#fff}#job-agent-operation-overlay .ja-operation-card{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:2px 10px;width:min(700px,calc(100vw - 28px));padding:9px 12px;background:rgba(24,33,29,.94);border:1px solid rgba(255,255,255,.3);border-radius:4px;box-shadow:0 6px 20px rgba(22,35,29,.2);text-align:left;animation:ja-operation-float 2.4s ease-in-out infinite}#job-agent-operation-overlay strong{font-size:14px}#job-agent-operation-overlay p{grid-column:2/4;margin:0;color:#dbe5df}#job-agent-operation-overlay small{color:#a9e6cc;font-weight:700;white-space:nowrap}#job-agent-operation-overlay .ja-operation-spinner{grid-row:1/3;width:16px;height:16px;border:2px solid #74827a;border-top-color:#79d5ad;border-radius:50%;animation:ja-operation-spin .8s linear infinite}@keyframes ja-operation-spin{to{transform:rotate(360deg)}}@keyframes ja-operation-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}";
             document.documentElement.append(style, overlay);
         }
         overlay.querySelector("strong").textContent = title;
@@ -1166,6 +1166,18 @@
         return null;
     }
 
+    async function agentWaitForIndeedDateSelection(option, pattern, timeout = 3000) {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+            if (option?.isConnected && option.getAttribute("aria-selected") === "true") return true;
+            const selected = Array.from(document.querySelectorAll("[role='listbox'] [role='option'][aria-selected='true']"))
+                .find((node) => pattern.test((node.innerText || node.textContent || "").trim()));
+            if (selected) return true;
+            await sleep(120);
+        }
+        return false;
+    }
+
     function agentFindIndeedDateUpdateButton(listbox) {
         let container = listbox;
         while (container && container !== document.body) {
@@ -1291,6 +1303,7 @@
         } else if (!agentClickText(/^date posted$/i)) {
             throw new Error("未找到 Indeed 的 Date posted 筛选器。");
         }
+        await sleep(650);
         log("预检：等待 Date posted 下拉选项加载。");
         const option = await agentWaitForIndeedDateOption(labels[days]);
         if (!option) {
@@ -1302,11 +1315,22 @@
         }
         const listbox = option.closest("[role='listbox']");
         let updateButton = agentFindIndeedDateUpdateButton(listbox);
+        option.scrollIntoView({ block: "nearest" });
         option.click();
-        log("预检：已选择 Date posted 时间范围。");
+        if (!await agentWaitForIndeedDateSelection(option, labels[days])) {
+            throw new Error("已点击 Date posted 时间范围，但 Indeed 没有将该选项标记为已选中。");
+        }
+        setStatus(`Job Agent: Date posted 已选中，准备确认...`);
+        log("预检：Date posted 选项已确认选中，等待 Indeed 保存选择状态。");
+        await sleep(850);
         setStatus("Job Agent: 正在应用 Date posted...");
         log("预检：正在点击 Indeed 的 Update 确认按钮。");
         if (!agentVisible(updateButton)) updateButton = agentFindIndeedDateUpdateButton(listbox);
+        gmSet(AGENT.preflightKey, {
+            validationId: validation.id,
+            preflightAttempt: Number(validation.preflightAttempt || 1),
+            stage: "verify"
+        });
         if (updateButton) updateButton.click();
         else if (!await agentWaitAndClickText(/^update$/i, 4000)) throw new Error("已选择 Date posted，但未找到 Indeed 的 Update 确认按钮。");
         log("预检：等待 Indeed 应用 Date posted 并更新结果 URL。");
@@ -1317,6 +1341,11 @@
         const directUrl = new URL(location.href);
         directUrl.searchParams.set("fromage", String(days));
         directUrl.searchParams.delete("start");
+        gmSet(AGENT.preflightKey, {
+            validationId: validation.id,
+            preflightAttempt: Number(validation.preflightAttempt || 1),
+            stage: "direct-verify"
+        });
         log(`预检：Indeed 未及时更新 URL，正在使用官方 fromage=${days} 参数重新打开结果页。`);
         window.location.assign(directUrl.href);
         return false;
@@ -1406,13 +1435,26 @@
             }
             log("预检：关键词和地点已确认。");
             if ((agentPreflightState(validation).stage || "date") === "date") {
-                gmSet(AGENT.preflightKey, { validationId: validation.id, preflightAttempt: Number(validation.preflightAttempt || 1), stage: "verify" });
                 if (!await agentApplyIndeedDateFilter(validation)) return true;
                 await sleep(800);
             }
             const appliedDays = Number(validation.postedWithinDays);
             const current = new URL(location.href).searchParams;
             if (appliedDays && Number(current.get("fromage")) !== appliedDays) {
+                if (agentPreflightState(validation).stage === "verify") {
+                    const directUrl = new URL(location.href);
+                    directUrl.searchParams.set("fromage", String(appliedDays));
+                    directUrl.searchParams.delete("start");
+                    gmSet(AGENT.preflightKey, {
+                        validationId: validation.id,
+                        preflightAttempt: Number(validation.preflightAttempt || 1),
+                        stage: "direct-verify"
+                    });
+                    setStatus("Job Agent: 正在确认 Date posted 结果...");
+                    log(`预检：Update 跳转后尚未保留日期参数，正在用 Indeed 官方 fromage=${appliedDays} 参数确认。`);
+                    window.location.assign(directUrl.href);
+                    return true;
+                }
                 throw new Error("Date posted 未确认生效。Indeed 没有在结果 URL 中写入对应的 fromage 参数。");
             }
             await agentAssertSearchResults(validation);

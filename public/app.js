@@ -66,9 +66,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v2.2.3", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v2.2.4", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v2.2.3", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v2.2.4", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v2.2.5", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v2.2.4", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
