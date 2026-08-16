@@ -21,8 +21,13 @@ import {
   strongSourceKey,
   validateProfileDraft
 } from "./src/screening.mjs";
-import { localPreferenceReflection, validatePreferenceModel } from "./src/learning.mjs";
-import { normalizeKeywordAlternatives } from "./src/task-keywords.mjs";
+import {
+  compactExclusionKeyword,
+  ensurePreferenceModelNegativeCoverage,
+  localPreferenceReflection,
+  validatePreferenceModel
+} from "./src/learning.mjs";
+import { normalizeKeywordAlternatives, primarySearchKeyword } from "./src/task-keywords.mjs";
 import { createStorage, newId } from "./src/storage.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -42,12 +47,20 @@ const allowedPlatforms = new Set(platformOrder);
 await loadDotEnv(join(root, ".env"));
 await loadSavedAiConfig();
 const storage = createStorage({ dataDirectory, defaultSettings, defaultTaskCategories });
+const autoReviewQueue = [];
+const queuedAutoReviewIds = new Set();
+const jdRetryBatches = new Map();
+let autoReviewRunning = false;
 await storage.ensureState();
 await storage.update((state) => {
   state.settings = safeSettings(state.settings);
+  state.exclusionSuggestions = (state.exclusionSuggestions ?? []).map(safeExclusionSuggestion).filter(Boolean);
   for (const record of state.profiles) record.profile = validateProfileDraft(record.profile);
   if (state.preferenceModel) state.preferenceModel = validatePreferenceModel(state.preferenceModel);
   migrateKeywordAlternatives(state);
+  backfillPreferenceExclusionSuggestions(state);
+  compactPendingExclusionSuggestions(state);
+  removeCoveredPendingExclusionSuggestions(state);
 });
 
 const maxBodyBytes = 7 * 1024 * 1024;
@@ -119,6 +132,10 @@ function publicProfile(profile) {
 }
 
 function buildBootstrap(state) {
+  const retryCutoff = Date.now() - 20 * 60 * 1000;
+  for (const [id, batch] of jdRetryBatches) {
+    if (Date.parse(batch.createdAt) < retryCutoff) jdRetryBatches.delete(id);
+  }
   const activeProfile = state.profiles.find((profile) => profile.id === state.activeProfileId) ?? null;
   state.runs.forEach(ensureRunCounterShape);
   return {
@@ -132,6 +149,15 @@ function buildBootstrap(state) {
     taskCategories: state.taskCategories,
     reviewReflections: state.reviewReflections,
     preferenceModel: state.preferenceModel,
+    exclusionSuggestions: state.exclusionSuggestions,
+    jdRetryBatches: [...jdRetryBatches.values()].map((batch) => ({
+      id: batch.id,
+      total: batch.jobIds.length,
+      completed: batch.completed,
+      currentJobId: batch.currentJobId,
+      jobIds: batch.jobIds,
+      createdAt: batch.createdAt
+    })),
     ai: aiStatus()
   };
 }
@@ -243,6 +269,25 @@ function safeSettings(input) {
     lowMatch: Number(input.thresholds?.lowMatch ?? defaultSettings.thresholds.lowMatch)
   };
   const postedWithinDays = Number(input.postedWithinDays ?? defaultSettings.postedWithinDays ?? 0);
+  const defaultWorkerTiming = defaultSettings.workerTiming ?? {};
+  const timingNumber = (key, minimum, maximum) => {
+    const fallback = Number(defaultWorkerTiming[key]);
+    const value = Number(input.workerTiming?.[key]);
+    return Math.min(maximum, Math.max(minimum, Number.isFinite(value) ? value : fallback));
+  };
+  const workerTiming = {
+    accessLimit: Math.round(timingNumber("accessLimit", 1, 100)),
+    cooldownMinutes: timingNumber("cooldownMinutes", 0.5, 120),
+    actionDelaySeconds: timingNumber("actionDelaySeconds", 0.3, 10),
+    scrollDelaySeconds: timingNumber("scrollDelaySeconds", 0.5, 20),
+    pageDelaySeconds: timingNumber("pageDelaySeconds", 1, 120),
+    jdIntervalSeconds: timingNumber("jdIntervalSeconds", 0.2, 30),
+    jdRequestTimeoutSeconds: timingNumber("jdRequestTimeoutSeconds", 2, 30),
+    jdPageTimeoutSeconds: timingNumber("jdPageTimeoutSeconds", 3, 60)
+  };
+  const exclusionKeywords = [...new Set((Array.isArray(input.exclusionKeywords) ? input.exclusionKeywords : defaultSettings.exclusionKeywords ?? [])
+    .map((keyword) => String(keyword ?? "").replace(/\s+/g, " ").trim())
+    .filter((keyword) => keyword.length >= 2 && keyword.length <= 80))].slice(0, 100);
   if (![0, 1, 3, 7, 14, 30].includes(postedWithinDays)) {
     throw new Error("Posted-within filter must be one of 0, 1, 3, 7, 14, or 30 days.");
   }
@@ -260,6 +305,8 @@ function safeSettings(input) {
       .filter((platform) => allowedPlatforms.has(platform)))],
     locations,
     searches,
+    exclusionKeywords,
+    workerTiming,
     thresholds
   };
 }
@@ -307,13 +354,20 @@ function sameRoutineTask(left, right) {
     && Number(left?.postedWithinDays) === Number(right?.postedWithinDays);
 }
 
-const feedbackReasons = new Set(["CLASSIFICATION_WRONG", "NOT_RELEVANT"]);
+const helpfulFeedbackReasons = new Set(["ROLE_RELEVANT", "SKILL_MATCH", "WOULD_APPLY", "REJECTION_CORRECT"]);
+const legacyFeedbackReasons = new Set(["CLASSIFICATION_WRONG", "NOT_RELEVANT", "ROLE_NOT_INTERESTED", "SKILL_MISMATCH", "WOULD_NOT_APPLY"]);
 
 function safeJobFeedback(input) {
-  if (input?.notHelpful === false || input?.helpfulness === null) return null;
-  const reason = feedbackReasons.has(String(input?.reason ?? "")) ? String(input.reason) : null;
+  if (input?.helpful === false || input?.notHelpful === false || input?.helpfulness === null) return null;
+  const requestedHelpfulness = String(input?.helpfulness ?? "");
+  const correction = requestedHelpfulness === "REJECTION_INCORRECT";
+  const legacy = !correction && (input?.notHelpful === true || requestedHelpfulness === "NOT_HELPFUL");
+  const reasons = legacy ? legacyFeedbackReasons : helpfulFeedbackReasons;
+  const reason = correction
+    ? "CLASSIFICATION_WRONG"
+    : reasons.has(String(input?.reason ?? "")) ? String(input.reason) : null;
   return {
-    helpfulness: "NOT_HELPFUL",
+    helpfulness: correction ? "REJECTION_INCORRECT" : legacy ? "NOT_HELPFUL" : "HELPFUL",
     reason,
     note: String(input?.note ?? "").trim().slice(0, 500) || null,
     updatedAt: new Date().toISOString(),
@@ -322,12 +376,200 @@ function safeJobFeedback(input) {
   };
 }
 
+function isPositiveJobFeedback(job) {
+  return (job.feedback?.helpfulness === "HELPFUL" && job.feedback?.reason !== "REJECTION_CORRECT")
+    || job.feedback?.helpfulness === "REJECTION_INCORRECT"
+    || (job.feedback?.helpfulness === "NOT_HELPFUL" && job.feedback?.reason === "CLASSIFICATION_WRONG");
+}
+
+function isConfirmedRejection(job) {
+  return job.feedback?.helpfulness === "HELPFUL" && job.feedback?.reason === "REJECTION_CORRECT";
+}
+
+function isLegacyNegativeJobFeedback(job) {
+  return job.feedback?.helpfulness === "NOT_HELPFUL" && job.feedback?.reason !== "CLASSIFICATION_WRONG";
+}
+
+function isStrictExclusionFeedback(job) {
+  return isConfirmedRejection(job)
+    || (job.feedback?.helpfulness === "NOT_HELPFUL" && job.feedback?.reason === "NOT_RELEVANT");
+}
+
+function safeExclusionSuggestion(input) {
+  const keyword = String(input?.keyword ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+  if (keyword.length < 3) return null;
+  return {
+    id: String(input?.id || newId("exclusion_suggestion")).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 100),
+    keyword,
+    reason: String(input?.reason ?? "").replace(/\s+/g, " ").trim().slice(0, 240) || null,
+    sourceJobIds: [...new Set(Array.isArray(input?.sourceJobIds) ? input.sourceJobIds.map(String) : input?.sourceJobId ? [String(input.sourceJobId)] : [])].slice(0, 30),
+    sourceTitles: [...new Set(Array.isArray(input?.sourceTitles) ? input.sourceTitles.map((value) => String(value).trim()).filter(Boolean) : input?.sourceTitle ? [String(input.sourceTitle).trim()] : [])].slice(0, 12),
+    sourceRunId: input?.sourceRunId ? String(input.sourceRunId) : null,
+    sourceType: input?.sourceType === "review-reflection" ? "review-reflection" : "job-review",
+    status: input?.status === "approved" ? "approved" : "pending",
+    createdAt: input?.createdAt || new Date().toISOString(),
+    approvedAt: input?.approvedAt || null
+  };
+}
+
+function normalizeExclusionPhrase(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9+#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function exclusionKeywordCovered(keyword, enabledKeywords = []) {
+  const candidate = normalizeExclusionPhrase(keyword);
+  if (!candidate) return false;
+  const paddedCandidate = ` ${candidate} `;
+  return enabledKeywords.some((value) => {
+    const enabled = normalizeExclusionPhrase(value);
+    return enabled && paddedCandidate.includes(` ${enabled} `);
+  });
+}
+
+function removeCoveredPendingExclusionSuggestions(state) {
+  const enabledKeywords = state.settings.exclusionKeywords ?? [];
+  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => suggestion.status !== "pending"
+    || !exclusionKeywordCovered(suggestion.keyword, enabledKeywords));
+}
+
+function compactPendingExclusionSuggestions(state) {
+  const compacted = [];
+  for (const suggestion of state.exclusionSuggestions) {
+    if (suggestion.status !== "pending") {
+      compacted.push(suggestion);
+      continue;
+    }
+    const keyword = compactExclusionKeyword(suggestion.keyword);
+    if (!keyword) continue;
+    const existing = compacted.find((item) => item.status === "pending" && item.keyword.toLowerCase() === keyword);
+    if (existing) {
+      existing.sourceJobIds = [...new Set([...(existing.sourceJobIds ?? []), ...(suggestion.sourceJobIds ?? [])])].slice(0, 30);
+      existing.sourceTitles = [...new Set([...(existing.sourceTitles ?? []), ...(suggestion.sourceTitles ?? [])])].slice(0, 12);
+      existing.reason ||= suggestion.reason;
+      continue;
+    }
+    compacted.push({ ...suggestion, keyword });
+  }
+  state.exclusionSuggestions = compacted;
+}
+
+function addExclusionSuggestions(state, job, signals) {
+  if (isPositiveJobFeedback(job)) return;
+  const active = state.settings.exclusionKeywords ?? [];
+  for (const rawKeyword of signals?.exclusionKeywords ?? []) {
+    const keyword = compactExclusionKeyword(rawKeyword);
+    if (!keyword) continue;
+    const normalized = keyword.toLowerCase();
+    if (exclusionKeywordCovered(keyword, active)) continue;
+    const existing = state.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === normalized);
+    if (existing) {
+      existing.sourceJobIds = [...new Set([...(existing.sourceJobIds ?? []), job.id])].slice(0, 30);
+      existing.sourceTitles = [...new Set([...(existing.sourceTitles ?? []), job.title])].slice(0, 12);
+      existing.reason ||= signals.exclusionReason || job.screening?.reason || null;
+      continue;
+    }
+    const suggestion = safeExclusionSuggestion({
+      keyword,
+      reason: signals.exclusionReason || job.screening?.reason,
+      sourceJobId: job.id,
+      sourceTitle: job.title,
+      sourceRunId: job.runId,
+      sourceType: "job-review"
+    });
+    if (suggestion) state.exclusionSuggestions.unshift(suggestion);
+  }
+  compactPendingExclusionSuggestions(state);
+  state.exclusionSuggestions = state.exclusionSuggestions.slice(0, 300);
+}
+
+function removeJobFromPendingExclusionSuggestions(state, jobId) {
+  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => {
+    if (suggestion.status !== "pending" || !(suggestion.sourceJobIds ?? []).includes(jobId)) return true;
+    suggestion.sourceJobIds = suggestion.sourceJobIds.filter((id) => id !== jobId);
+    suggestion.sourceTitles = [...new Set(suggestion.sourceJobIds
+      .map((id) => state.jobs.find((job) => job.id === id)?.title)
+      .filter(Boolean))].slice(0, 12);
+    return suggestion.sourceJobIds.length > 0;
+  });
+}
+
+function addReflectionExclusionSuggestions(state, evidenceJobs, preferenceModel, runId) {
+  const jobs = evidenceJobs.filter(isStrictExclusionFeedback);
+  if (!jobs.length) return;
+  const evidenceIds = new Set(jobs.map((job) => job.id));
+  const legacyReflectionReasons = new Set([
+    "人工确认 Rejected 判断正确后，由审阅复盘整理。",
+    "根据人工确认的不相关职位，由审阅复盘整理为待审核建议。"
+  ]);
+  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => suggestion.status !== "pending"
+    || !(suggestion.sourceType === "review-reflection" || legacyReflectionReasons.has(suggestion.reason))
+    || !(suggestion.sourceJobIds ?? []).some((id) => evidenceIds.has(id)));
+  const active = state.settings.exclusionKeywords ?? [];
+  const candidates = [...new Set([
+    ...(preferenceModel?.avoidSignals ?? []),
+    ...(preferenceModel?.titleExclusions ?? [])
+  ].map(compactExclusionKeyword).filter(Boolean))];
+  const coveredJobIds = new Set();
+  for (const keyword of candidates) {
+    const normalized = String(keyword).toLowerCase().trim();
+    if (normalized.length < 3 || exclusionKeywordCovered(keyword, active)) continue;
+    const sources = jobs.filter((job) => {
+      const title = String(job.title || "").toLowerCase();
+      return title.includes(normalized) || normalized.includes(title);
+    }).filter((job) => !coveredJobIds.has(job.id));
+    if (!sources.length) continue;
+    const existing = state.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === normalized);
+    if (existing) {
+      existing.sourceJobIds = [...new Set([...(existing.sourceJobIds ?? []), ...sources.map((job) => job.id)])].slice(0, 30);
+      existing.sourceTitles = [...new Set([...(existing.sourceTitles ?? []), ...sources.map((job) => job.title)])].slice(0, 12);
+      existing.reason ||= "根据人工确认的不相关职位，由审阅复盘整理为待审核建议。";
+      existing.sourceType = "review-reflection";
+      sources.forEach((job) => coveredJobIds.add(job.id));
+      continue;
+    }
+    const suggestion = safeExclusionSuggestion({
+      keyword,
+      reason: "根据人工确认的不相关职位，由审阅复盘整理为待审核建议。",
+      sourceJobIds: sources.map((job) => job.id),
+      sourceTitles: sources.map((job) => job.title),
+      sourceRunId: runId,
+      sourceType: "review-reflection"
+    });
+    if (suggestion) state.exclusionSuggestions.unshift(suggestion);
+    sources.forEach((job) => coveredJobIds.add(job.id));
+  }
+  compactPendingExclusionSuggestions(state);
+  removeCoveredPendingExclusionSuggestions(state);
+  state.exclusionSuggestions = state.exclusionSuggestions.slice(0, 300);
+}
+
+function backfillPreferenceExclusionSuggestions(state) {
+  if (!state.preferenceModel) return;
+  const evidenceJobs = state.jobs.filter(isStrictExclusionFeedback);
+  state.preferenceModel = ensurePreferenceModelNegativeCoverage(state.preferenceModel, evidenceJobs);
+  const reflection = state.reviewReflections.find((item) => item.id === state.runs
+    .find((run) => run.id === state.preferenceModel.sourceRunId)?.reviewReflectionId)
+    ?? state.reviewReflections.find((item) => item.runId === state.preferenceModel.sourceRunId);
+  if (reflection && reflection.version === state.preferenceModel.version) {
+    reflection.modelSnapshot = state.preferenceModel;
+  }
+  addReflectionExclusionSuggestions(state, evidenceJobs, state.preferenceModel, state.preferenceModel.sourceRunId);
+}
+
 function feedbackFingerprint(jobs) {
   const source = jobs
-    .map((job) => `${job.id}:${job.feedback?.updatedAt ?? ""}:${job.feedback?.reason ?? ""}:${job.feedback?.note ?? ""}`)
+    .map((job) => `${job.id}:${job.feedback?.updatedAt ?? ""}:${job.feedback?.reason ?? ""}:${job.feedback?.note ?? ""}:${job.learningSignals?.generatedAt ?? ""}:${(job.learningSignals?.exclusionKeywords ?? []).join(",")}`)
     .sort()
     .join("|");
   return createHash("sha256").update(source).digest("hex");
+}
+
+function uniqueJobsById(jobs) {
+  return [...new Map(jobs.map((job) => [job.id, job])).values()];
 }
 
 function feedbackForAi(job) {
@@ -342,9 +584,39 @@ function feedbackForAi(job) {
     previousCategory: job.screening?.category,
     previousScore: job.screening?.score,
     previousReason: job.screening?.reason,
+    helpfulness: job.feedback?.helpfulness,
     feedbackReason: job.feedback?.reason,
-    userNote: job.feedback?.note
+    userNote: job.feedback?.note,
+    targetKeywords: job.learningSignals?.targetKeywords ?? []
   };
+}
+
+function rejectedSignalForAi(job) {
+  return {
+    jobId: job.id,
+    title: job.title,
+    company: job.company,
+    location: job.location,
+    source: job.source,
+    searchKeyword: job.searchKeyword,
+    score: job.screening?.score,
+    reason: job.screening?.reason,
+    concerns: job.screening?.concerns ?? [],
+    exclusionKeywords: job.learningSignals?.exclusionKeywords ?? [],
+    exclusionReason: job.learningSignals?.exclusionReason ?? null,
+    humanConfirmed: isConfirmedRejection(job),
+    feedbackReason: job.feedback?.reason ?? null,
+    userNote: job.feedback?.note ?? null
+  };
+}
+
+function isAiRoleRejectedSignal(job) {
+  const rejected = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
+  return rejected
+    && job.screening?.workRights?.assessment !== "INELIGIBLE"
+    && (isConfirmedRejection(job) || Boolean(hasAiJdReview(job)
+      && !isPositiveJobFeedback(job)
+      && job.learningSignals?.exclusionKeywords?.length));
 }
 
 function safeTaskCategoryInput(input, existing = null) {
@@ -546,7 +818,32 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
     } : rawJob, { thresholds: state.settings.thresholds, runId, preferenceModel: state.preferenceModel });
     const key = strongSourceKey(candidate);
     const existing = key ? existingByKey.get(key) : null;
-    if (existing) candidate.duplicateOf = existing.id;
+    if (existing) {
+      candidate.duplicateOf = existing.id;
+      if (!candidate.description && existing.description) {
+        candidate.description = existing.description;
+        candidate.descriptionSource = existing.descriptionSource;
+        candidate.descriptionFetchStatus = existing.descriptionFetchStatus;
+        candidate.descriptionFetchedAt = existing.descriptionFetchedAt;
+      }
+      if (existing.screening?.jdReviewed && /^ai(?:$|-)/i.test(existing.screening.engine || "")) {
+        candidate.description = existing.description;
+        candidate.descriptionSource = existing.descriptionSource;
+        candidate.descriptionFetchStatus = existing.descriptionFetchStatus;
+        candidate.descriptionFetchError = null;
+        candidate.descriptionFetchedAt = existing.descriptionFetchedAt;
+        candidate.screening = {
+          ...JSON.parse(JSON.stringify(existing.screening)),
+          reusedFromJobId: existing.id
+        };
+        candidate.reviewedAt = existing.reviewedAt;
+        candidate.aiReview = {
+          status: "reused",
+          reusedFromJobId: existing.id,
+          completedAt: existing.reviewedAt || new Date().toISOString()
+        };
+      }
+    }
     if (key) existingByKey.set(key, candidate);
     state.jobs.push(candidate);
     jobs.push(candidate);
@@ -572,6 +869,290 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
   return jobs;
 }
 
+function isRejectedBeforeJd(job) {
+  return !job.screening?.jdReviewed
+    && (job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT");
+}
+
+function hasAiJdReview(job) {
+  return Boolean(job.screening?.jdReviewed && /^ai(?:$|-)/i.test(job.screening?.engine || ""));
+}
+
+function hasCompleteDescription(job) {
+  if (!job.description || job.descriptionFetchStatus === "failed") return false;
+  return job.descriptionFetchStatus === "fetched"
+    || job.descriptionSource === "detail-page"
+    || job.source === "manual"
+    || !job.runTaskId;
+}
+
+function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
+  const jobIds = [];
+  const profile = state.profiles.find((item) => item.id === state.activeProfileId);
+  const aiConfigured = aiStatus().configured;
+  for (const job of jobs) {
+    if (isRejectedBeforeJd(job)) {
+      job.aiReview = { status: "skipped", reason: "title_rejected" };
+      continue;
+    }
+    if (hasAiJdReview(job) && !force) continue;
+    if (!hasCompleteDescription(job)) {
+      job.screening.screeningStatus = "JD_FETCH_FAILED";
+      job.aiReview = {
+        status: "blocked",
+        reason: job.descriptionFetchError || "The complete job description could not be fetched."
+      };
+      continue;
+    }
+    if (!profile) {
+      job.screening.screeningStatus = "PROFILE_REQUIRED";
+      job.aiReview = { status: "blocked", reason: "Activate a career profile before automatic AI review." };
+      continue;
+    }
+    if (!aiConfigured) {
+      job.screening.screeningStatus = "AI_NOT_CONFIGURED";
+      job.aiReview = { status: "blocked", reason: "Configure AI before automatic JD review." };
+      continue;
+    }
+    job.screening = {
+      ...job.screening,
+      jdReviewed: false,
+      screeningStatus: "AI_QUEUED",
+      engine: "ai-pending"
+    };
+    job.aiReview = { status: "queued", queuedAt: new Date().toISOString() };
+    jobIds.push(job.id);
+  }
+  return jobIds;
+}
+
+function buildOnDemandJdUrl(job, batchId = null) {
+  const marker = new URLSearchParams({ jobAgentOnDemandJd: job.id });
+  if (batchId) marker.set("jobAgentJdBatch", batchId);
+  if (job.source === "indeed") {
+    let sourceUrl = null;
+    try { sourceUrl = new URL(job.jobUrl); } catch {}
+    const jobId = job.sourceJobId || sourceUrl?.searchParams.get("jk") || sourceUrl?.searchParams.get("vjk");
+    if (!jobId) throw new Error("Indeed job ID is missing, so the JD page cannot be opened.");
+    const url = new URL("https://au.indeed.com/jobs");
+    url.searchParams.set("q", primarySearchKeyword(job.searchKeyword) || job.title);
+    url.searchParams.set("l", job.searchLocation || job.location || "Australia");
+    if (Number(job.searchPostedWithinDays) > 0) url.searchParams.set("fromage", String(job.searchPostedWithinDays));
+    url.searchParams.set("vjk", jobId);
+    url.hash = marker.toString();
+    return url.href;
+  }
+  if (!job.jobUrl) throw new Error("The original job link is missing.");
+  const url = new URL(job.jobUrl);
+  const host = url.hostname.toLowerCase();
+  if (job.source === "linkedin" && !host.endsWith("linkedin.com")) throw new Error("The LinkedIn job link is invalid.");
+  if (job.source === "seek" && !host.endsWith("seek.com.au")) throw new Error("The SEEK job link is invalid.");
+  if (!["linkedin", "seek"].includes(job.source)) throw new Error("This platform does not support automatic JD retrieval.");
+  url.hash = marker.toString();
+  return url.href;
+}
+
+function markJobJdFetching(job) {
+  job.descriptionFetchStatus = "fetching";
+  job.descriptionFetchError = null;
+  job.screening = { ...job.screening, jdReviewed: false, screeningStatus: "JD_FETCHING" };
+  job.aiReview = { status: "fetching_jd", startedAt: new Date().toISOString() };
+}
+
+function retryableFailedJd(job) {
+  const staleFetch = job?.screening?.screeningStatus === "JD_FETCHING"
+    && Date.now() - Date.parse(job.aiReview?.startedAt || 0) > 30_000;
+  return Boolean(job
+    && !isRejectedBeforeJd(job)
+    && ["linkedin", "indeed", "seek"].includes(job.source)
+    && (job.descriptionFetchStatus === "failed" || job.screening?.screeningStatus === "JD_FETCH_FAILED" || staleFetch));
+}
+
+async function advanceJdRetryBatch(batchId) {
+  const batch = jdRetryBatches.get(batchId);
+  if (!batch) return { done: true, batchId, total: 0, completed: 0, remaining: 0 };
+  if (batch.currentJobId) {
+    batch.completed += 1;
+    batch.currentJobId = null;
+  }
+  while (batch.cursor < batch.jobIds.length) {
+    const jobId = batch.jobIds[batch.cursor];
+    batch.cursor += 1;
+    const prepared = await storage.update((state) => {
+      const job = state.jobs.find((item) => item.id === jobId);
+      if (!retryableFailedJd(job)) return null;
+      let launchUrl;
+      try {
+        launchUrl = buildOnDemandJdUrl(job, batch.id);
+      } catch (error) {
+        job.descriptionFetchStatus = "failed";
+        job.descriptionFetchError = String(error.message || error).slice(0, 500);
+        job.screening = { ...job.screening, jdReviewed: false, screeningStatus: "JD_FETCH_FAILED" };
+        return { skipped: true };
+      }
+      markJobJdFetching(job);
+      return { job, launchUrl };
+    });
+    if (!prepared || prepared.skipped) {
+      batch.completed += 1;
+      continue;
+    }
+    batch.currentJobId = jobId;
+    return {
+      ...prepared,
+      done: false,
+      batchId: batch.id,
+      total: batch.jobIds.length,
+      completed: batch.completed,
+      remaining: batch.jobIds.length - batch.completed
+    };
+  }
+  batch.completed = batch.jobIds.length;
+  jdRetryBatches.delete(batch.id);
+  return {
+    done: true,
+    batchId: batch.id,
+    total: batch.jobIds.length,
+    completed: batch.jobIds.length,
+    remaining: 0
+  };
+}
+
+function enqueueAutoReviews(jobIds) {
+  for (const jobId of jobIds) {
+    if (!jobId || queuedAutoReviewIds.has(jobId)) continue;
+    queuedAutoReviewIds.add(jobId);
+    autoReviewQueue.push(jobId);
+  }
+  if (!autoReviewRunning && autoReviewQueue.length) void drainAutoReviewQueue();
+}
+
+async function prepareAutoReview(jobId) {
+  return storage.update((state) => {
+    const job = state.jobs.find((item) => item.id === jobId);
+    if (!job || hasAiJdReview(job) || isRejectedBeforeJd(job)) return null;
+    const profile = state.profiles.find((item) => item.id === state.activeProfileId);
+    const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
+    if (run) ensureRunCounterShape(run);
+    if (!hasCompleteDescription(job)) {
+      job.screening.screeningStatus = "JD_FETCH_FAILED";
+      job.aiReview = { status: "blocked", reason: job.descriptionFetchError || "Complete JD unavailable." };
+      return null;
+    }
+    if (!profile) {
+      job.screening.screeningStatus = "PROFILE_REQUIRED";
+      job.aiReview = { status: "blocked", reason: "No active career profile." };
+      return null;
+    }
+    if (!aiStatus().configured) {
+      job.screening.screeningStatus = "AI_NOT_CONFIGURED";
+      job.aiReview = { status: "blocked", reason: "AI is not configured." };
+      return null;
+    }
+    if (!canUseAiForRun(run)) {
+      if (run) run.counters.ai.budgetSkipped += 1;
+      job.screening.screeningStatus = "AI_BUDGET_SKIPPED";
+      job.aiReview = { status: "blocked", reason: "The automatic AI review limit for this run was reached." };
+      return null;
+    }
+    if (run) run.counters.ai.calls += 1;
+    const startedAt = new Date().toISOString();
+    job.screening = { ...job.screening, screeningStatus: "AI_REVIEWING", engine: "ai-pending" };
+    job.aiReview = { status: "reviewing", startedAt };
+    return {
+      job: JSON.parse(JSON.stringify(job)),
+      profile: JSON.parse(JSON.stringify(profile.profile)),
+      thresholds: JSON.parse(JSON.stringify(state.settings.thresholds)),
+      preferenceModel: state.preferenceModel ? JSON.parse(JSON.stringify(state.preferenceModel)) : null
+    };
+  });
+}
+
+async function processAutoReview(jobId) {
+  const prepared = await prepareAutoReview(jobId);
+  if (!prepared) return;
+  try {
+    const evaluated = await evaluateJdWithAi(
+      prepared.job,
+      prepared.profile,
+      prepared.thresholds,
+      prepared.preferenceModel
+    );
+    await storage.update((state) => {
+      const job = state.jobs.find((item) => item.id === jobId);
+      if (!job) return;
+      const completedAt = new Date().toISOString();
+      job.screening = evaluated.screening;
+      job.reviewedAt = completedAt;
+      job.aiReview = { status: "completed", completedAt, usage: evaluated.usage };
+      const roleRejected = job.screening.category === "REJECTED" && job.screening.workRights?.assessment !== "INELIGIBLE";
+      job.learningSignals = {
+        targetKeywords: evaluated.preferenceSignals.targetKeywords,
+        exclusionKeywords: roleRejected ? evaluated.preferenceSignals.exclusionKeywords : [],
+        exclusionReason: roleRejected ? evaluated.preferenceSignals.exclusionReason : "",
+        generatedAt: completedAt,
+        engine: "ai"
+      };
+      if (roleRejected) addExclusionSuggestions(state, job, job.learningSignals);
+      const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
+      if (run) {
+        ensureRunCounterShape(run);
+        run.counters.ai.jdReviewed += 1;
+        recordAiUsage(run, evaluated.usage);
+      }
+    });
+  } catch (error) {
+    await storage.update((state) => {
+      const job = state.jobs.find((item) => item.id === jobId);
+      if (!job) return;
+      job.screening = {
+        ...job.screening,
+        jdReviewed: false,
+        screeningStatus: "AI_ERROR",
+        engine: "ai-error",
+        reason: `AI JD review failed: ${error.message}`,
+        concerns: [...(job.screening?.concerns ?? []), "automatic AI review needs another attempt"]
+      };
+      job.aiReview = { status: "failed", failedAt: new Date().toISOString(), reason: error.message };
+      const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
+      if (run) {
+        ensureRunCounterShape(run);
+        run.counters.ai.errors += 1;
+      }
+    });
+  }
+}
+
+async function drainAutoReviewQueue() {
+  if (autoReviewRunning) return;
+  autoReviewRunning = true;
+  try {
+    while (autoReviewQueue.length) {
+      const jobId = autoReviewQueue.shift();
+      queuedAutoReviewIds.delete(jobId);
+      await processAutoReview(jobId);
+    }
+  } finally {
+    autoReviewRunning = false;
+    if (autoReviewQueue.length) void drainAutoReviewQueue();
+  }
+}
+
+async function resumeAutoReviews() {
+  const ids = await storage.update((state) => {
+    const pending = [];
+    for (const job of state.jobs) {
+      if (!["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus)) continue;
+      job.screening.screeningStatus = "AI_QUEUED";
+      job.screening.engine = "ai-pending";
+      job.aiReview = { status: "queued", queuedAt: new Date().toISOString(), resumed: true };
+      pending.push(job.id);
+    }
+    return pending;
+  });
+  enqueueAutoReviews(ids);
+}
+
 function jobBelongsToRunTask(job, task, run) {
   if (job.runTaskId) return job.runTaskId === task.id;
   const normalized = (value) => String(value ?? "").trim().toLowerCase();
@@ -585,7 +1166,7 @@ function jobBelongsToRunTask(job, task, run) {
 
 function reconcileLearningAfterJobDeletion(state, removedJobs) {
   const removedIds = new Set(removedJobs.map((job) => job.id));
-  const removedFeedback = removedJobs.some((job) => job.feedback?.helpfulness === "NOT_HELPFUL");
+  const removedFeedback = removedJobs.some((job) => job.feedback || job.learningSignals);
   const invalidReflectionRunIds = new Set(state.reviewReflections
     .filter((reflection) => (reflection.feedbackJobIds ?? []).some((id) => removedIds.has(id)))
     .map((reflection) => reflection.runId));
@@ -597,18 +1178,29 @@ function reconcileLearningAfterJobDeletion(state, removedJobs) {
     }
   }
   if (!removedFeedback) return;
-  const activeFeedback = state.jobs
-    .filter((job) => job.feedback?.helpfulness === "NOT_HELPFUL")
+  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => {
+    suggestion.sourceJobIds = (suggestion.sourceJobIds ?? []).filter((id) => !removedIds.has(id));
+    return suggestion.status === "approved" || suggestion.sourceJobIds.length;
+  });
+  const helpfulJobs = state.jobs
+    .filter(isPositiveJobFeedback)
     .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
     .slice(0, 120);
-  if (!activeFeedback.length) {
+  const legacyNotHelpfulJobs = state.jobs
+    .filter(isLegacyNegativeJobFeedback)
+    .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
+    .slice(0, 120);
+  const rejectedJobs = state.jobs.filter(isAiRoleRejectedSignal).slice(0, 120);
+  if (!helpfulJobs.length && !legacyNotHelpfulJobs.length && !rejectedJobs.length) {
     state.preferenceModel = null;
     return;
   }
   const now = new Date().toISOString();
-  state.preferenceModel = validatePreferenceModel(localPreferenceReflection(activeFeedback), {
+  state.preferenceModel = validatePreferenceModel(localPreferenceReflection({ helpfulJobs, rejectedJobs, legacyNotHelpfulJobs }), {
     version: (Number(state.preferenceModel?.version) || 0) + 1,
-    feedbackCount: activeFeedback.length,
+    feedbackCount: helpfulJobs.length + legacyNotHelpfulJobs.length + rejectedJobs.length,
+    positiveFeedbackCount: helpfulJobs.length,
+    rejectedSignalCount: rejectedJobs.length,
     sourceRunId: null,
     engine: "local-rules-after-deletion",
     updatedAt: now
@@ -661,6 +1253,8 @@ function createRun(settings, routineTasks, routineTaskIds = null) {
     location: task.location,
     priority: index + 1,
     postedWithinDays: task.postedWithinDays,
+    exclusionKeywords: [...(settings.exclusionKeywords ?? [])],
+    workerTiming: { ...(settings.workerTiming ?? {}) },
     attempt: 1,
     status: "queued",
     reason: null,
@@ -668,6 +1262,7 @@ function createRun(settings, routineTasks, routineTaskIds = null) {
     completedAt: null,
     workerId: null,
     workerHeartbeatAt: null,
+    stopRequestedAt: null,
     progress: null
   }));
   if (!tasks.length) throw new Error("Add and validate at least one daily task before starting a run.");
@@ -755,7 +1350,15 @@ async function handleApi(request, response, url) {
   }
   if (request.method === "PUT" && path === "/api/ai-config") {
     const body = await readJson(request);
-    return sendJson(response, 200, { ai: await saveAiConfig(mergedAiConfig(body)) });
+    const ai = await saveAiConfig(mergedAiConfig(body));
+    if (ai.configured) {
+      const ids = await storage.update((state) => prepareAutoReviewJobs(
+        state,
+        state.jobs.filter((job) => ["AI_NOT_CONFIGURED", "AI_ERROR"].includes(job.screening?.screeningStatus))
+      ));
+      enqueueAutoReviews(ids);
+    }
+    return sendJson(response, 200, { ai });
   }
   if (request.method === "POST" && path === "/api/ai-config/test") {
     const body = await readJson(request);
@@ -774,7 +1377,8 @@ async function handleApi(request, response, url) {
         validations: state.validations.length,
         importBatches: state.importBatches.length,
         reviewReflections: state.reviewReflections.length,
-        preferenceModel: state.preferenceModel ? 1 : 0
+        preferenceModel: state.preferenceModel ? 1 : 0,
+        exclusionSuggestions: state.exclusionSuggestions.length
       };
       state.jobs = [];
       state.runs = [];
@@ -786,6 +1390,7 @@ async function handleApi(request, response, url) {
       state.importBatches = [];
       state.reviewReflections = [];
       state.preferenceModel = null;
+      state.exclusionSuggestions = [];
       return {
         cleared: counts,
         preserved: {
@@ -803,8 +1408,69 @@ async function handleApi(request, response, url) {
   if (request.method === "PUT" && path === "/api/settings") {
     const body = await readJson(request);
     const settings = safeSettings(body);
-    await storage.update((state) => { state.settings = settings; });
+    await storage.update((state) => {
+      state.settings = settings;
+      removeCoveredPendingExclusionSuggestions(state);
+    });
     return sendJson(response, 200, { settings });
+  }
+  if (request.method === "GET" && path === "/api/worker/settings") {
+    const state = await storage.ensureState();
+    const runId = String(url.searchParams.get("runId") ?? "");
+    const run = runId ? state.runs.find((item) => item.id === runId) : null;
+    return sendJson(response, 200, {
+      workerTiming: run?.settingsSnapshot?.workerTiming ?? state.settings.workerTiming,
+      source: run ? "run-snapshot" : "current-settings",
+      runId: run?.id ?? null
+    });
+  }
+  if (request.method === "POST" && path === "/api/settings/exclusion-keywords") {
+    const body = await readJson(request);
+    const keyword = String(body.keyword ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+    if (keyword.length < 2) throw new Error("Enter an exclusion keyword with at least two characters.");
+    const settings = await storage.update((state) => {
+      const existing = state.settings.exclusionKeywords ?? [];
+      if (!exclusionKeywordCovered(keyword, existing)) state.settings.exclusionKeywords.push(keyword);
+      removeCoveredPendingExclusionSuggestions(state);
+      return state.settings;
+    });
+    return sendJson(response, 201, { settings });
+  }
+  const exclusionKeywordMatch = /^\/api\/settings\/exclusion-keywords\/([^/]+)$/.exec(path);
+  if (request.method === "DELETE" && exclusionKeywordMatch) {
+    const keyword = decodeURIComponent(exclusionKeywordMatch[1]);
+    const settings = await storage.update((state) => {
+      state.settings.exclusionKeywords = (state.settings.exclusionKeywords ?? []).filter((value) => value.toLowerCase() !== keyword.toLowerCase());
+      const suggestion = state.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === keyword.toLowerCase());
+      if (suggestion) {
+        suggestion.status = "pending";
+        suggestion.approvedAt = null;
+      }
+      return state.settings;
+    });
+    return sendJson(response, 200, { settings });
+  }
+  const exclusionSuggestionMatch = /^\/api\/exclusion-suggestions\/([^/]+)$/.exec(path);
+  if (request.method === "POST" && exclusionSuggestionMatch) {
+    const result = await storage.update((state) => {
+      const suggestion = state.exclusionSuggestions.find((item) => item.id === exclusionSuggestionMatch[1]);
+      if (!suggestion) throw new Error("Exclusion suggestion was not found.");
+      suggestion.status = "approved";
+      suggestion.approvedAt = new Date().toISOString();
+      const existing = state.settings.exclusionKeywords ?? [];
+      if (!exclusionKeywordCovered(suggestion.keyword, existing)) state.settings.exclusionKeywords.push(suggestion.keyword);
+      removeCoveredPendingExclusionSuggestions(state);
+      return { suggestion, settings: state.settings };
+    });
+    return sendJson(response, 200, result);
+  }
+  if (request.method === "DELETE" && exclusionSuggestionMatch) {
+    const deleted = await storage.update((state) => {
+      const index = state.exclusionSuggestions.findIndex((item) => item.id === exclusionSuggestionMatch[1]);
+      if (index < 0) throw new Error("Exclusion suggestion was not found.");
+      return state.exclusionSuggestions.splice(index, 1)[0];
+    });
+    return sendJson(response, 200, { deleted });
   }
   if (request.method === "POST" && path === "/api/resumes/upload") {
     const buffer = await readBody(request);
@@ -871,6 +1537,11 @@ async function handleApi(request, response, url) {
       state.profiles = [record];
       return { profile: record, deleted };
     });
+    const ids = await storage.update((state) => prepareAutoReviewJobs(
+      state,
+      state.jobs.filter((job) => job.screening?.screeningStatus === "PROFILE_REQUIRED")
+    ));
+    enqueueAutoReviews(ids);
     return sendJson(response, 200, { profile: publicProfile(result.profile), deleted: result.deleted });
   }
   if (request.method === "DELETE" && path === "/api/profiles/other-versions") {
@@ -1271,7 +1942,7 @@ async function handleApi(request, response, url) {
       const pausedForPlatform = run.tasks.find((item) => item.platform === platform && item.status === "needs_user_action");
       if (pausedForPlatform) return { run, task: null, reason: "needs_user_action" };
       const nextInSequence = run.tasks.find((item) => ["queued", "running", "needs_user_action"].includes(item.status));
-      if (run.settingsSnapshot.executionMode === "sequential" && nextInSequence?.platform !== platform) {
+      if (run.settingsSnapshot.executionMode === "sequential" && nextInSequence && nextInSequence.platform !== platform) {
         return { run, task: null, reason: "waiting_turn" };
       }
       if (nextInSequence?.status === "needs_user_action" && run.settingsSnapshot.executionMode === "sequential") {
@@ -1309,11 +1980,93 @@ async function handleApi(request, response, url) {
         message: String(body.message || "Worker 正在处理任务。").slice(0, 240),
         scanned: Math.max(0, Number(body.scanned) || 0),
         found: Math.max(0, Number(body.found) || 0),
+        accessCount: Math.max(0, Number(body.accessCount) || 0),
+        accessLimit: Math.max(0, Number(body.accessLimit) || 0),
+        cooldownUntil: body.cooldownUntil ? String(body.cooldownUntil).slice(0, 40) : null,
+        cooldownReason: body.cooldownReason ? String(body.cooldownReason).slice(0, 240) : null,
         updatedAt: now
       };
-      return { run, task, discarded: false };
+      return { run, task, discarded: false, stopRequested: Boolean(task.stopRequestedAt) };
     });
     return sendJson(response, 200, result);
+  }
+  if (request.method === "POST" && path === "/api/worker/title-plan") {
+    const body = await readJson(request);
+    const rawJobs = Array.isArray(body.jobs) ? body.jobs.slice(0, 1000) : [];
+    const state = await storage.ensureState();
+    const existingByKey = new Map(state.jobs.map((job) => [strongSourceKey(job), job]).filter(([key]) => key));
+    const plan = rawJobs.map((rawJob, index) => {
+      try {
+        const job = normalizeJob(rawJob, {
+          thresholds: state.settings.thresholds,
+          runId: body.runId || null,
+          preferenceModel: state.preferenceModel
+        });
+        const existing = existingByKey.get(strongSourceKey(job));
+        if (isRejectedBeforeJd(job)) {
+          return { index, action: "reject", reason: job.screening.reason };
+        }
+        if (existing && hasAiJdReview(existing) && existing.description) {
+          return { index, action: "reuse", existingJobId: existing.id };
+        }
+        return { index, action: "fetch" };
+      } catch (error) {
+        return { index, action: "fetch", warning: error.message };
+      }
+    });
+    return sendJson(response, 200, {
+      plan,
+      counts: {
+        total: plan.length,
+        fetch: plan.filter((item) => item.action === "fetch").length,
+        reuse: plan.filter((item) => item.action === "reuse").length,
+        rejected: plan.filter((item) => item.action === "reject").length
+      }
+    });
+  }
+  if (request.method === "POST" && path === "/api/worker/job-jd") {
+    const body = await readJson(request);
+    const result = await storage.update((state) => {
+      const job = state.jobs.find((item) => item.id === body.jobId);
+      if (!job) throw new Error("Job was not found.");
+      if (job.source !== body.platform) throw new Error("The JD result came from the wrong platform Worker.");
+      const description = String(body.description || "").replace(/\s+/g, " ").trim();
+      const failureReason = String(body.humanReason || body.error || "").trim();
+      if (failureReason || description.length < 120) {
+        const reason = failureReason || "The page did not contain a complete job description.";
+        job.descriptionFetchStatus = "failed";
+        job.descriptionFetchError = reason.slice(0, 500);
+        job.screening = { ...job.screening, jdReviewed: false, screeningStatus: "JD_FETCH_FAILED" };
+        job.aiReview = {
+          status: body.humanReason ? "needs_user_action" : "failed",
+          reason: job.descriptionFetchError,
+          failedAt: new Date().toISOString()
+        };
+        const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
+        if (run) recalculateRunCounters(state, run);
+        return { job, autoReviewJobIds: [] };
+      }
+      job.description = description;
+      job.descriptionSource = "detail-page";
+      job.descriptionFetchStatus = "fetched";
+      job.descriptionFetchError = null;
+      job.descriptionFetchedAt = new Date().toISOString();
+      const autoReviewJobIds = prepareAutoReviewJobs(state, [job], { force: true });
+      const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
+      if (run) recalculateRunCounters(state, run);
+      return { job, autoReviewJobIds };
+    });
+    if (body.humanReason && body.batchId) jdRetryBatches.delete(String(body.batchId));
+    enqueueAutoReviews(result.autoReviewJobIds);
+    return sendJson(response, 200, {
+      job: result.job,
+      autoReviewQueued: result.autoReviewJobIds.length
+    });
+  }
+
+  const nextJdRetryMatch = /^\/api\/worker\/jd-retry\/([^/]+)\/next$/.exec(path);
+  if (request.method === "POST" && nextJdRetryMatch) {
+    return sendJson(response, 200, await advanceJdRetryBatch(nextJdRetryMatch[1]));
   }
   if (request.method === "POST" && path === "/api/worker/result") {
     const body = await readJson(request);
@@ -1347,10 +2100,24 @@ async function handleApi(request, response, url) {
       const jobs = Array.isArray(body.jobs) && body.jobs.length
         ? addJobsToState(state, body.jobs, { runId: run.id, label: `${task.platform} worker result`, task })
         : [];
+      const autoReviewJobIds = prepareAutoReviewJobs(state, jobs);
+      if (autoReviewJobIds.length) {
+        task.progress = {
+          phase: "ai_queued",
+          message: `${autoReviewJobIds.length} job descriptions are queued for automatic AI review.`,
+          found: jobs.length,
+          updatedAt: new Date().toISOString()
+        };
+      }
       updateRunState(run);
-      return { run, task, jobs };
+      return { run, task, jobs, autoReviewJobIds };
     });
-    return sendJson(response, 200, result);
+    enqueueAutoReviews(result.autoReviewJobIds || []);
+    return sendJson(response, 200, {
+      ...result,
+      autoReviewQueued: result.autoReviewJobIds?.length || 0,
+      autoReviewJobIds: undefined
+    });
   }
 
   const retryRunTaskMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/retry$/.exec(path);
@@ -1366,6 +2133,7 @@ async function handleApi(request, response, url) {
       task.reason = null;
       task.workerId = null;
       task.workerHeartbeatAt = null;
+      task.stopRequestedAt = null;
       task.progress = null;
       task.startedAt = null;
       task.completedAt = null;
@@ -1401,6 +2169,26 @@ async function handleApi(request, response, url) {
   }
 
   const runTaskMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)$/.exec(path);
+  const stopRunTaskMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/stop$/.exec(path);
+  if (request.method === "POST" && stopRunTaskMatch) {
+    const result = await storage.update((state) => {
+      const run = state.runs.find((item) => item.id === stopRunTaskMatch[1]);
+      const task = run?.tasks.find((item) => item.id === stopRunTaskMatch[2]);
+      if (!run || !task) throw new Error("Run task was not found.");
+      if (task.status !== "running") throw new Error("Only a running task can be stopped while keeping its results.");
+      const now = new Date().toISOString();
+      task.stopRequestedAt ||= now;
+      task.progress = {
+        ...(task.progress || {}),
+        phase: "stopping",
+        message: "已请求停止，等待 Worker 上传当前结果。",
+        updatedAt: now
+      };
+      return { run, task, stopRequested: true };
+    });
+    return sendJson(response, 200, result);
+  }
+
   if (request.method === "DELETE" && runTaskMatch) {
     const result = await storage.update((state) => {
       const run = state.runs.find((item) => item.id === runTaskMatch[1]);
@@ -1456,6 +2244,7 @@ async function handleApi(request, response, url) {
       task.status = "queued";
       task.reason = null;
       task.workerId = null;
+      task.stopRequestedAt = null;
       task.startedAt = null;
       task.completedAt = null;
       updateRunState(run);
@@ -1466,9 +2255,12 @@ async function handleApi(request, response, url) {
 
   if (request.method === "POST" && path === "/api/jobs/import") {
     const body = await readJson(request);
-    const jobs = await storage.update((state) =>
-      addJobsToState(state, body.jobs, { runId: body.runId || null, label: body.label || "manual import" }));
-    return sendJson(response, 201, { jobs });
+    const result = await storage.update((state) => {
+      const jobs = addJobsToState(state, body.jobs, { runId: body.runId || null, label: body.label || "manual import" });
+      return { jobs, autoReviewJobIds: prepareAutoReviewJobs(state, jobs) };
+    });
+    enqueueAutoReviews(result.autoReviewJobIds);
+    return sendJson(response, 201, { jobs: result.jobs, autoReviewQueued: result.autoReviewJobIds.length });
   }
 
   const viewedMatch = /^\/api\/jobs\/([^/]+)\/viewed$/.exec(path);
@@ -1483,13 +2275,55 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { job });
   }
 
+  const runTaskViewedMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/viewed$/.exec(path);
+  if (request.method === "PUT" && runTaskViewedMatch) {
+    const result = await storage.update((state) => {
+      const run = state.runs.find((item) => item.id === runTaskViewedMatch[1]);
+      const task = run?.tasks.find((item) => item.id === runTaskViewedMatch[2]);
+      if (!run || !task) throw new Error("Run task was not found.");
+      if (["queued", "running", "needs_user_action"].includes(task.status)) {
+        throw new Error("Finish the task before marking all of its jobs as viewed.");
+      }
+      const jobs = state.jobs.filter((job) => job.runId === run.id && jobBelongsToRunTask(job, task, run));
+      const viewedAt = new Date().toISOString();
+      let updated = 0;
+      for (const job of jobs) {
+        if (job.viewedAt) continue;
+        job.viewedAt = viewedAt;
+        updated += 1;
+      }
+      return { run, task, total: jobs.length, updated, viewedAt };
+    });
+    return sendJson(response, 200, result);
+  }
+
   const feedbackMatch = /^\/api\/jobs\/([^/]+)\/feedback$/.exec(path);
   if (request.method === "PUT" && feedbackMatch) {
     const body = await readJson(request);
     const job = await storage.update((state) => {
       const job = state.jobs.find((item) => item.id === feedbackMatch[1]);
       if (!job) throw new Error("Job was not found.");
-      job.feedback = safeJobFeedback(body);
+      const clearing = body.helpful === false || body.notHelpful === false || body.helpfulness === null;
+      const feedback = clearing ? null : safeJobFeedback(body);
+      const rejectedJob = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
+      const correctingRejection = feedback?.helpfulness === "REJECTION_INCORRECT"
+        && rejectedJob;
+      const confirmingRejection = feedback?.helpfulness === "HELPFUL"
+        && feedback?.reason === "REJECTION_CORRECT"
+        && rejectedJob;
+      if (!clearing && !hasAiJdReview(job) && !rejectedJob) {
+        throw new Error("Wait for the automatic AI JD review before rating whether its result was helpful.");
+      }
+      if (feedback?.helpfulness === "REJECTION_INCORRECT" && !correctingRejection) {
+        throw new Error("Only a rejected job can be marked as an incorrect rejection.");
+      }
+      if (feedback?.reason === "REJECTION_CORRECT" && !confirmingRejection) {
+        throw new Error("Only a rejected job can be marked as a correct rejection.");
+      }
+      job.feedback = feedback;
+      if (feedback && !job.viewedAt) job.viewedAt = feedback.updatedAt;
+      if (clearing || isPositiveJobFeedback(job)) removeJobFromPendingExclusionSuggestions(state, job.id);
+      if (rejectedJob && isStrictExclusionFeedback(job)) addExclusionSuggestions(state, job, job.learningSignals);
       return job;
     });
     return sendJson(response, 200, { job });
@@ -1503,16 +2337,34 @@ async function handleApi(request, response, url) {
       if (!["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state)) {
         throw new Error("Finish the run before completing its review reflection.");
       }
+      const pendingAiReviews = state.jobs.filter((job) => job.runId === run.id
+        && ["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus));
+      if (pendingAiReviews.length) {
+        throw new Error(`Wait for ${pendingAiReviews.length} automatic AI JD reviews to finish before completing the reflection.`);
+      }
       ensureRunCounterShape(run);
-      const runFeedback = state.jobs.filter((job) => job.runId === run.id && job.feedback?.helpfulness === "NOT_HELPFUL");
+      const runHelpful = state.jobs.filter((job) => job.runId === run.id && isPositiveJobFeedback(job));
+      const runRejected = state.jobs.filter((job) => job.runId === run.id
+        && isAiRoleRejectedSignal(job));
+      const runLegacy = state.jobs.filter((job) => job.runId === run.id && isLegacyNegativeJobFeedback(job));
+      const runEvidence = uniqueJobsById([...runHelpful, ...runRejected, ...runLegacy]);
       const previousReflection = state.reviewReflections.find((item) => item.runId === run.id) ?? null;
-      if (!runFeedback.length && !previousReflection) throw new Error("Mark at least one job as not helpful before reflecting.");
+      if (!runEvidence.length && !previousReflection) throw new Error("Review at least one AI-screened job before completing the reflection.");
 
-      const activeFeedback = state.jobs
-        .filter((job) => job.feedback?.helpfulness === "NOT_HELPFUL")
+      const activeHelpful = state.jobs
+        .filter(isPositiveJobFeedback)
         .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
         .slice(0, 120);
-      const feedback = activeFeedback.map(feedbackForAi);
+      const activeRejected = state.jobs
+        .filter(isAiRoleRejectedSignal)
+        .slice(0, 120);
+      const activeLegacy = state.jobs
+        .filter(isLegacyNegativeJobFeedback)
+        .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
+        .slice(0, 120);
+      const helpfulFeedback = activeHelpful.map(feedbackForAi);
+      const rejectedJobSignals = activeRejected.map(rejectedSignalForAi);
+      const legacyNotHelpfulFeedback = activeLegacy.map(feedbackForAi);
       const profile = state.profiles.find((item) => item.id === state.activeProfileId)?.profile ?? null;
       const ai = aiStatus();
       const canUseAi = ai.configured && run.counters.ai.calls < ai.budget.maxAiCallsPerRun;
@@ -1523,50 +2375,57 @@ async function handleApi(request, response, url) {
       if (canUseAi) {
         run.counters.ai.calls += 1;
         try {
-          const evaluated = await reflectOnJobFeedback({ feedback, previousModel: state.preferenceModel, profile });
+          const evaluated = await reflectOnJobFeedback({ helpfulFeedback, rejectedJobSignals, legacyNotHelpfulFeedback, previousModel: state.preferenceModel, profile });
           generated = evaluated.preferenceModel;
           usage = evaluated.usage;
           recordAiUsage(run, usage);
           engine = "ai";
         } catch (error) {
           aiError = error.message;
-          generated = localPreferenceReflection(activeFeedback);
+          generated = localPreferenceReflection({ helpfulJobs: activeHelpful, rejectedJobs: activeRejected, legacyNotHelpfulJobs: activeLegacy });
           engine = "local-rules-fallback";
         }
       } else {
-        generated = localPreferenceReflection(activeFeedback);
+        generated = localPreferenceReflection({ helpfulJobs: activeHelpful, rejectedJobs: activeRejected, legacyNotHelpfulJobs: activeLegacy });
         if (ai.configured) aiError = "AI call budget reached; local reflection used.";
       }
       const now = new Date().toISOString();
       const version = (Number(state.preferenceModel?.version) || 0) + 1;
-      const preferenceModel = validatePreferenceModel(generated, {
+      let preferenceModel = validatePreferenceModel(generated, {
         version,
-        feedbackCount: activeFeedback.length,
+        feedbackCount: activeHelpful.length + activeRejected.length + activeLegacy.length,
+        positiveFeedbackCount: activeHelpful.length,
+        rejectedSignalCount: activeRejected.length,
         sourceRunId: run.id,
         engine,
         updatedAt: now
       });
+      preferenceModel = ensurePreferenceModelNegativeCoverage(preferenceModel, state.jobs);
       const reflection = {
         id: newId("reflection"),
         runId: run.id,
         version,
         createdAt: now,
-        feedbackCount: runFeedback.length,
-        totalActiveFeedback: activeFeedback.length,
-        feedbackJobIds: runFeedback.map((job) => job.id),
-        feedbackFingerprint: feedbackFingerprint(runFeedback),
+        feedbackCount: runEvidence.length,
+        positiveFeedbackCount: runHelpful.length,
+        rejectedSignalCount: runRejected.length,
+        totalActiveFeedback: activeHelpful.length + activeRejected.length + activeLegacy.length,
+        feedbackJobIds: runEvidence.map((job) => job.id),
+        feedbackFingerprint: feedbackFingerprint(runEvidence),
         engine,
         aiError,
         usage,
         modelSnapshot: preferenceModel
       };
       state.preferenceModel = preferenceModel;
+      addReflectionExclusionSuggestions(state, [...activeRejected, ...activeLegacy], preferenceModel, run.id);
       state.reviewReflections.unshift(reflection);
       state.reviewReflections = state.reviewReflections.slice(0, 100);
       run.reviewReflectionId = reflection.id;
       run.reviewCompletedAt = now;
       run.counters.ai.reflections += 1;
-      for (const job of runFeedback) {
+      for (const job of runEvidence) {
+        if (!job.feedback) continue;
         job.feedback.reflectedAt = now;
         job.feedback.reflectionId = reflection.id;
       }
@@ -1584,7 +2443,7 @@ async function handleApi(request, response, url) {
       if (body.description !== undefined) job.description = String(body.description).trim() || null;
       const profile = state.profiles.find((item) => item.id === state.activeProfileId);
       if (!profile) throw new Error("Activate a career profile before JD review.");
-      if (!job.description) throw new Error("Paste the job description before reviewing it.");
+      if (!job.description) throw new Error("A complete job description is not available. Rerun its source task to fetch the JD first.");
       const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
       const hasAi = aiStatus().configured;
       const aiBudgetAvailable = hasAi && canUseAiForRun(run);
@@ -1593,6 +2452,16 @@ async function handleApi(request, response, url) {
           if (run) run.counters.ai.calls += 1;
           const evaluated = await evaluateJdWithAi(job, profile.profile, state.settings.thresholds, state.preferenceModel);
           job.screening = evaluated.screening;
+          const reviewedAt = new Date().toISOString();
+          const roleRejected = job.screening.category === "REJECTED" && job.screening.workRights?.assessment !== "INELIGIBLE";
+          job.learningSignals = {
+            targetKeywords: evaluated.preferenceSignals.targetKeywords,
+            exclusionKeywords: roleRejected ? evaluated.preferenceSignals.exclusionKeywords : [],
+            exclusionReason: roleRejected ? evaluated.preferenceSignals.exclusionReason : "",
+            generatedAt: reviewedAt,
+            engine: "ai"
+          };
+          if (roleRejected) addExclusionSuggestions(state, job, job.learningSignals);
           recordAiUsage(run, evaluated.usage);
         } else {
           job.screening = localJdScreen(job, profile.profile, state.settings.thresholds, state.preferenceModel);
@@ -1605,21 +2474,54 @@ async function handleApi(request, response, url) {
       } catch (error) {
         job.screening = {
           ...job.screening,
-          jdReviewed: true,
+          jdReviewed: false,
           screeningStatus: "AI_ERROR",
-          engine: hasAi ? "ai" : "local-rules",
+          engine: hasAi ? "ai-error" : "local-rules",
           reason: `JD screening failed: ${error.message}`,
           concerns: [...(job.screening?.concerns ?? []), "screening needs another attempt"]
         };
       }
       job.reviewedAt = new Date().toISOString();
-      if (run) {
-        run.counters.ai.jdReviewed += 1;
-        if (job.screening.screeningStatus === "AI_ERROR") run.counters.ai.errors += 1;
-      }
+      if (run) recalculateRunCounters(state, run);
       return job;
     });
     return sendJson(response, 200, { job });
+  }
+
+  const fetchJdMatch = /^\/api\/jobs\/([^/]+)\/fetch-jd$/.exec(path);
+  if (request.method === "POST" && path === "/api/jobs/retry-failed-jd") {
+    const body = await readJson(request);
+    const requestedIds = [...new Set((Array.isArray(body.jobIds) ? body.jobIds : [])
+      .map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 100);
+    if (!requestedIds.length) throw new Error("Choose at least one failed JD to retry.");
+    const currentState = await storage.ensureState();
+    const eligibleIds = requestedIds.filter((id) => retryableFailedJd(
+      currentState.jobs.find((job) => job.id === id)
+    ));
+    if (!eligibleIds.length) throw new Error("None of the selected jobs still need JD retrieval.");
+    const batch = {
+      id: newId("jd_retry"),
+      jobIds: eligibleIds,
+      cursor: 0,
+      completed: 0,
+      currentJobId: null,
+      createdAt: new Date().toISOString()
+    };
+    jdRetryBatches.set(batch.id, batch);
+    const first = await advanceJdRetryBatch(batch.id);
+    return sendJson(response, 201, first);
+  }
+
+  if (request.method === "POST" && fetchJdMatch) {
+    const result = await storage.update((state) => {
+      const job = state.jobs.find((item) => item.id === fetchJdMatch[1]);
+      if (!job) throw new Error("Job was not found.");
+      if (isRejectedBeforeJd(job)) throw new Error("This job was explicitly rejected by its title and does not need JD retrieval.");
+      const launchUrl = buildOnDemandJdUrl(job);
+      markJobJdFetching(job);
+      return { job, launchUrl };
+    });
+    return sendJson(response, 200, result);
   }
 
   return apiError(response, 404, "API route not found.");
@@ -1667,4 +2569,5 @@ const server = createServer(async (request, response) => {
 const port = Number(process.env.PORT || 4317);
 server.listen(port, "127.0.0.1", () => {
   console.log(`Personal AI Job Agent running at http://127.0.0.1:${port}`);
+  void resumeAutoReviews().catch((error) => console.error("Could not resume automatic AI reviews", error));
 });

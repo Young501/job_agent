@@ -2,18 +2,21 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 
-import { generateProfile, reflectOnJobFeedback, testAiConnection } from "../src/ai.mjs";
+import { evaluateJdWithAi, generateProfile, reflectOnJobFeedback, testAiConnection } from "../src/ai.mjs";
 
 const externalProfile = {
-  name: "Candidate",
-  headline: "Graduate Developer",
-  summary: "Evidence-based external career profile.",
-  targetRoles: ["Graduate Software Engineer"],
-  focusAreas: ["software engineering"],
+  schemaVersion: 2,
+  basicInfo: { name: "Candidate", location: "Melbourne VIC", phone: "", email: "", linkedinUrl: "", githubUrl: "", websiteUrl: "https://candidate.example" },
+  visa: { visaType: "Temporary", visaName: "Student visa", grantedDate: "", expiryDate: "2027-03", details: "Can work subject to visa conditions.", forceKeepRequirements: ["Australian permanent resident"] },
+  workExperience: [],
+  projectExperience: [],
+  education: [{ institution: "Example University", location: "", degree: "Bachelor", field: "Computer Science", startDate: "", endDate: "", description: "" }],
+  extracurricular: [],
+  certifications: [],
+  languages: [],
   skills: ["Python"],
-  education: ["Bachelor degree in progress"],
-  preferences: { locations: ["Melbourne VIC"], workTypes: [], exclusions: [] },
-  candidateItems: []
+  honors: [],
+  customSections: []
 };
 
 test("Responses API adapter sends a bounded low-reasoning structured request", async () => {
@@ -25,15 +28,13 @@ test("Responses API adapter sends a bounded low-reasoning structured request", a
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
       output_text: JSON.stringify({
-        name: "Candidate",
-        headline: "Graduate Developer",
-        summary: "Early-career technology candidate.",
-        targetRoles: ["Graduate Software Engineer"],
-        focusAreas: ["software engineering"],
-        skills: ["Python"],
+        schemaVersion: 2,
+        basicInfo: { name: "Candidate", location: "", phone: "", email: "", linkedinUrl: "", githubUrl: "", websiteUrl: "" },
+        visa: { visaType: "", visaName: "", grantedDate: "", expiryDate: "", details: "", forceKeepRequirements: [] },
+        workExperience: [],
+        projectExperience: [{ name: "Automation project", role: "Developer", startDate: "", endDate: "", url: "", description: "Backend API development", technologies: ["Python"], highlights: [] }],
         education: [],
-        preferences: { locations: [], workTypes: [], exclusions: [] },
-        candidateItems: ["Automation projects", "Backend API development"]
+        extracurricular: [], certifications: [], languages: [], skills: ["Python"], honors: [], customSections: []
       }),
       usage: { input_tokens: 42, output_tokens: 18, total_tokens: 60 }
     }));
@@ -65,10 +66,12 @@ test("Responses API adapter sends a bounded low-reasoning structured request", a
     assert.equal(received.body.max_output_tokens, 321);
     assert.equal(received.body.text.format.type, "json_object");
     assert.match(received.body.instructions, /resume is the primary factual record/i);
-    assert.match(received.body.instructions, /10-20 candidateItems/i);
+    assert.match(received.body.instructions, /workExperience/i);
+    assert.match(received.body.instructions, /empty strings and empty arrays/i);
     const input = JSON.parse(received.body.input);
     assert.equal(input.externalCareerAnalysis, externalText);
-    assert.deepEqual(result.profile.candidateItems, ["Automation projects", "Backend API development"]);
+    assert.equal(result.profile.projectExperience[0].name, "Automation project");
+    assert.deepEqual(result.profile.projectExperience[0].technologies, ["Python"]);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     for (const [key, value] of Object.entries(original)) {
@@ -95,13 +98,75 @@ test("validated external GPT JSON remains usable when no agent endpoint is confi
     delete process.env.JOB_AGENT_AI_MODEL;
     const result = await generateProfile("Candidate completed Python and JavaScript university projects with a technology focus.", "resume.txt", JSON.stringify(externalProfile));
     assert.equal(result.engine, "external-gpt");
-    assert.deepEqual(result.profile, externalProfile);
+    assert.equal(result.profile.schemaVersion, 2);
+    assert.equal(result.profile.basicInfo.name, externalProfile.basicInfo.name);
+    assert.equal(result.profile.education[0].institution, "Example University");
+    assert.deepEqual(result.profile.skills, ["Python"]);
   } finally {
     for (const [key, value] of Object.entries(original)) {
       const environmentKey = key === "baseUrl" ? "JOB_AGENT_AI_BASE_URL" : "JOB_AGENT_AI_MODEL";
       if (value === undefined) delete process.env[environmentKey];
       else process.env[environmentKey] = value;
     }
+  }
+});
+
+test("AI JD review semantically compares visa requirements and honors user retention scope", async () => {
+  let received = null;
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    received = JSON.parse(body);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      output_text: JSON.stringify({
+        titleClassification: "CLEAR_MATCH",
+        score: 78,
+        reason: "The role aligns with the candidate's backend engineering experience.",
+        matchedAreas: ["software engineering"],
+        concerns: [],
+        jdReviewed: true,
+        workRights: {
+          assessment: "OVERRIDE_KEEP",
+          reason: "The permanent-resident option matches the user's forced-retention scope.",
+          requirements: ["Australian citizen", "Australian permanent resident", "full working rights"]
+        }
+      }),
+      usage: { input_tokens: 110, output_tokens: 80, total_tokens: 190 }
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const original = {
+    baseUrl: process.env.JOB_AGENT_AI_BASE_URL,
+    model: process.env.JOB_AGENT_AI_MODEL,
+    wireApi: process.env.JOB_AGENT_AI_WIRE_API
+  };
+  try {
+    process.env.JOB_AGENT_AI_BASE_URL = "http://127.0.0.1:" + server.address().port;
+    process.env.JOB_AGENT_AI_MODEL = "visa-review-model";
+    process.env.JOB_AGENT_AI_WIRE_API = "responses";
+    const result = await evaluateJdWithAi({
+      title: "Graduate Software Engineer",
+      company: "Example",
+      location: "Melbourne",
+      description: "Applicants must be an Australian citizen, permanent resident, or hold full working rights."
+    }, externalProfile, { strongMatch: 85, goodMatch: 70, maybe: 50, lowMatch: 30 });
+    assert.match(received.instructions, /AND, OR, alternatives/i);
+    assert.match(received.instructions, /forceKeepRequirements/i);
+    assert.match(received.instructions, /Simplified Chinese/i);
+    assert.match(received.instructions, /targetKeywords and preferenceSignals\.exclusionKeywords in English only/i);
+    const input = JSON.parse(received.input);
+    assert.deepEqual(input.candidateProfile.visa.forceKeepRequirements, ["Australian permanent resident"]);
+    assert.equal(result.screening.workRights.assessment, "OVERRIDE_KEEP");
+    assert.equal(result.screening.category, "GOOD_MATCH");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    if (original.baseUrl === undefined) delete process.env.JOB_AGENT_AI_BASE_URL;
+    else process.env.JOB_AGENT_AI_BASE_URL = original.baseUrl;
+    if (original.model === undefined) delete process.env.JOB_AGENT_AI_MODEL;
+    else process.env.JOB_AGENT_AI_MODEL = original.model;
+    if (original.wireApi === undefined) delete process.env.JOB_AGENT_AI_WIRE_API;
+    else process.env.JOB_AGENT_AI_WIRE_API = original.wireApi;
   }
 });
 
@@ -146,6 +211,7 @@ test("review reflection sends active feedback and returns a bounded preference m
       output_text: JSON.stringify({
         summary: "用户不希望销售导向的技术职位。",
         targetSignals: ["software engineering"],
+        deprioritizeSignals: ["technical documentation"],
         avoidSignals: ["technical sales"],
         titleExclusions: ["Graduate Sales Engineer"],
         screeningGuidance: ["技术销售职位降低优先级，但保留记录。"]
@@ -170,16 +236,31 @@ test("review reflection sends active feedback and returns a bounded preference m
     const result = await reflectOnJobFeedback({
       profile: externalProfile,
       previousModel: null,
-      feedback: [
+      rejectedJobSignals: [{
+        title: "Graduate Retail Assistant",
+        humanConfirmed: true,
+        feedbackReason: "REJECTION_CORRECT"
+      }],
+      legacyNotHelpfulFeedback: [
         { title: "Graduate Sales Engineer", feedbackReason: "NOT_RELEVANT" },
         ...Array.from({ length: 80 }, (_, index) => ({ title: "Long feedback " + index, userNote: "x".repeat(400) }))
       ]
     });
+    assert.match(received.instructions, /REJECTION_CORRECT/);
+    assert.match(received.instructions, /must contain at least one specific English role phrase/i);
+    assert.match(received.instructions, /even when the item's exclusionKeywords array is empty/i);
+    assert.match(received.instructions, /must acknowledge its evidence count/i);
+    assert.match(received.instructions, /targetSignals, deprioritizeSignals, avoidSignals, and titleExclusions item in English only/i);
+    assert.match(received.instructions, /avoidSignals item must be exactly one lowercase English occupation or job-function word/i);
+    assert.match(received.instructions, /Soft NOT_HELPFUL feedback must affect deprioritizeSignals instead/i);
     assert.equal(received.max_output_tokens, 444);
     assert.match(received.instructions, /complete replacement model/i);
     assert.ok(received.input.length <= 4_000);
-    assert.equal(JSON.parse(received.input).activeNotHelpfulFeedback[0].feedbackReason, "NOT_RELEVANT");
-    assert.deepEqual(result.preferenceModel.avoidSignals, ["technical sales"]);
+    assert.equal(JSON.parse(received.input).legacyNotHelpfulFeedback[0].feedbackReason, "NOT_RELEVANT");
+    assert.equal(JSON.parse(received.input).confirmedNegativeEvidence[0].title, "Graduate Retail Assistant");
+    assert.equal(JSON.parse(received.input).explicitNotHelpfulEvidence[0].title, "Graduate Sales Engineer");
+    assert.deepEqual(result.preferenceModel.deprioritizeSignals, ["documentation"]);
+    assert.deepEqual(result.preferenceModel.avoidSignals, ["sales"]);
     assert.equal(result.usage.totalTokens, 79);
   } finally {
     await new Promise((resolve) => server.close(resolve));

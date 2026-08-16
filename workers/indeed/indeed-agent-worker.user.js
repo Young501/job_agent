@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      2.2.5
+// @version      1.0.0
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -23,7 +23,17 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "2.2.5";
+    const APP_VERSION = "1.0.0";
+    const DEFAULT_AGENT_TIMING = {
+        accessLimit: 20,
+        cooldownMinutes: 5,
+        actionDelaySeconds: 1,
+        scrollDelaySeconds: 2,
+        pageDelaySeconds: 10,
+        jdIntervalSeconds: 1,
+        jdRequestTimeoutSeconds: 5,
+        jdPageTimeoutSeconds: 10
+    };
     const SITE = getSiteAdapter();
     if (!SITE) return;
 
@@ -33,7 +43,8 @@
         taskKey: "job-agent:worker-task:indeed",
         workerKey: "job-agent:worker-id:indeed",
         pauseKey: "job-agent:worker-pause:indeed",
-        preflightKey: "job-agent:worker-preflight:indeed"
+        preflightKey: "job-agent:worker-preflight:indeed",
+        accessThrottleKey: "job-agent:access-throttle:indeed:v1"
     };
     let agentTask = null;
     let agentScanFailure = null;
@@ -41,6 +52,8 @@
     let agentPollTimer = null;
     let agentHeartbeatTimer = null;
     let agentStartedTaskId = null;
+    let agentTiming = { ...DEFAULT_AGENT_TIMING };
+    let agentStopRequested = false;
 
     const KEYS = {
         settings: `indeed-helper:settings:${SITE.id}:v1`,
@@ -345,6 +358,7 @@
     }
 
     async function fetchPage(url) {
+        await agentBeforePlatformAccess("Indeed 下一页");
         try {
         const response = await fetch(url, { credentials: "same-origin" });
         if (!response.ok) throw new Error(`读取列表页失败（${response.status}）`);
@@ -366,7 +380,8 @@
         }
     }
 
-    function requestIndeedPage(url) {
+    async function requestIndeedPage(url) {
+        await agentBeforePlatformAccess("Indeed 分页保底请求");
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: "GET",
@@ -762,7 +777,9 @@
 
     function agentIsActive() {
         const params = new URL(location.href).searchParams;
+        const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
         return params.get("jobAgentWorker") === "1" || params.get("jobAgentPreflight") === "1"
+            || hash.has("jobAgentOnDemandJd") || hash.has("jobAgentJdRequest")
             || agentIsManagedWorkerWindow() || agentIsManagedPreflightWindow();
     }
 
@@ -788,10 +805,96 @@
         return { scanned: state.scanned, found: state.results.size };
     }
 
+    function agentAccessState() {
+        const now = Date.now();
+        const stored = gmGet(AGENT.accessThrottleKey, null) || {};
+        if (Number(stored.cooldownUntil || 0) && now >= Number(stored.cooldownUntil)) {
+            const reset = { count: 0, cooldownUntil: 0, updatedAt: now };
+            gmSet(AGENT.accessThrottleKey, reset);
+            return reset;
+        }
+        return { count: Math.max(0, Number(stored.count) || 0), cooldownUntil: Math.max(0, Number(stored.cooldownUntil) || 0), updatedAt: Number(stored.updatedAt) || now };
+    }
+
+    function agentCooldownText(remainingMs) {
+        const minutes = Math.floor(remainingMs / 60000);
+        const seconds = Math.floor((remainingMs % 60000) / 1000);
+        return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    function agentApplyTiming(input) {
+        const source = input && typeof input === "object" ? input : {};
+        const bounded = (key, minimum, maximum) => {
+            const value = Number(source[key]);
+            return Math.min(maximum, Math.max(minimum, Number.isFinite(value) ? value : DEFAULT_AGENT_TIMING[key]));
+        };
+        agentTiming = {
+            accessLimit: Math.round(bounded("accessLimit", 1, 100)),
+            cooldownMinutes: bounded("cooldownMinutes", 0.5, 120),
+            actionDelaySeconds: bounded("actionDelaySeconds", 0.3, 10),
+            scrollDelaySeconds: bounded("scrollDelaySeconds", 0.5, 20),
+            pageDelaySeconds: bounded("pageDelaySeconds", 1, 120),
+            jdIntervalSeconds: bounded("jdIntervalSeconds", 0.2, 30),
+            jdRequestTimeoutSeconds: bounded("jdRequestTimeoutSeconds", 2, 30),
+            jdPageTimeoutSeconds: bounded("jdPageTimeoutSeconds", 3, 60)
+        };
+    }
+
+    async function agentRefreshTiming(runId = agentTask?.runId) {
+        try {
+            const query = runId ? `?${new URLSearchParams({ runId }).toString()}` : "";
+            const response = await agentRequest("GET", `/api/worker/settings${query}`);
+            agentApplyTiming(response.workerTiming);
+        } catch (error) {
+            console.warn("Job Agent timing settings could not be refreshed", error);
+        }
+    }
+
+    function agentActionDelay(multiplier = 1) {
+        return sleep(Math.round(agentTiming.actionDelaySeconds * multiplier * 1000));
+    }
+
+    function agentJdInterval() {
+        const base = agentTiming.jdIntervalSeconds * 1000;
+        return sleep(Math.max(100, Math.round(base * (0.8 + Math.random() * 0.4))));
+    }
+
+    async function agentBeforePlatformAccess(label) {
+        if (!agentIsActive() || agentStopRequested) return;
+        let access = agentAccessState();
+        if (access.count >= agentTiming.accessLimit) {
+            access.cooldownUntil ||= Date.now() + agentTiming.cooldownMinutes * 60 * 1000;
+            gmSet(AGENT.accessThrottleKey, access);
+            const hadHeartbeat = Boolean(agentHeartbeatTimer);
+            agentStopHeartbeat();
+            let lastProgressAt = 0;
+            while (Date.now() < access.cooldownUntil) {
+                const remaining = access.cooldownUntil - Date.now();
+                const detail = `已连续完成 ${agentTiming.accessLimit} 次 Indeed 平台访问，为降低访问压力暂停 ${agentTiming.cooldownMinutes} 分钟；${agentCooldownText(remaining)} 后自动继续 ${label}。`;
+                agentShowOverlay(`访问节流休息中 · ${agentCooldownText(remaining)}`, detail);
+                setStatus(`访问节流休息中 · ${agentCooldownText(remaining)}`);
+                if (Date.now() - lastProgressAt >= 2500) {
+                    lastProgressAt = Date.now();
+                    await agentProgress("cooldown", detail, { ...agentProgressStats(), accessCount: access.count, accessLimit: agentTiming.accessLimit, cooldownUntil: new Date(access.cooldownUntil).toISOString(), cooldownReason: `已连续访问 ${agentTiming.accessLimit} 次 Indeed，暂停 ${agentTiming.cooldownMinutes} 分钟后自动继续。` });
+                }
+                await sleep(Math.min(1000, remaining));
+            }
+            if (agentStopRequested) return;
+            access = { count: 0, cooldownUntil: 0, updatedAt: Date.now() };
+            gmSet(AGENT.accessThrottleKey, access);
+            agentShowOverlay("Indeed 正在继续", `访问节流休息已结束，继续 ${label}。`);
+            if (hadHeartbeat) agentStartHeartbeat();
+        }
+        access.count += 1;
+        access.updatedAt = Date.now();
+        if (access.count >= agentTiming.accessLimit) access.cooldownUntil = Date.now() + agentTiming.cooldownMinutes * 60 * 1000;
+        gmSet(AGENT.accessThrottleKey, access);
+    }
+
     async function agentProgress(phase, message, stats = agentProgressStats()) {
         if (!agentTask) return;
         try {
-            await agentRequest("POST", "/api/worker/progress", {
+            const response = await agentRequest("POST", "/api/worker/progress", {
                 runId: agentTask.runId,
                 taskId: agentTask.id,
                 taskAttempt: agentTask.attempt || 1,
@@ -800,6 +903,12 @@
                 message,
                 ...stats
             });
+            if (response.stopRequested && !agentStopRequested) {
+                agentStopRequested = true;
+                requestStop();
+                agentShowOverlay("正在停止并保留结果", "已收到停止请求，正在结束当前步骤并上传已获取的职位。");
+            }
+            return response;
         } catch (error) {
             console.warn("Job Agent progress update failed", error);
         }
@@ -808,7 +917,7 @@
     function agentStartHeartbeat() {
         clearInterval(agentHeartbeatTimer);
         void agentProgress("scanning", "Indeed 正在扫描职位列表。");
-        agentHeartbeatTimer = setInterval(() => { void agentProgress("scanning", "Indeed 正在扫描职位列表。"); }, 8000);
+        agentHeartbeatTimer = setInterval(() => { void agentProgress("scanning", "Indeed 正在扫描职位列表。"); }, 2500);
     }
 
     function agentStopHeartbeat() {
@@ -823,6 +932,7 @@
         gmSet(AGENT.taskKey, null);
         gmSet(AGENT.pauseKey, "");
         gmSet(AGENT.preflightKey, null);
+        gmSet(AGENT.accessThrottleKey, { count: 0, cooldownUntil: 0, updatedAt: Date.now() });
         setStatus("Worker 历史记录已清空");
         log("Job Agent 已清空 Indeed Worker 历史记录。", "warn");
         updateCounters();
@@ -986,7 +1096,9 @@
                 return agentFinishRunWindow();
             }
             agentStartedTaskId = null;
-            agentTask = { ...response.task, runId: response.run.id };
+            agentApplyTiming(response.task.workerTiming || response.run.settingsSnapshot?.workerTiming);
+            agentStopRequested = false;
+            agentTask = { ...response.task, runId: response.run.id, workerTiming: { ...agentTiming } };
             gmSet(AGENT.taskKey, agentTask);
             gmSet(AGENT.pauseKey, "");
             if (agentOnTaskPage(agentTask)) await agentStartTask();
@@ -999,6 +1111,18 @@
         }
     }
 
+    async function agentWaitForSearchResults(timeout = 12000) {
+        const deadline = Date.now() + timeout;
+        setStatus("正在等待 Indeed 职位列表加载...");
+        while (Date.now() < deadline) {
+            if (SITE.findCards(document).length) return true;
+            const text = (document.body?.innerText || "").slice(0, 30000);
+            if (/\b0\s+jobs?\b|no jobs found|did not match any jobs|没有找到.*职位/i.test(text)) return false;
+            await sleep(300);
+        }
+        return false;
+    }
+
     async function agentStartTask() {
         if (!agentTask || agentStartedTaskId === agentTask.id || state.running) return;
         const humanReason = agentHumanBlockReason();
@@ -1009,9 +1133,15 @@
         agentStartedTaskId = agentTask.id;
         const includeKeywords = agentIncludeKeywordText(agentTask.keyword);
         ui.include.value = includeKeywords;
-        settings = { ...settings, include: includeKeywords };
+        const excludeKeywords = Array.isArray(agentTask.exclusionKeywords) ? agentTask.exclusionKeywords.join("\n") : "";
+        ui.exclude.value = excludeKeywords;
+        settings = { ...settings, include: includeKeywords, exclude: excludeKeywords, pageDelaySeconds: agentTiming.pageDelaySeconds };
+        log(`Job Agent 访问节奏：连续访问 ${agentTiming.accessLimit} 次后休息 ${agentTiming.cooldownMinutes} 分钟；翻页 ${agentTiming.pageDelaySeconds} 秒，每份 JD ${agentTiming.jdIntervalSeconds} 秒。`);
         agentShowOverlay("Indeed 正在运行", `平台搜索“${agentSearchKeyword(agentTask.keyword)}” · 包含 ${parseRules(agentTask.keyword).join("、")} · ${agentTask.location}。请勿操作此窗口。`);
+        await agentBeforePlatformAccess("搜索结果页");
         agentStartHeartbeat();
+        const resultsReady = await agentWaitForSearchResults();
+        if (!resultsReady) log("等待后仍未发现职位卡；将按当前页面结果生成空汇总。", "warn");
         await startScan();
     }
 
@@ -1024,10 +1154,310 @@
             location: job.location,
             jobUrl: job.link,
             description: job.description,
+            descriptionSource: job.description ? "card-snippet" : null,
+            descriptionFetchStatus: null,
+            descriptionFetchError: null,
             postedAt: job.listedAt,
             searchKeyword: agentTask?.keyword,
             searchLocation: agentTask?.location
         })).filter((job) => job.title);
+    }
+
+    async function agentRequestJobPage(url) {
+        await agentBeforePlatformAccess("JD 请求");
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url,
+                responseType: "text",
+                timeout: agentTiming.jdRequestTimeoutSeconds * 1000,
+                headers: { Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+                onload(response) {
+                    if (response.status >= 200 && response.status < 300) resolve(response.responseText || "");
+                    else reject(new Error(`Indeed JD request failed (HTTP ${response.status}).`));
+                },
+                onerror() { reject(new Error("Indeed JD request failed due to a network error.")); },
+                ontimeout() { reject(new Error("Indeed JD request timed out.")); }
+            });
+        });
+    }
+
+    function agentJsonLdJobPosting(value) {
+        if (!value || typeof value !== "object") return null;
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                const found = agentJsonLdJobPosting(item);
+                if (found) return found;
+            }
+            return null;
+        }
+        const types = Array.isArray(value["@type"]) ? value["@type"] : [value["@type"]];
+        if (types.some((type) => String(type).toLowerCase() === "jobposting")) return value;
+        return agentJsonLdJobPosting(value["@graph"]);
+    }
+
+    function agentExtractDescriptionFromDocument(root) {
+        const selectors = [
+            "#jobDescriptionText",
+            '[data-testid="jobsearch-JobComponent-description"]',
+            ".jobsearch-JobComponent-description",
+            '[class*="jobDescription"]'
+        ];
+        let bestLength = 0;
+        for (const selector of selectors) {
+            for (const element of root.querySelectorAll(selector)) {
+                const description = cleanText(element?.innerText || element?.textContent || "");
+                bestLength = Math.max(bestLength, description.length);
+                if (description.length >= 120) return { description };
+            }
+        }
+
+        for (const script of root.querySelectorAll('script[type="application/ld+json"]')) {
+            try {
+                const posting = agentJsonLdJobPosting(JSON.parse(script.textContent || "null"));
+                if (!posting?.description) continue;
+                const parsedDescription = new DOMParser().parseFromString(String(posting.description), "text/html");
+                const description = cleanText(parsedDescription.body?.textContent || "");
+                bestLength = Math.max(bestLength, description.length);
+                if (description.length >= 120) return { description };
+            } catch {}
+        }
+
+        const pageText = cleanText(root.body?.innerText || root.body?.textContent || "");
+        const pageTitle = cleanText(root.title || "");
+        const path = root === document ? location.pathname.toLowerCase() : "";
+        const blockedPath = /(captcha|challenge|checkpoint|authwall|login)/.test(path);
+        const blockedContent = /captcha|verify you are human|unusual traffic|security check|cloudflare|ray id|需要进行其他验证/i.test(`${pageTitle} ${pageText}`);
+        if (blockedPath || blockedContent) {
+            return { humanReason: "Indeed 在获取职位 JD 时要求人工验证。请完成验证后重新获取 JD。" };
+        }
+
+        const panelFound = selectors.some((selector) => root.querySelector(selector));
+        throw new Error(`Indeed detail page did not contain a complete job description. Description panel: ${panelFound ? "found" : "missing"}; extracted text: ${bestLength} characters; vjk: ${root === document ? new URL(location.href).searchParams.get("vjk") || "missing" : "static HTML"}.`);
+    }
+
+    function agentExtractDescription(html) {
+        const parsed = new DOMParser().parseFromString(html, "text/html");
+        return agentExtractDescriptionFromDocument(parsed);
+    }
+
+    async function agentFetchDescription(job) {
+        const jobId = job.sourceJobId || new URL(job.jobUrl, location.href).searchParams.get("jk");
+        if (!jobId) throw new Error("Indeed job ID is missing, so its description cannot be opened.");
+        const detailUrl = new URL("https://au.indeed.com/jobs");
+        detailUrl.searchParams.set("q", agentSearchKeyword(agentTask?.keyword || job.searchKeyword || job.title));
+        detailUrl.searchParams.set("l", agentTask?.location || job.searchLocation || "Australia");
+        if (Number(agentTask?.postedWithinDays) > 0) {
+            detailUrl.searchParams.set("fromage", String(agentTask.postedWithinDays));
+        }
+        detailUrl.searchParams.set("vjk", jobId);
+        let directError = null;
+        try {
+            const html = await agentRequestJobPage(detailUrl.href);
+            const directResult = agentExtractDescription(html);
+            if (!directResult.humanReason) return directResult;
+            directError = new Error(directResult.humanReason);
+        } catch (error) {
+            directError = error;
+        }
+        if (typeof GM_openInTab !== "function") throw directError;
+        await agentBeforePlatformAccess("JD 详情页保底标签");
+        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const resultKey = `job-agent:jd-result:indeed:${requestId}`;
+        detailUrl.hash = new URLSearchParams({ jobAgentJdRequest: requestId }).toString();
+        gmSet(resultKey, null);
+        const childTab = GM_openInTab(detailUrl.href, { active: true, insert: true, setParent: true });
+        let keepChildOpen = false;
+        try {
+            const deadline = Date.now() + agentTiming.jdPageTimeoutSeconds * 1000;
+            while (Date.now() < deadline) {
+                await sleep(350);
+                const result = gmGet(resultKey, null);
+                if (!result) continue;
+                keepChildOpen = Boolean(result.humanReason);
+                if (result.error) throw new Error(`${directError?.message || "Direct HTML extraction failed."} Rendered fallback: ${result.error}`);
+                return result;
+            }
+            throw new Error(`${directError?.message || "Direct HTML extraction failed."} Indeed job description panel did not load within 10 seconds.`);
+        } finally {
+            gmSet(resultKey, null);
+            if (!keepChildOpen) {
+                try { childTab?.close?.(); } catch {}
+            }
+        }
+    }
+
+    async function agentRunJdChild(requestId) {
+        await agentRefreshTiming();
+        const resultKey = `job-agent:jd-result:indeed:${requestId}`;
+        const deadline = Date.now() + agentTiming.jdPageTimeoutSeconds * 1000 - 1000;
+        let lastError = "Indeed job description panel did not become available.";
+        let lastHumanReason = null;
+        while (Date.now() < deadline) {
+            const currentHumanReason = agentHumanBlockReason();
+            if (currentHumanReason) {
+                lastHumanReason = currentHumanReason;
+                lastError = currentHumanReason;
+                await sleep(600);
+                continue;
+            }
+            try {
+                const result = agentExtractDescriptionFromDocument(document);
+                if (result.humanReason) {
+                    lastHumanReason = result.humanReason;
+                    lastError = result.humanReason;
+                } else {
+                    gmSet(resultKey, result);
+                    setTimeout(() => window.close(), 150);
+                    return;
+                }
+            } catch (error) {
+                lastError = error.message || String(error);
+            }
+            await sleep(500);
+        }
+        if (lastHumanReason) {
+            gmSet(resultKey, { humanReason: lastHumanReason });
+            return;
+        }
+        gmSet(resultKey, { error: `${lastError} Final page: ${location.pathname}${location.search}.` });
+        setTimeout(() => window.close(), 150);
+    }
+
+    async function agentContinueJdBatch(batchId) {
+        if (!batchId) return false;
+        try {
+            const next = await agentRequest("POST", `/api/worker/jd-retry/${encodeURIComponent(batchId)}/next`, {});
+            if (next.launchUrl) {
+                await agentBeforePlatformAccess("下一份批量 JD");
+                agentShowOverlay("继续批量获取 JD", `已完成 ${next.completed}/${next.total}，正在打开下一项。`);
+                setTimeout(() => window.location.replace(next.launchUrl), 450);
+            } else {
+                agentShowOverlay("批量 JD 获取完成", `已处理 ${next.completed}/${next.total} 个职位；Agent 会自动更新。`);
+                setTimeout(() => window.close(), 700);
+            }
+        } catch (error) {
+            agentShowOverlay("批量获取已停止", `无法继续下一项：${error.message || String(error)}。请回到 Job Agent 重试。`);
+        }
+        return true;
+    }
+
+    async function agentRunOnDemandJd(jobId, batchId = null) {
+        await agentRefreshTiming();
+        agentShowOverlay("Indeed 正在获取完整 JD", "正在等待职位详情面板加载；读取后会传回 Job Agent 并自动 AI 审阅。");
+        const deadline = Date.now() + agentTiming.jdPageTimeoutSeconds * 1000;
+        let lastError = "Indeed job description panel did not become available.";
+        let lastHumanReason = null;
+        while (Date.now() < deadline) {
+            const currentHumanReason = agentHumanBlockReason();
+            if (currentHumanReason) {
+                lastHumanReason = currentHumanReason;
+                lastError = currentHumanReason;
+                await sleep(600);
+                continue;
+            }
+            try {
+                const result = agentExtractDescriptionFromDocument(document);
+                if (result.humanReason) {
+                    lastHumanReason = result.humanReason;
+                    lastError = result.humanReason;
+                } else {
+                    await agentRequest("POST", "/api/worker/job-jd", { jobId, platform: AGENT.platform, batchId, description: result.description });
+                    if (await agentContinueJdBatch(batchId)) return;
+                    agentShowOverlay("完整 JD 已获取", "已传回 Job Agent，AI 审阅将自动继续。此页面即将关闭。");
+                    setTimeout(() => {
+                        window.close();
+                        setTimeout(() => { if (!window.closed) window.location.replace(`${AGENT.apiBase}/?view=jobs`); }, 250);
+                    }, 700);
+                    return;
+                }
+            } catch (error) {
+                lastError = error.message || String(error);
+            }
+            await sleep(500);
+        }
+        if (lastHumanReason) {
+            await agentRequest("POST", "/api/worker/job-jd", { jobId, platform: AGENT.platform, batchId, humanReason: lastHumanReason });
+            agentShowOverlay("需要人工处理 Indeed", "页面持续要求安全验证。请完成处理后回到 Job Agent 再次获取 JD。");
+            if (typeof GM_notification === "function") GM_notification({ title: "Job Agent needs help", text: lastHumanReason, timeout: 0 });
+            return;
+        }
+        try {
+            await agentRequest("POST", "/api/worker/job-jd", { jobId, platform: AGENT.platform, batchId, error: `${lastError} Final page: ${location.pathname}${location.search}.` });
+        } catch (error) {
+            lastError = `${lastError} ${error.message || error}`;
+        }
+        if (await agentContinueJdBatch(batchId)) return;
+        agentShowOverlay("未能获取 Indeed JD", `${lastError} 请回到 Job Agent 重试。`);
+    }
+
+    async function agentEnrichJobs(jobs, task) {
+        if (agentStopRequested) return { jobs, humanReason: null };
+        let plan;
+        try {
+            const response = await agentRequest("POST", "/api/worker/title-plan", {
+                runId: task.runId,
+                taskId: task.id,
+                jobs
+            });
+            plan = response.plan;
+            log(`Job Agent 标题初筛：需获取 ${response.counts.fetch} 份 JD，复用 ${response.counts.reuse} 份，标题拒绝 ${response.counts.rejected} 份。`);
+        } catch (error) {
+            log(`标题初筛计划暂不可用，将为全部职位尝试获取 JD：${error.message}`, "warn");
+            plan = jobs.map((_, index) => ({ index, action: "fetch" }));
+        }
+        const planByIndex = new Map(plan.map((item) => [item.index, item]));
+        const fetchIndexes = plan.filter((item) => item.action === "fetch").map((item) => item.index);
+        let completed = 0;
+        let humanReason = null;
+        for (let index = 0; index < jobs.length; index += 1) {
+            if (agentStopRequested) break;
+            const job = jobs[index];
+            const action = planByIndex.get(index)?.action || "fetch";
+            if (action === "reject") {
+                job.descriptionFetchStatus = "skipped-rejected";
+                continue;
+            }
+            if (action === "reuse") {
+                job.descriptionFetchStatus = "reused";
+                continue;
+            }
+            completed += 1;
+            const message = `正在获取完整 JD ${completed}/${fetchIndexes.length}：${job.title}`;
+            agentShowOverlay("Indeed 正在获取完整 JD", `${message}。请勿操作此窗口。`);
+            setStatus(message);
+            if (completed === 1 || completed % 3 === 0 || completed === fetchIndexes.length) {
+                await agentProgress("fetching_jd", message, { ...agentProgressStats(), found: jobs.length });
+            }
+            try {
+                const result = await agentFetchDescription(job);
+                if (result.humanReason) {
+                    humanReason = result.humanReason;
+                    job.descriptionFetchStatus = "failed";
+                    job.descriptionFetchError = humanReason;
+                    break;
+                }
+                job.description = result.description;
+                job.descriptionSource = "detail-page";
+                job.descriptionFetchStatus = "fetched";
+                job.descriptionFetchError = null;
+                job.descriptionFetchedAt = new Date().toISOString();
+            } catch (error) {
+                job.descriptionFetchStatus = "failed";
+                job.descriptionFetchError = error.message || String(error);
+                log(`未能获取 ${job.title} 的完整 JD：${job.descriptionFetchError}`, "warn");
+            }
+            await agentJdInterval();
+        }
+        if (humanReason) {
+            for (const index of fetchIndexes) {
+                const job = jobs[index];
+                if (job.descriptionFetchStatus) continue;
+                job.descriptionFetchStatus = "failed";
+                job.descriptionFetchError = "JD retrieval stopped for human verification.";
+            }
+        }
+        return { jobs, humanReason };
     }
 
     function agentNotify(message) {
@@ -1037,6 +1467,16 @@
     async function agentSubmit(status, reason, payload) {
         const task = agentTask;
         if (!task) return;
+        payload ||= { results: [] };
+        if (status === "completed" && agentStopRequested) reason ||= "Stopped early by user; partial results were kept.";
+        if (!payload.__agentPreparedJobs && status === "completed") {
+            const enriched = await agentEnrichJobs(agentJobs(payload), task);
+            payload.__agentPreparedJobs = enriched.jobs;
+            if (enriched.humanReason) {
+                status = "needs_user_action";
+                reason = enriched.humanReason;
+            }
+        }
         const submission = {
             runId: task.runId,
             taskId: task.id,
@@ -1044,7 +1484,7 @@
             workerId: agentWorkerId(),
             status,
             reason,
-            jobs: agentJobs(payload || { results: [] })
+            jobs: payload.__agentPreparedJobs || agentJobs(payload)
         };
         try {
             agentStopHeartbeat();
@@ -1358,10 +1798,10 @@
         if (!keywordInput || !locationInput) throw new Error("Indeed primary search inputs were not found.");
         if (!agentSetInput(keywordInput, searchKeyword)) throw new Error("Keyword input could not retain its value.");
         log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
-        await sleep(1000);
+        await agentActionDelay();
         if (!agentSetInput(locationInput, validation.location)) throw new Error("Location input could not retain its value.");
         log(`预检：已填写地点 = ${validation.location}`);
-        await sleep(1000);
+        await agentActionDelay();
         gmSet(AGENT.preflightKey, {
             validationId: validation.id,
             preflightAttempt: Number(validation.preflightAttempt || 1),
@@ -1396,6 +1836,7 @@
         if (!validationId) return false;
         const response = await agentRequest("GET", `/api/worker/preflight?${new URLSearchParams({ validationId, platform: AGENT.platform })}`);
         const validation = response.validation;
+        await agentRefreshTiming();
         await agentRequest("POST", "/api/worker/preflight/started", {
             validationId: validation.id,
             preflightAttempt: Number(validation.preflightAttempt || 1),
@@ -1420,14 +1861,14 @@
     const searchKeyword = agentSearchKeyword(validation.keyword);
     agentSetInput(keyword, searchKeyword);
     log(`预检：平台搜索关键词 = ${searchKeyword}；本地包含规则 = ${parseRules(validation.keyword).join("、")}`);
-    await sleep(1000);
+    await agentActionDelay();
     agentSetInput(location, validation.location);
     log(`预检：已填写地点 = ${validation.location}`);
-                await sleep(1000);
+                await agentActionDelay();
                 gmSet(AGENT.preflightKey, { validationId: validation.id, preflightAttempt: Number(validation.preflightAttempt || 1), stage: "date" });
                 setStatus("Job Agent: 正在提交搜索条件...");
                 submit.click();
-                await sleep(1100);
+                await agentActionDelay(1.1);
             }
             const searchState = agentIndeedSearchState();
             if (searchState.keyword.toLowerCase() !== agentSearchKeyword(validation.keyword).toLowerCase() || searchState.location.toLowerCase() !== validation.location.trim().toLowerCase()) {
@@ -1436,7 +1877,7 @@
             log("预检：关键词和地点已确认。");
             if ((agentPreflightState(validation).stage || "date") === "date") {
                 if (!await agentApplyIndeedDateFilter(validation)) return true;
-                await sleep(800);
+                await agentActionDelay(0.8);
             }
             const appliedDays = Number(validation.postedWithinDays);
             const current = new URL(location.href).searchParams;
@@ -1514,11 +1955,27 @@
         const humanReason = agentHumanBlockReason();
         if (agentTask && humanReason) return agentPause(humanReason);
         if (agentTask && gmGet(AGENT.pauseKey, "") === agentTask.id) return agentScheduleClaim(agentTask.runId, 4000);
-        if (agentTask) return agentStartTask();
+        if (agentTask) {
+            agentApplyTiming(agentTask.workerTiming);
+            await agentRefreshTiming(agentTask.runId);
+            agentTask.workerTiming = { ...agentTiming };
+            gmSet(AGENT.taskKey, agentTask);
+            return agentStartTask();
+        }
         if (!runId && agentIsManagedWorkerWindow()) runId = await agentFindActiveRun();
         if (runId) await agentClaimNext(runId);
     }
 
-    init();
-    void agentBoot();
+    const agentHashParams = new URLSearchParams(location.hash.replace(/^#/, ""));
+    const agentOnDemandJd = agentHashParams.get("jobAgentOnDemandJd");
+    const agentJdBatch = agentHashParams.get("jobAgentJdBatch");
+    const agentJdChildRequest = agentHashParams.get("jobAgentJdRequest");
+    if (agentOnDemandJd) {
+        void agentRunOnDemandJd(agentOnDemandJd, agentJdBatch);
+    } else if (agentJdChildRequest) {
+        void agentRunJdChild(agentJdChildRequest);
+    } else {
+        init();
+        void agentBoot();
+    }
 })();

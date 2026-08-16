@@ -19,7 +19,8 @@ export function createDefaultState(settings, taskCategories = []) {
     taskCategories: clone(taskCategories),
     importBatches: [],
     reviewReflections: [],
-    preferenceModel: null
+    preferenceModel: null,
+    exclusionSuggestions: []
   };
 }
 
@@ -43,6 +44,7 @@ function mergeTaskCategories(defaultCategories, savedCategories) {
 
 export function createStorage({ dataDirectory, defaultSettings, defaultTaskCategories = [] }) {
   const statePath = join(dataDirectory, "state.json");
+  let updateQueue = Promise.resolve();
 
   async function ensureState() {
     await mkdir(dataDirectory, { recursive: true });
@@ -61,7 +63,8 @@ export function createStorage({ dataDirectory, defaultSettings, defaultTaskCateg
         taskCategories: mergeTaskCategories(defaultTaskCategories, state.taskCategories),
         importBatches: Array.isArray(state.importBatches) ? state.importBatches : [],
         reviewReflections: Array.isArray(state.reviewReflections) ? state.reviewReflections : [],
-        preferenceModel: state.preferenceModel && typeof state.preferenceModel === "object" ? state.preferenceModel : null
+        preferenceModel: state.preferenceModel && typeof state.preferenceModel === "object" ? state.preferenceModel : null,
+        exclusionSuggestions: Array.isArray(state.exclusionSuggestions) ? state.exclusionSuggestions : []
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -78,11 +81,15 @@ export function createStorage({ dataDirectory, defaultSettings, defaultTaskCateg
     await rename(temporaryPath, statePath);
   }
 
-  async function update(mutator) {
-    const state = await ensureState();
-    const result = await mutator(state);
-    await write(state);
-    return result;
+  function update(mutator) {
+    const operation = updateQueue.then(async () => {
+      const state = await ensureState();
+      const result = await mutator(state);
+      await write(state);
+      return result;
+    });
+    updateQueue = operation.catch(() => {});
+    return operation;
   }
 
   return { ensureState, update };
