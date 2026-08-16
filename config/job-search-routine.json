@@ -3,6 +3,17 @@
   "platforms": ["linkedin", "indeed", "seek"],
   "executionMode": "sequential",
   "postedWithinDays": 7,
+  "exclusionKeywords": ["expression of interest", "eoi"],
+  "workerTiming": {
+    "accessLimit": 20,
+    "cooldownMinutes": 5,
+    "actionDelaySeconds": 1,
+    "scrollDelaySeconds": 2,
+    "pageDelaySeconds": 10,
+    "jdIntervalSeconds": 1,
+    "jdRequestTimeoutSeconds": 5,
+    "jdPageTimeoutSeconds": 10
+  },
   "locations": [
     { "id": "melbourne-vic", "name": "Melbourne VIC", "enabled": true },
     { "id": "australia", "name": "Australia", "enabled": false },

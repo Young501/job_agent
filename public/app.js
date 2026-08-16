@@ -14,18 +14,25 @@ const state = {
   data: null,
   view: initialView(),
   profileId: null,
-  jobId: null,
   feedbackJobId: null,
+  feedbackMode: "positive",
+  pendingRunTaskIds: null,
   resumeSource: "",
   editingValidationId: null,
   notifiedTaskIds: new Set(),
   jobsPane: "current",
   historyRunId: "",
+  historyTaskId: "",
+  currentRunId: "",
+  currentRunTaskId: "",
   routinePane: "plan",
   selectedCategoryIds: new Set(),
+  selectedRoutineTaskIds: new Set(),
+  routineSelectionAnchorId: "",
   expandedCategoryIds: new Set(),
   editingCategoryId: null,
   profilePane: "editor",
+  profileSection: "basicInfo",
   workerScripts: {},
   workerScriptsLoading: false,
   aiConfigDirty: false,
@@ -35,6 +42,7 @@ const state = {
 };
 
 const names = { linkedin: "LinkedIn", indeed: "Indeed", seek: "SEEK", manual: "手动" };
+const routinePlatformOrder = ["linkedin", "seek", "indeed"];
 const postedWithinLabels = { 0: "不限", 1: "过去 24 小时", 3: "过去 3 天", 7: "过去 7 天", 14: "过去 14 天", 30: "过去 30 天" };
 const validationStatusLabels = {
   WAITING_FOR_WORKER: "等待预检",
@@ -43,19 +51,79 @@ const validationStatusLabels = {
   NEEDS_USER_ACTION: "需要人工处理"
 };
 const feedbackReasonLabels = {
+  ROLE_RELEVANT: "方向合适",
+  SKILL_MATCH: "技能匹配",
+  WOULD_APPLY: "准备申请",
+  REJECTION_CORRECT: "Rejected 判断正确",
   CLASSIFICATION_WRONG: "分类错了",
-  NOT_RELEVANT: "与我无关"
+  NOT_RELEVANT: "与我无关",
+  ROLE_NOT_INTERESTED: "方向不感兴趣",
+  SKILL_MISMATCH: "技能不合适",
+  WOULD_NOT_APPLY: "不会申请"
+};
+const scoreCategoryLabels = {
+  STRONG_MATCH: "强匹配",
+  GOOD_MATCH: "良好匹配",
+  MAYBE: "可考虑",
+  LOW_MATCH: "低匹配",
+  REJECTED: "已排除"
+};
+const titleClassificationLabels = {
+  CLEAR_MATCH: "标题明确匹配",
+  AMBIGUOUS: "标题信息不足",
+  CLEAR_REJECT: "标题明确不匹配"
+};
+const workRightsLabels = {
+  ELIGIBLE: "签证 / 工作权利符合",
+  INELIGIBLE: "签证 / 工作权利不符合",
+  UNCERTAIN: "签证 / 工作权利待确认",
+  OVERRIDE_KEEP: "命中强制保留条件",
+  NOT_STATED: "JD 未说明签证要求"
+};
+const workRightsShortLabels = {
+  ELIGIBLE: "符合",
+  INELIGIBLE: "不符合",
+  UNCERTAIN: "待确认",
+  OVERRIDE_KEEP: "强制保留",
+  NOT_STATED: "未说明"
+};
+
+function normalizeExclusionPhrase(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9+#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function exclusionKeywordCovered(keyword, enabledKeywords = []) {
+  const candidate = normalizeExclusionPhrase(keyword);
+  if (!candidate) return false;
+  const paddedCandidate = ` ${candidate} `;
+  return enabledKeywords.some((value) => {
+    const enabled = normalizeExclusionPhrase(value);
+    return enabled && paddedCandidate.includes(` ${enabled} `);
+  });
+}
+
+const screeningStatusLabels = {
+  TITLE_SCREENED: "标题初筛完成",
+  NEEDS_JD_REVIEW: "等待 JD 审阅",
+  JD_FETCHING: "正在获取 JD",
+  JD_FETCH_FAILED: "JD 获取失败",
+  AI_QUEUED: "等待 AI 审阅",
+  AI_REVIEWING: "AI 审阅中",
+  JD_SCREENED: "完整 JD 已审阅",
+  PROFILE_REQUIRED: "需要职业画像",
+  AI_NOT_CONFIGURED: "AI 未配置",
+  AI_BUDGET_SKIPPED: "已达到 AI 审阅上限"
 };
 const externalGptProfilePrompt = [
-  "You are a meticulous career strategist. The user will attach or paste their resume in this chat.",
-  "Create an evidence-based candidate profile for an early-career job-search agent.",
-  "Use only facts explicitly supported by the resume. Do not invent years of experience, degrees, work rights, locations, salary expectations, or preferences.",
-  "When something is unclear, omit it instead of guessing. Use many concise, specific list items so the user can curate them later.",
-  "Aim for 4-8 target roles, 6-12 focus areas, 15-30 supported skills, 1-6 complete education records, and 10-20 additional candidateItems.",
-  "Keep each education qualification, institution, and date range together in one string when those facts are available. Never split them into separate items.",
-  "Each candidateItems entry must be an object with value and suggestedSection. suggestedSection must be one of targetRoles, focusAreas, skills, education, locations, workTypes, or exclusions.",
+  "You are a meticulous resume data extractor. The user will attach or paste their resume in this chat.",
+  "Extract only facts explicitly supported by the resume. Never invent missing contact details, dates, work rights, achievements, or preferences.",
+  "Empty strings and empty arrays are valid. Keep each work, project, education, activity, certification, language, and honor as one complete entry.",
   "Return JSON only, with exactly this shape:",
-  '{"name":"...","headline":"...","summary":"...","targetRoles":["..."],"focusAreas":["..."],"skills":["..."],"education":["Degree | Institution | 2022-2024"],"preferences":{"locations":["..."],"workTypes":["..."],"exclusions":["..."]},"candidateItems":[{"value":"...","suggestedSection":"skills"}]}'
+  '{"schemaVersion":2,"basicInfo":{"name":"","location":"","phone":"","email":"","linkedinUrl":"","githubUrl":"","websiteUrl":""},"visa":{"visaType":"","visaName":"","grantedDate":"","expiryDate":"","details":"","forceKeepRequirements":[]},"workExperience":[{"company":"","role":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}],"projectExperience":[{"name":"","role":"","startDate":"","endDate":"","url":"","description":"","technologies":[],"highlights":[]}],"education":[{"institution":"","location":"","degree":"","field":"","startDate":"","endDate":"","description":""}],"extracurricular":[{"organization":"","role":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}],"certifications":[{"name":"","issuer":"","issuedDate":"","expiryDate":"","credentialId":"","url":""}],"languages":[{"language":"","proficiency":""}],"skills":[],"honors":[{"title":"","issuer":"","date":"","description":""}],"customSections":[{"title":"","entries":[{"title":"","subtitle":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}]}]}'
 ].join("\n\n");
 const pages = {
   overview: ["今日工作区", "职位概览"],
@@ -66,9 +134,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v2.2.1", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v2.2.1", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v2.2.1", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v1.0.0", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v1.0.0", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v1.0.0", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -82,6 +150,28 @@ const profileTagSections = [
 ];
 const formalProfileTagSections = profileTagSections.slice(1);
 const formalProfileTagKeys = new Set(formalProfileTagSections.map((definition) => definition.key));
+const structuredProfileSections = [
+  { key: "basicInfo", label: "基本信息", icon: "contact", singular: true },
+  { key: "visa", label: "身份与签证", icon: "badge-check", singular: true },
+  { key: "workExperience", label: "工作经历", icon: "briefcase-business", addLabel: "添加工作经历" },
+  { key: "projectExperience", label: "项目经历", icon: "blocks", addLabel: "添加项目经历" },
+  { key: "education", label: "教育经历", icon: "graduation-cap", addLabel: "添加教育经历" },
+  { key: "extracurricular", label: "课外活动经历", icon: "users", addLabel: "添加活动经历" },
+  { key: "certifications", label: "证书", icon: "badge-check", addLabel: "添加证书" },
+  { key: "languages", label: "语言", icon: "languages", addLabel: "添加语言" },
+  { key: "skills", label: "技能", icon: "code-2", skills: true, addLabel: "添加技能" },
+  { key: "honors", label: "荣誉", icon: "award", addLabel: "添加荣誉" }
+];
+const profileEntryFields = {
+  workExperience: [["company", "公司"], ["role", "职位"], ["location", "地点"], ["startDate", "开始时间"], ["endDate", "结束时间"], ["description", "经历说明", "textarea"], ["highlights", "职责与成果（一行一项）", "lines"]],
+  projectExperience: [["name", "项目名称"], ["role", "担任角色"], ["startDate", "开始时间"], ["endDate", "结束时间"], ["url", "项目网址", "url"], ["description", "项目说明", "textarea"], ["technologies", "技术（一行一项）", "lines"], ["highlights", "成果（一行一项）", "lines"]],
+  education: [["institution", "学校"], ["location", "地点"], ["degree", "学位"], ["field", "专业"], ["startDate", "开始时间"], ["endDate", "结束时间"], ["description", "补充说明", "textarea"]],
+  extracurricular: [["organization", "组织"], ["role", "角色"], ["location", "地点"], ["startDate", "开始时间"], ["endDate", "结束时间"], ["description", "经历说明", "textarea"], ["highlights", "活动与成果（一行一项）", "lines"]],
+  certifications: [["name", "证书名称"], ["issuer", "颁发机构"], ["issuedDate", "取得时间"], ["expiryDate", "到期时间"], ["credentialId", "证书编号"], ["url", "证书网址", "url"]],
+  languages: [["language", "语言"], ["proficiency", "熟练程度"]],
+  honors: [["title", "荣誉名称"], ["issuer", "颁发方"], ["date", "时间"], ["description", "说明", "textarea"]],
+  custom: [["title", "标题"], ["subtitle", "副标题 / 组织"], ["location", "地点"], ["startDate", "开始时间"], ["endDate", "结束时间"], ["description", "说明", "textarea"], ["highlights", "要点（一行一项）", "lines"]]
+};
 
 const el = (selector) => document.querySelector(selector);
 const escapeHtml = (value = "") => String(value)
@@ -151,16 +241,94 @@ function badge(value, type = "") {
   return '<span class="badge ' + type + '">' + escapeHtml(nice(value)) + "</span>";
 }
 
-function aiReviewBadge(job) {
-  return /^ai(?:$|-)/i.test(job.screening?.engine || "")
-    ? '<span class="badge ai-review-badge" title="此职位的 JD 已经过 AI 审阅"><i data-lucide="sparkles"></i>AI 审阅</span>'
+function screeningMethodBadge(job) {
+  const screening = job.screening || {};
+  const ai = /^ai(?:$|-)/i.test(screening.engine || "");
+  const pendingPresentation = {
+    AI_QUEUED: ["clock-3", "AI 排队中", "完整 JD 已获取，正在等待自动 AI 审阅"],
+    AI_REVIEWING: ["loader-circle", "AI 审阅中", "AI 正在结合职业画像评估完整 JD"],
+    JD_FETCHING: ["file-search", "正在获取 JD", "Worker 正在原职位页面读取完整 JD"],
+    JD_FETCH_FAILED: ["file-warning", "JD 获取失败", job.descriptionFetchError || "未能自动获取完整 JD，可稍后单独重跑任务"],
+    AI_NOT_CONFIGURED: ["key-round", "等待 AI 配置", "完整 JD 已获取；配置 AI 后会自动继续审阅"],
+    PROFILE_REQUIRED: ["contact-round", "等待职业画像", "完整 JD 已获取；激活职业画像后会自动继续审阅"],
+    AI_BUDGET_SKIPPED: ["gauge", "AI 额度上限", "本次运行达到 AI 自动审阅上限" ]
+  }[screening.screeningStatus];
+  if (pendingPresentation) {
+    return '<span class="badge screening-method-badge is-pending" title="' + escapeHtml(pendingPresentation[2]) + '"><i data-lucide="' + pendingPresentation[0] + '"></i>' + pendingPresentation[1] + '</span>';
+  }
+  if (screening.screeningStatus === "AI_ERROR") {
+    return '<span class="badge screening-method-badge is-error" title="AI 审阅发生错误，结果未确认"><i data-lucide="triangle-alert"></i>AI 审阅失败</span>';
+  }
+  if (screening.jdReviewed) {
+    return ai
+      ? '<span class="badge screening-method-badge ai-review-badge" title="此职位的 JD 已由 AI 审阅"><i data-lucide="sparkles"></i>AI 已审阅 JD</span>'
+      : '<span class="badge screening-method-badge" title="此职位的 JD 使用本地规则审阅"><i data-lucide="cpu"></i>本地已审阅 JD</span>';
+  }
+  return ai
+    ? '<span class="badge screening-method-badge ai-review-badge" title="此职位已由 AI 筛查"><i data-lucide="sparkles"></i>AI 已筛查</span>'
+    : '<span class="badge screening-method-badge" title="当前只完成了本地标题筛查，尚未进行 AI JD 审阅"><i data-lucide="text-search"></i>本地标题筛查</span>';
+}
+
+function workRightsBadge(job) {
+  const workRights = job.screening?.workRights;
+  if (!workRights?.assessment) return "";
+  const presentation = {
+    ELIGIBLE: ["shield-check", "签证符合", "is-eligible"],
+    INELIGIBLE: ["shield-x", "签证不符", "is-ineligible"],
+    UNCERTAIN: ["circle-help", "签证待确认", "is-uncertain"],
+    OVERRIDE_KEEP: ["bookmark-check", "签证强制保留", "is-override"],
+    NOT_STATED: ["minus", "JD 未提签证", "is-neutral"]
+  }[workRights.assessment] || ["circle-help", "签证待确认", "is-uncertain"];
+  const requirements = (workRights.requirements || []).length
+    ? ` 要求：${workRights.requirements.join("；")}`
     : "";
+  return '<span class="badge work-rights-badge ' + presentation[2] + '" title="' + escapeHtml((workRights.reason || "签证结论没有说明。") + requirements)
+    + '"><i data-lucide="' + presentation[0] + '"></i>' + presentation[1] + "</span>";
 }
 
 function feedbackBadge(job) {
-  if (job.feedback?.helpfulness !== "NOT_HELPFUL") return "";
+  if (isRejectionApproval(job)) {
+    return '<span class="feedback-badge is-helpful"><i data-lucide="thumbs-up"></i>Rejected 判断正确</span>';
+  }
+  if (isRejectionCorrection(job)) {
+    return '<span class="feedback-badge is-correction"><i data-lucide="rotate-ccw"></i>Rejected 判断有误</span>';
+  }
+  if (job.feedback?.helpfulness === "NOT_HELPFUL") {
+    const reason = feedbackReasonLabels[job.feedback.reason];
+    return '<span class="feedback-badge is-negative"><i data-lucide="thumbs-down"></i>没用' + (reason ? " · " + escapeHtml(reason) : "") + "</span>";
+  }
+  if (job.feedback?.helpfulness !== "HELPFUL") return "";
   const reason = feedbackReasonLabels[job.feedback.reason];
-  return '<span class="feedback-badge"><i data-lucide="thumbs-down"></i>没帮助' + (reason ? " · " + escapeHtml(reason) : "") + "</span>";
+  return '<span class="feedback-badge is-helpful"><i data-lucide="thumbs-up"></i>有用' + (reason ? " · " + escapeHtml(reason) : "") + "</span>";
+}
+
+function isRejectionCorrection(job) {
+  return job.feedback?.helpfulness === "REJECTION_INCORRECT"
+    || (job.feedback?.helpfulness === "NOT_HELPFUL" && job.feedback?.reason === "CLASSIFICATION_WRONG");
+}
+
+function isRejectionApproval(job) {
+  return job.feedback?.helpfulness === "HELPFUL" && job.feedback?.reason === "REJECTION_CORRECT";
+}
+
+function hasLikedJobFeedback(job) {
+  return (job.feedback?.helpfulness === "HELPFUL" && !isRejectionApproval(job)) || isRejectionCorrection(job);
+}
+
+function isRejectedLearningSignal(job) {
+  const rejected = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
+  if (!rejected || job.screening?.workRights?.assessment === "INELIGIBLE") return false;
+  return isRejectionApproval(job) || Boolean(job.screening?.jdReviewed
+    && !hasLikedJobFeedback(job)
+    && job.learningSignals?.exclusionKeywords?.length);
+}
+
+function effectiveJobCategory(job) {
+  if (isRejectionCorrection(job)) return "MAYBE";
+  if (job.feedback?.helpfulness === "NOT_HELPFUL") {
+    return job.screening?.category === "REJECTED" ? "REJECTED" : "LOW_MATCH";
+  }
+  return job.screening?.category;
 }
 
 function activeProfile() {
@@ -172,7 +340,49 @@ function selectedProfile() {
 }
 
 function currentRun() {
-  return state.data.runs[0] || null;
+  const latest = state.data.runs[0] || null;
+  return latest?.reviewCompletedAt ? null : latest;
+}
+
+function runIsFinished(run) {
+  return Boolean(run && ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state));
+}
+
+function localDateKey(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
+}
+
+function todayRoutineTaskRun(routineTaskId) {
+  const today = localDateKey(new Date());
+  let latest = null;
+  for (const run of state.data.runs || []) {
+    for (const task of run.tasks || []) {
+      if (task.routineTaskId !== routineTaskId || !task.startedAt || localDateKey(task.startedAt) !== today) continue;
+      if (!latest || Date.parse(task.startedAt) > Date.parse(latest.startedAt)) latest = task;
+    }
+  }
+  return latest;
+}
+
+function todayRoutineTaskBadge(runTask) {
+  if (!runTask) return "";
+  const startedAt = new Date(runTask.startedAt);
+  const time = Number.isFinite(startedAt.getTime())
+    ? startedAt.toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit", hour12: false })
+    : "";
+  const status = String(runTask.status || "").toUpperCase();
+  const presentation = status === "RUNNING"
+    ? { label: "今日运行中", className: "is-running", icon: "loader-circle" }
+    : status === "NEEDS_USER_ACTION"
+      ? { label: "今日需处理", className: "is-action", icon: "circle-alert" }
+      : ["FAILED", "CANCELLED", "SKIPPED"].includes(status)
+        ? { label: "今日已尝试", className: "is-attempted", icon: "history" }
+        : { label: "今日已运行", className: "is-complete", icon: "check" };
+  const title = presentation.label + (time ? "，最近启动于 " + time : "") + "；仍可手动再次运行";
+  return '<span class="today-run-badge ' + presentation.className + '" title="' + escapeHtml(title) + '"><i data-lucide="' + presentation.icon + '"></i>'
+    + presentation.label + (time ? " " + time : "") + "</span>";
 }
 
 function currentRunJobs() {
@@ -180,9 +390,115 @@ function currentRunJobs() {
   return run ? state.data.jobs.filter((job) => job.runId === run.id) : [];
 }
 
+function pendingReviewTaskEntries() {
+  const entries = [];
+  for (const run of state.data.runs || []) {
+    const runJobs = state.data.jobs.filter((job) => job.runId === run.id);
+    for (const task of run.tasks || []) {
+      const jobs = runJobs.filter((job) => matchingRunTask(run, job)?.id === task.id);
+      if (!jobs.some((job) => !job.viewedAt)) continue;
+      entries.push({
+        run,
+        task,
+        runId: run.id,
+        taskId: task.id,
+        platform: task.platform,
+        keyword: task.keyword,
+        location: task.location,
+        postedWithinDays: task.postedWithinDays,
+        executedAt: task.startedAt || task.completedAt || run.startedAt,
+        status: task.status,
+        jobs
+      });
+    }
+  }
+  return entries.sort((a, b) => Date.parse(b.executedAt || 0) - Date.parse(a.executedAt || 0));
+}
+
+function selectedPendingReviewTaskEntry(entries = pendingReviewTaskEntries()) {
+  if (!state.currentRunId || !state.currentRunTaskId) return null;
+  const entry = entries.find((item) => item.runId === state.currentRunId && item.taskId === state.currentRunTaskId) || null;
+  if (!entry) {
+    state.currentRunId = "";
+    state.currentRunTaskId = "";
+  }
+  return entry;
+}
+
+function pendingReviewJobs(entries = pendingReviewTaskEntries()) {
+  return uniqueJobsById(entries.flatMap((entry) => entry.jobs));
+}
+
 function historicalJobs() {
-  const run = currentRun();
-  return state.data.jobs.filter((job) => !run || job.runId !== run.id);
+  return state.data.jobs;
+}
+
+function historicalTaskEntries() {
+  const jobs = historicalJobs();
+  const entries = [];
+  const terminalTaskStatuses = new Set(["completed", "failed", "cancelled", "skipped"]);
+  for (const run of state.data.runs) {
+    const runJobs = jobs.filter((job) => job.runId === run.id);
+    const assignedJobIds = new Set();
+    for (const task of run.tasks || []) {
+      if (!task.completedAt && !terminalTaskStatuses.has(task.status)) continue;
+      const taskJobs = runJobs.filter((job) => matchingRunTask(run, job)?.id === task.id);
+      taskJobs.forEach((job) => assignedJobIds.add(job.id));
+      entries.push({
+        run,
+        task,
+        runId: run.id,
+        taskId: task.id,
+        platform: task.platform,
+        keyword: task.keyword,
+        location: task.location,
+        postedWithinDays: task.postedWithinDays,
+        executedAt: task.startedAt || task.completedAt || run.startedAt,
+        status: task.status,
+        jobs: taskJobs
+      });
+    }
+    const unassigned = runJobs.filter((job) => !assignedJobIds.has(job.id));
+    if (unassigned.length) {
+      const sources = [...new Set(unassigned.map((job) => job.source))];
+      entries.push({
+        run,
+        task: null,
+        runId: run.id,
+        taskId: "__unassigned",
+        platform: sources.length === 1 ? sources[0] : "manual",
+        keyword: "未关联任务",
+        location: "手动导入或旧版 Worker 数据",
+        postedWithinDays: null,
+        executedAt: unassigned.map((job) => job.discoveredAt).filter(Boolean).sort().at(-1) || run.startedAt,
+        status: "UNASSIGNED",
+        jobs: unassigned
+      });
+    }
+  }
+  const orphanJobs = jobs.filter((job) => !runForJob(job));
+  if (orphanJobs.length) {
+    const sources = [...new Set(orphanJobs.map((job) => job.source))];
+    entries.push({
+      run: null,
+      task: null,
+      runId: "__unassigned",
+      taskId: "__unassigned",
+      platform: sources.length === 1 ? sources[0] : "manual",
+      keyword: "未关联任务",
+      location: "手动导入或旧版 Worker 数据",
+      postedWithinDays: null,
+      executedAt: orphanJobs.map((job) => job.discoveredAt).filter(Boolean).sort().at(-1) || null,
+      status: "UNASSIGNED",
+      jobs: orphanJobs
+    });
+  }
+  return entries.sort((a, b) => Date.parse(b.executedAt || 0) - Date.parse(a.executedAt || 0));
+}
+
+function selectedHistoryTaskEntry(entries = historicalTaskEntries()) {
+  if (!state.historyRunId || !state.historyTaskId) return null;
+  return entries.find((entry) => entry.runId === state.historyRunId && entry.taskId === state.historyTaskId) || null;
 }
 
 function runForJob(job) {
@@ -190,18 +506,33 @@ function runForJob(job) {
 }
 
 function jobsInSelectedPane() {
-  if (state.jobsPane === "current") return currentRunJobs();
-  const jobs = historicalJobs();
-  if (!state.historyRunId) return jobs;
-  if (state.historyRunId === "__unassigned") return jobs.filter((job) => !runForJob(job));
-  return jobs.filter((job) => job.runId === state.historyRunId);
+  if (state.jobsPane === "current") {
+    const entries = pendingReviewTaskEntries();
+    return selectedPendingReviewTaskEntry(entries)?.jobs || pendingReviewJobs(entries);
+  }
+  return selectedHistoryTaskEntry()?.jobs || [];
+}
+
+function failedJdJobsInSelectedPane() {
+  return jobsInSelectedPane().filter((job) => {
+    const staleFetch = job.screening?.screeningStatus === "JD_FETCHING"
+      && Date.now() - new Date(job.aiReview?.startedAt || 0).getTime() > 30_000;
+    return ["linkedin", "indeed", "seek"].includes(job.source)
+      && job.screening?.category !== "REJECTED"
+      && (job.descriptionFetchStatus === "failed"
+        || job.screening?.screeningStatus === "JD_FETCH_FAILED"
+        || staleFetch);
+  });
 }
 
 function screeningBucket(job) {
   const screening = job.screening || {};
+  if (isRejectionCorrection(job)) return "pending";
+  if (job.feedback?.helpfulness === "NOT_HELPFUL") return screening.category === "REJECTED" ? "rejected" : "pending";
   if (screening.category === "REJECTED" || screening.titleClassification === "CLEAR_REJECT") return "rejected";
-  if (["NEEDS_JD_REVIEW", "AI_ERROR"].includes(screening.screeningStatus) || screening.category === "LOW_MATCH") return "pending";
+  if (!screening.jdReviewed || !/^ai(?:$|-)/i.test(screening.engine || "")) return "pending";
   if (["STRONG_MATCH", "GOOD_MATCH", "MAYBE"].includes(screening.category)) return "selected";
+  if (screening.category === "LOW_MATCH") return "pending";
   return "pending";
 }
 
@@ -217,69 +548,68 @@ function matchingRunTask(run, job) {
 }
 
 function jobStats(jobs) {
-  const counts = { entered: jobs.length, selected: 0, pending: 0, rejected: 0 };
+  const counts = { entered: jobs.length, selected: 0, pending: 0, rejected: 0, viewed: 0, unviewed: 0 };
   for (const job of jobs) counts[screeningBucket(job)] += 1;
+  counts.viewed = jobs.filter((job) => Boolean(job.viewedAt)).length;
+  counts.unviewed = counts.entered - counts.viewed;
   return counts;
 }
 
-function renderCurrentRunStats() {
-  const run = currentRun();
-  const jobs = currentRunJobs();
+function renderPendingReviewTasks() {
+  const entries = pendingReviewTaskEntries();
+  const jobs = pendingReviewJobs(entries);
   const total = jobStats(jobs);
-  el("#job-run-stats-total").textContent = run
-    ? `共 ${total.entered} 个职位 · 选中 ${total.selected} · 待定 ${total.pending} · 不符合 ${total.rejected}`
-    : "尚未运行";
-  if (!run) {
-    el("#job-run-stats-body").innerHTML = '<tr><td colspan="7" class="empty-cell">开始每日任务后，这里会按平台和搜索条件显示统计。</td></tr>';
+  el("#job-run-stats-total").textContent = entries.length
+    ? `共 ${entries.length} 个任务 · 未看 ${total.unviewed} · 选中 ${total.selected} · 待定 ${total.pending} · 不符合 ${total.rejected}`
+    : "没有待完成任务";
+  if (!entries.length) {
+    el("#job-run-stats-body").innerHTML = '<tr><td colspan="8" class="empty-cell">所有已返回职位的任务都已看完。</td></tr>';
     return;
   }
 
-  const jobsByTask = new Map(run.tasks.map((task) => [task.id, []]));
-  const unassignedByPlatform = new Map();
-  for (const job of jobs) {
-    const task = matchingRunTask(run, job);
-    if (task) jobsByTask.get(task.id).push(job);
-    else {
-      const platform = job.source || "manual";
-      if (!unassignedByPlatform.has(platform)) unassignedByPlatform.set(platform, []);
-      unassignedByPlatform.get(platform).push(job);
-    }
-  }
-
   const platforms = ["linkedin", "indeed", "seek", "manual"]
-    .filter((platform) => run.tasks.some((task) => task.platform === platform) || unassignedByPlatform.has(platform));
+    .filter((platform) => entries.some((entry) => entry.platform === platform));
   const rows = [];
   for (const platform of platforms) {
-    const tasks = run.tasks.filter((task) => task.platform === platform);
-    const platformJobs = [...tasks.flatMap((task) => jobsByTask.get(task.id) || []), ...(unassignedByPlatform.get(platform) || [])];
+    const platformEntries = entries.filter((entry) => entry.platform === platform);
+    const platformJobs = pendingReviewJobs(platformEntries);
     const platformStats = jobStats(platformJobs);
-    rows.push('<tr class="job-stats-platform-row"><th colspan="7"><span>' + escapeHtml(names[platform] || platform) + '</span><small>进入 ' + platformStats.entered + ' · 选中 ' + platformStats.selected + ' · 待定 ' + platformStats.pending + ' · 不符合 ' + platformStats.rejected + "</small></th></tr>");
-    for (const task of tasks) {
-      const stats = jobStats(jobsByTask.get(task.id) || []);
-      rows.push("<tr>"
-        + '<td><strong>' + escapeHtml(task.keyword) + '</strong><small>' + escapeHtml(task.location) + "</small></td>"
+    rows.push('<tr class="job-stats-platform-row"><th colspan="8"><span>' + escapeHtml(names[platform] || platform) + '</span><small>' + platformEntries.length + ' 个任务 · 未看 ' + platformStats.unviewed + ' · 选中 ' + platformStats.selected + ' · 待定 ' + platformStats.pending + ' · 不符合 ' + platformStats.rejected + "</small></th></tr>");
+    for (const entry of platformEntries) {
+      const { run, task } = entry;
+      const stats = jobStats(entry.jobs);
+      const activeStatus = ["queued", "running", "needs_user_action"].includes(task.status);
+      const active = state.currentRunId === run.id && state.currentRunTaskId === task.id;
+      const filterAttributes = ' data-filter-job-stat-task="' + task.id + '" data-job-stat-run="' + run.id + '"';
+      rows.push('<tr class="job-stats-task-row' + (active ? " is-active" : "") + '"' + filterAttributes + ' title="只看这个任务的职位；再次点击取消筛选">'
+        + '<td><button class="job-stat-task-button"' + filterAttributes + ' type="button" title="只看这个任务的职位"><strong>' + escapeHtml(task.keyword) + '</strong><small>' + escapeHtml(task.location) + '<br>执行于 ' + escapeHtml(dateTime(entry.executedAt)) + "</small></button></td>"
         + "<td>" + escapeHtml(postedWithinLabels[Number(task.postedWithinDays)] || "不限") + "</td>"
-        + "<td>" + badge(task.status, "status-badge") + "</td>"
+        + "<td>" + badge(task.status, "status-badge") + '<small>未看 ' + stats.unviewed + " / " + stats.entered + "</small></td>"
         + '<td class="job-stat-number">' + stats.entered + "</td>"
         + '<td class="job-stat-number stat-selected">' + stats.selected + "</td>"
         + '<td class="job-stat-number stat-pending">' + stats.pending + "</td>"
-        + '<td class="job-stat-number stat-rejected">' + stats.rejected + "</td></tr>");
-    }
-    const unassigned = unassignedByPlatform.get(platform) || [];
-    if (unassigned.length) {
-      const stats = jobStats(unassigned);
-      rows.push('<tr><td><strong>未关联任务</strong><small>手动导入或旧版 Worker 数据</small></td><td>-</td><td>' + badge("UNASSIGNED", "status-badge") + "</td>"
-        + '<td class="job-stat-number">' + stats.entered + "</td>"
-        + '<td class="job-stat-number stat-selected">' + stats.selected + "</td>"
-        + '<td class="job-stat-number stat-pending">' + stats.pending + "</td>"
-        + '<td class="job-stat-number stat-rejected">' + stats.rejected + "</td></tr>");
+        + '<td class="job-stat-number stat-rejected">' + stats.rejected + "</td>"
+        + '<td class="action-cell job-stat-actions"><button class="button button-secondary task-view-all-action" data-mark-task-viewed="' + task.id + '" data-job-stat-run="' + run.id
+        + '" type="button" title="' + (activeStatus ? "任务结束后才能批量标记" : "将这个任务的全部职位标记为已看") + '"'
+        + (activeStatus ? " disabled" : "") + '><i data-lucide="check-check"></i><span>标记已全部看完</span></button>'
+        + '<button class="icon-button destructive" data-delete-job-stat-task="' + task.id + '" data-job-stat-run="' + run.id
+        + '" type="button" title="' + (activeStatus ? "请先在每日任务中结束或移除此任务" : "删除此任务统计及关联职位") + '"'
+        + (activeStatus ? " disabled" : "") + '><i data-lucide="trash-2"></i></button></td></tr>');
     }
   }
-  el("#job-run-stats-body").innerHTML = rows.join("") || '<tr><td colspan="7" class="empty-cell">本次运行没有可统计的任务。</td></tr>';
+  el("#job-run-stats-body").innerHTML = rows.join("");
 }
 
 function sortJobs(jobs, sort) {
   return [...jobs].sort((a, b) => {
+    if (sort === "priority") {
+      const rank = { STRONG_MATCH: 0, GOOD_MATCH: 1, MAYBE: 2, LOW_MATCH: 3, REJECTED: 4 };
+      const categoryOrder = (rank[effectiveJobCategory(a)] ?? 5) - (rank[effectiveJobCategory(b)] ?? 5);
+      if (categoryOrder) return categoryOrder;
+      const scoreOrder = Number(b.screening?.score || 0) - Number(a.screening?.score || 0);
+      if (scoreOrder) return scoreOrder;
+      return String(b.discoveredAt).localeCompare(String(a.discoveredAt));
+    }
     if (sort === "score") return b.screening.score - a.screening.score;
     if (sort === "source") return a.source.localeCompare(b.source);
     if (sort === "company") return String(a.company || "").localeCompare(String(b.company || ""));
@@ -293,13 +623,15 @@ function visibleJobs() {
   const category = el("#job-category").value;
   const source = el("#job-source").value;
   const status = el("#job-status").value;
+  const viewed = el("#job-viewed").value;
   const sort = el("#job-sort").value;
   const jobs = jobsInSelectedPane().filter((job) => {
     const words = [job.title, job.company, job.location, job.searchKeyword].join(" ").toLowerCase();
     return (!query || words.includes(query))
-      && (!category || job.screening.category === category)
+      && (!category || effectiveJobCategory(job) === category)
       && (!source || job.source === source)
-      && (!status || job.screening.screeningStatus === status);
+      && (!status || job.screening.screeningStatus === status)
+      && (viewed === "all" || (viewed === "viewed" ? Boolean(job.viewedAt) : !job.viewedAt));
   });
   return sortJobs(jobs, sort);
 }
@@ -308,10 +640,49 @@ function actionButtons(job) {
   const open = /^https?:\/\//i.test(job.jobUrl || "")
     ? '<a class="icon-button" href="' + escapeHtml(job.jobUrl) + '" target="_blank" rel="noreferrer" title="打开原职位"><i data-lucide="external-link"></i></a>'
     : "";
-  const feedbackActive = job.feedback?.helpfulness === "NOT_HELPFUL";
+  const correctionActive = isRejectionCorrection(job);
+  const rejected = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
+  const positiveActive = rejected ? isRejectionApproval(job) : hasLikedJobFeedback(job);
+  const negativeActive = rejected ? correctionActive : job.feedback?.helpfulness === "NOT_HELPFUL";
+  const feedbackAllowed = positiveActive || negativeActive || rejected || Boolean(job.screening?.jdReviewed && /^ai(?:$|-)/i.test(job.screening?.engine || ""));
+  const viewed = Boolean(job.viewedAt);
+  const jdFetching = job.screening?.screeningStatus === "JD_FETCHING";
+  const jdFetchStale = jdFetching && Date.now() - new Date(job.aiReview?.startedAt || 0).getTime() > 45_000;
+  const aiBusy = ["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus) || (jdFetching && !jdFetchStale);
+  const titleRejected = !job.screening?.jdReviewed
+    && rejected
+    && !correctionActive;
+  const hasCompleteJd = hasCompleteJobJd(job);
+  const canFetchJd = Boolean(job.jobUrl && ["linkedin", "indeed", "seek"].includes(job.source));
+  const canRereview = (hasCompleteJd || canFetchJd) && !titleRejected && !aiBusy && state.data?.ai?.configured && state.data?.activeProfile;
+  const rereviewTitle = aiBusy
+    ? (job.screening?.screeningStatus === "JD_FETCHING" ? "正在原职位页面获取完整 JD" : "AI 正在审阅此职位")
+    : titleRejected
+      ? "标题已明确排除，无需获取 JD 或重新审阅"
+      : !state.data?.activeProfile
+        ? "请先激活职业画像"
+        : !state.data?.ai?.configured
+          ? "请先配置 AI 服务"
+          : jdFetchStale
+            ? "上次 JD 获取没有回传，点击重新打开原职位"
+          : !hasCompleteJd && canFetchJd
+            ? "打开原职位获取完整 JD，然后自动 AI 审阅"
+            : !hasCompleteJd
+              ? "缺少原职位链接，不能获取完整 JD"
+              : "使用已保存的完整 JD 重新 AI 审阅";
   return open
-    + '<button class="icon-button" data-review="' + job.id + '" title="查看或审阅 JD"><i data-lucide="scan-search"></i></button>'
-    + '<button class="feedback-action' + (feedbackActive ? " is-active" : "") + '" data-feedback="' + job.id + '" type="button" aria-pressed="' + String(feedbackActive) + '" title="' + (feedbackActive ? "修改没帮助反馈" : "标记为没帮助") + '"><i data-lucide="thumbs-down"></i><span>没帮助</span></button>';
+    + '<button class="icon-button" data-rereview="' + job.id + '" type="button" title="' + rereviewTitle + '" aria-label="' + (hasCompleteJd ? "重新 AI 审阅" : "获取 JD 并 AI 审阅") + '"' + (canRereview ? "" : " disabled") + '><i data-lucide="' + (aiBusy ? "loader-circle" : hasCompleteJd ? "refresh-cw" : "file-search") + '"></i></button>'
+    + '<button class="viewed-action' + (viewed ? " is-active" : "") + '" data-toggle-viewed="' + job.id + '" data-viewed="' + String(viewed) + '" type="button" title="' + (viewed ? "点击恢复为未看" : "标记为已看") + '"><i data-lucide="' + (viewed ? "check" : "eye") + '"></i><span>' + (viewed ? "已看" : "看过了") + "</span></button>"
+    + '<button class="feedback-action is-compact' + (positiveActive ? " is-active" : "") + '" data-feedback="' + job.id + '" data-feedback-mode="positive" type="button" aria-label="有用" aria-pressed="' + String(positiveActive) + '" title="' + (feedbackAllowed ? (rejected ? "有用：Rejected 判断正确" : positiveActive ? "修改有用反馈" : "有用：告诉 Agent 你喜欢这个职位") : "AI 完成完整 JD 审阅后才能评价") + '"' + (feedbackAllowed ? "" : " disabled") + '><i data-lucide="thumbs-up"></i></button>'
+    + '<button class="feedback-action is-compact is-negative' + (negativeActive ? " is-active" : "") + '" data-feedback="' + job.id + '" data-feedback-mode="negative" type="button" aria-label="没用" aria-pressed="' + String(negativeActive) + '" title="' + (feedbackAllowed ? (rejected ? "没用：Rejected 判断不正确" : negativeActive ? "修改没用反馈" : "没用：告诉 Agent 你不喜欢的原因") : "AI 完成完整 JD 审阅后才能评价") + '"' + (feedbackAllowed ? "" : " disabled") + '><i data-lucide="thumbs-down"></i></button>';
+}
+
+function hasCompleteJobJd(job) {
+  return Boolean(job.description && (
+    job.descriptionSource === "detail-page"
+    || ["fetched", "reused"].includes(job.descriptionFetchStatus)
+    || job.screening?.jdReviewed
+  ));
 }
 
 function jobRow(job, compact = false, includeBatch = false) {
@@ -321,13 +692,18 @@ function jobRow(job, compact = false, includeBatch = false) {
   const batch = includeBatch
     ? '<td><span>' + escapeHtml(run ? dateTime(run.startedAt) : "未关联运行") + '</span><small>' + escapeHtml(run ? nice(run.state) : "手动或旧版导入") + "</small></td>"
     : "";
-  return '<tr' + (job.feedback?.helpfulness === "NOT_HELPFUL" ? ' class="job-not-helpful"' : "") + '>'
-    + '<td><strong>' + escapeHtml(job.title) + "</strong>" + duplicate + feedbackBadge(job) + "</td>"
+  const rowClasses = [job.feedback?.helpfulness === "HELPFUL" ? "job-helpful" : "", job.feedback?.helpfulness === "NOT_HELPFUL" && !isRejectionCorrection(job) ? "job-not-helpful" : "", isRejectionCorrection(job) ? "job-correction" : "", job.viewedAt ? "job-viewed" : ""].filter(Boolean).join(" ");
+  const feedback = feedbackBadge(job);
+  const viewed = job.viewedAt && !feedback ? '<span class="viewed-badge"><i data-lucide="check"></i>已看</span>' : "";
+  const reviewMeta = viewed || feedback ? '<span class="job-review-meta">' + viewed + feedback + "</span>" : "";
+  const scoreReason = escapeHtml(job.screening?.reason || "尚无评分说明");
+  return '<tr' + (rowClasses ? ' class="' + rowClasses + '"' : "") + '>'
+    + '<td><strong>' + escapeHtml(job.title) + "</strong>" + duplicate + reviewMeta + "</td>"
     + '<td><span>' + escapeHtml(job.company || "-") + "</span><small>" + escapeHtml(job.location || "-") + "</small></td>"
     + '<td>' + badge(names[job.source] || job.source, "source-" + job.source) + "</td>"
     + search
-    + '<td><span class="score">' + job.screening.score + "</span>" + badge(job.screening.category, "category-" + job.screening.category.toLowerCase()) + aiReviewBadge(job) + "</td>"
-    + '<td>' + badge(job.screening.screeningStatus, "status-badge") + "</td>"
+    + '<td><button class="score score-trigger" type="button" data-score-details="' + job.id + '" title="点击查看分数构成：' + scoreReason + '" aria-label="查看评分 ' + job.screening.score + ' 的构成">' + job.screening.score + "</button>" + badge(effectiveJobCategory(job), "category-" + effectiveJobCategory(job).toLowerCase()) + "</td>"
+    + '<td>' + badge(job.screening.screeningStatus, "status-badge") + screeningMethodBadge(job) + workRightsBadge(job) + "</td>"
     + batch
     + '<td class="action-cell">' + actionButtons(job) + "</td></tr>";
 }
@@ -337,7 +713,7 @@ function renderOverview() {
   const historyCount = historicalJobs().length;
   const metrics = [
     ["本次导入", jobs.length, "briefcase-business"],
-    ["本次强匹配", jobs.filter((job) => job.screening.category === "STRONG_MATCH").length, "badge-check"],
+    ["本次强匹配", jobs.filter((job) => effectiveJobCategory(job) === "STRONG_MATCH").length, "badge-check"],
     ["本次待审阅", jobs.filter((job) => job.screening.screeningStatus === "NEEDS_JD_REVIEW").length, "scan-search"],
     ["历史职位", historyCount, "history"]
   ];
@@ -348,33 +724,40 @@ function renderOverview() {
   el("#overview-jobs").innerHTML = rows || '<tr><td colspan="6" class="empty-cell">本次任务尚未导入职位。</td></tr>';
 }
 
-function renderHistoryRunOptions() {
-  const currentId = currentRun()?.id || null;
-  const counts = new Map();
-  let unassigned = 0;
-  for (const job of historicalJobs()) {
-    if (job.runId && state.data.runs.some((run) => run.id === job.runId)) counts.set(job.runId, (counts.get(job.runId) || 0) + 1);
-    else unassigned += 1;
-  }
-  const runs = state.data.runs.filter((run) => run.id !== currentId && counts.has(run.id));
-  const validValues = new Set(["", ...runs.map((run) => run.id), ...(unassigned ? ["__unassigned"] : [])]);
-  if (!validValues.has(state.historyRunId)) state.historyRunId = "";
-  el("#job-history-run").innerHTML = '<option value="">全部历史批次</option>'
-    + runs.map((run) => '<option value="' + escapeHtml(run.id) + '"' + (state.historyRunId === run.id ? " selected" : "") + ">" + escapeHtml(dateTime(run.startedAt)) + " · " + counts.get(run.id) + " 个职位</option>").join("")
-    + (unassigned ? '<option value="__unassigned"' + (state.historyRunId === "__unassigned" ? " selected" : "") + ">未关联运行 · " + unassigned + " 个职位</option>" : "");
+function renderHistoryTaskIndex(entries) {
+  el("#history-task-index-count").textContent = entries.length + " 项任务";
+  el("#history-task-index-body").innerHTML = entries.map((entry) => {
+    const stats = jobStats(entry.jobs);
+    const scope = entry.postedWithinDays === null || entry.postedWithinDays === undefined
+      ? "不限 / 未记录"
+      : postedWithinLabels[Number(entry.postedWithinDays)] || "不限";
+    return '<tr class="history-task-row" data-open-history-task="' + escapeHtml(entry.taskId) + '" data-history-run="' + escapeHtml(entry.runId) + '" title="查看此任务的全部职位">'
+      + '<td><strong>' + escapeHtml(entry.executedAt ? dateTime(entry.executedAt) : "时间未记录") + '</strong><small>' + escapeHtml(entry.run ? "运行批次 " + dateTime(entry.run.startedAt) : "未关联运行") + "</small></td>"
+      + '<td>' + badge(names[entry.platform] || entry.platform, "source-" + entry.platform) + "</td>"
+      + '<td><strong>' + escapeHtml(entry.keyword) + '</strong><small>' + escapeHtml(entry.location || "-") + "</small></td>"
+      + '<td>' + escapeHtml(scope) + "</td>"
+      + '<td><strong>' + stats.entered + ' 个职位</strong><small>选中 ' + stats.selected + " · 待定 " + stats.pending + " · 不符合 " + stats.rejected + "</small></td>"
+      + '<td>' + badge(entry.status || "UNKNOWN", "status-badge") + "</td>"
+      + '<td class="history-task-open"><button class="icon-button" type="button" data-open-history-task="' + escapeHtml(entry.taskId) + '" data-history-run="' + escapeHtml(entry.runId) + '" title="查看任务职位"><i data-lucide="arrow-right"></i></button></td></tr>';
+  }).join("") || '<tr><td colspan="7" class="empty-cell">尚无历史任务。完成一次新的运行后会显示在这里。</td></tr>';
 }
 
 function selectedReviewRun() {
-  if (state.jobsPane === "current") return currentRun();
+  if (state.jobsPane === "current") return selectedPendingReviewTaskEntry()?.run || currentRun();
   if (!state.historyRunId || state.historyRunId === "__unassigned") return null;
   return state.data.runs.find((run) => run.id === state.historyRunId) || null;
 }
 
-function reflectionHasCurrentFeedback(reflection, feedbackJobs) {
+function reflectionHasCurrentFeedback(reflection, evidenceJobs) {
   if (!reflection) return false;
   const reflectedIds = new Set(reflection.feedbackJobIds || []);
-  return reflectedIds.size === feedbackJobs.length
-    && feedbackJobs.every((job) => reflectedIds.has(job.id) && String(job.feedback?.updatedAt || "") <= String(reflection.createdAt || ""));
+  return reflectedIds.size === evidenceJobs.length
+    && evidenceJobs.every((job) => reflectedIds.has(job.id)
+      && String(job.feedback?.updatedAt || job.learningSignals?.generatedAt || "") <= String(reflection.createdAt || ""));
+}
+
+function uniqueJobsById(jobs) {
+  return [...new Map(jobs.map((job) => [job.id, job])).values()];
 }
 
 function learningChips(items, tone = "") {
@@ -387,64 +770,101 @@ function renderReviewLearning() {
   panel.hidden = state.jobsPane === "history" && !run;
   if (panel.hidden) return;
   const jobs = run ? state.data.jobs.filter((job) => job.runId === run.id) : [];
-  const feedbackJobs = jobs.filter((job) => job.feedback?.helpfulness === "NOT_HELPFUL");
+  const helpfulJobs = jobs.filter(hasLikedJobFeedback);
+  const correctionJobs = helpfulJobs.filter(isRejectionCorrection);
+  const rejectedJobs = jobs.filter(isRejectedLearningSignal);
+  const confirmedRejectedJobs = rejectedJobs.filter(isRejectionApproval);
+  const automaticRejectedJobs = rejectedJobs.filter((job) => !isRejectionApproval(job));
+  const legacyJobs = jobs.filter((job) => job.feedback?.helpfulness === "NOT_HELPFUL" && job.feedback?.reason !== "CLASSIFICATION_WRONG");
+  const evidenceJobs = uniqueJobsById([...helpfulJobs, ...rejectedJobs, ...legacyJobs]);
   const reflection = run ? (state.data.reviewReflections || []).find((item) => item.runId === run.id) : null;
-  const model = reflection?.modelSnapshot || (!run ? state.data.preferenceModel : null);
   const runFinished = run && ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state);
-  const reflected = reflectionHasCurrentFeedback(reflection, feedbackJobs);
+  const pendingAiReviews = jobs.filter((job) => ["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus)).length;
+  const reflected = reflectionHasCurrentFeedback(reflection, evidenceJobs);
   const button = el("#complete-run-review");
   const label = button.querySelector("span");
-  el("#review-feedback-count").textContent = feedbackJobs.length + " 条没帮助";
+  el("#review-feedback-count").textContent = (helpfulJobs.length - correctionJobs.length) + " 条有用 · " + legacyJobs.length + " 条没用 · " + correctionJobs.length + " 条 Rejected 纠错 · " + confirmedRejectedJobs.length + " 条 Rejected 已确认 · " + automaticRejectedJobs.length + " 条 AI 排除";
   button.hidden = false;
-  button.disabled = !runFinished || (!feedbackJobs.length && !reflection) || reflected;
+  button.disabled = !runFinished || pendingAiReviews > 0 || (!evidenceJobs.length && !reflection) || reflected;
   label.textContent = reflection ? (reflected ? "本次复盘已完成" : "更新本次复盘") : "完成本次审阅并复盘";
   el("#review-learning-subtitle").textContent = state.jobsPane === "history"
     ? "查看该历史批次的人工反馈和复盘结论。"
-    : !run ? "运行每日任务后，可在这里标记没有帮助的职位并完成复盘。"
-      : !runFinished ? "任务仍在运行；可以先标记反馈，运行结束后再完成复盘。"
-        : "只学习你明确标记的职位；撤销反馈并更新复盘可以纠正偏好。";
+    : !run ? "运行每日任务后，可标记有用或没用，并结合 AI 排除结果完成复盘。"
+      : !runFinished ? "任务仍在运行；AI 审阅完成后再进行人工反馈和复盘。"
+        : pendingAiReviews ? `还有 ${pendingAiReviews} 个职位正在自动 AI 审阅；完成后再进行复盘。`
+        : "普通职位的“有用 / 没用”用于学习偏好；Rejected 的“有用 / 没用”用于确认或纠正排除判断，候选排除词只进入待审核区。";
 
-  if (!model) {
-    el("#review-learning-content").innerHTML = '<p class="review-learning-empty">尚未生成复盘。标记至少一条“没帮助”，并在任务结束后完成审阅。</p>';
-    return;
-  }
-  const engine = reflection?.engine || model.engine;
-  el("#review-learning-content").innerHTML = '<div class="learning-summary"><div><strong>学习摘要</strong>'
-    + (reflection ? '<span class="learning-version">v' + reflection.version + " · " + escapeHtml(dateTime(reflection.createdAt)) + "</span>" : "")
-    + (engine === "ai" ? '<span class="badge ai-review-badge"><i data-lucide="sparkles"></i>AI 复盘</span>' : '<span class="badge status-badge">本地复盘</span>')
-    + '</div><p>' + escapeHtml(model.summary) + "</p></div>"
-    + (model.targetSignals?.length ? '<div class="learning-rule-row"><strong>优先信号</strong><div>' + learningChips(model.targetSignals, "is-target") + "</div></div>" : "")
-    + (model.avoidSignals?.length || model.titleExclusions?.length ? '<div class="learning-rule-row"><strong>降低优先级</strong><div>' + learningChips([...(model.avoidSignals || []), ...(model.titleExclusions || [])], "is-avoid") + "</div></div>" : "")
-    + (model.screeningGuidance?.length ? '<div class="learning-guidance"><strong>下次筛选</strong><ul>' + model.screeningGuidance.map((item) => "<li>" + escapeHtml(item) + "</li>").join("") + "</ul></div>" : "")
-    + (reflection?.aiError ? '<p class="form-note warning-note">AI 复盘未完成，已使用本地规则：' + escapeHtml(reflection.aiError) + "</p>" : "");
 }
 
 function renderJobs() {
-  const currentJobs = currentRunJobs();
-  const historyJobs = historicalJobs();
-  renderHistoryRunOptions();
+  const pendingEntries = pendingReviewTaskEntries();
+  const currentJobs = pendingReviewJobs(pendingEntries);
+  const historyEntries = historicalTaskEntries();
+  let historyEntry = selectedHistoryTaskEntry(historyEntries);
+  if (state.jobsPane === "history" && (state.historyRunId || state.historyTaskId) && !historyEntry) {
+    state.historyRunId = "";
+    state.historyTaskId = "";
+  }
+  historyEntry = selectedHistoryTaskEntry(historyEntries);
+  const historyIndex = state.jobsPane === "history" && !historyEntry;
+  renderHistoryTaskIndex(historyEntries);
   document.querySelectorAll("[data-jobs-pane]").forEach((node) => {
     const active = node.dataset.jobsPane === state.jobsPane;
     node.classList.toggle("is-active", active);
     node.setAttribute("aria-selected", String(active));
   });
-  el("#current-jobs-count").textContent = String(currentJobs.length);
-  el("#history-jobs-count").textContent = String(historyJobs.length);
-  el("#jobs-run-filter").hidden = state.jobsPane !== "history";
+  el("#current-jobs-count").textContent = String(pendingEntries.length);
+  el("#history-jobs-count").textContent = String(historyEntries.length);
+  el("#history-task-index").hidden = !historyIndex;
+  el("#jobs-run-filter").hidden = state.jobsPane !== "history" || historyIndex;
   el("#job-run-stats").hidden = state.jobsPane !== "current";
-  if (state.jobsPane === "current") renderCurrentRunStats();
+  el("#jobs-filter-bar").hidden = historyIndex;
+  el("#jobs-list-table").hidden = historyIndex;
+  if (historyEntry) {
+    el("#history-task-context").textContent = `${names[historyEntry.platform] || historyEntry.platform} · ${historyEntry.keyword} · ${historyEntry.location} · ${dateTime(historyEntry.executedAt)}`;
+  }
+  const selectedRun = historyEntry?.run || null;
+  el("#delete-selected-history-run").disabled = !selectedRun || !["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(selectedRun.state);
+  const failedJdJobs = failedJdJobsInSelectedPane();
+  const paneJobIds = new Set(jobsInSelectedPane().map((job) => job.id));
+  const activeJdRetry = (state.data.jdRetryBatches || []).find((batch) => batch.jobIds.some((id) => paneJobIds.has(id)));
+  const retryFailedButton = el("#retry-failed-jds");
+  retryFailedButton.hidden = !activeJdRetry && !failedJdJobs.length;
+  retryFailedButton.disabled = Boolean(activeJdRetry) || !failedJdJobs.length;
+  retryFailedButton.classList.toggle("is-busy", Boolean(activeJdRetry));
+  if (historyIndex) retryFailedButton.hidden = true;
+  retryFailedButton.innerHTML = activeJdRetry
+    ? '<i data-lucide="loader-circle" class="button-spinner"></i><span>获取 JD ' + activeJdRetry.completed + '/' + activeJdRetry.total + '</span>'
+    : '<i data-lucide="files"></i><span>重试失败 JD (' + failedJdJobs.length + ')</span>';
+  if (state.jobsPane === "current") renderPendingReviewTasks();
+  const selectedPendingEntry = state.jobsPane === "current" ? selectedPendingReviewTaskEntry(pendingEntries) : null;
+  const selectedTask = selectedPendingEntry?.task || null;
+  const taskFilter = el("#active-job-task-filter");
+  taskFilter.hidden = !selectedTask;
+  if (selectedTask) {
+    el("#active-job-task-filter-label").textContent = `${names[selectedTask.platform] || selectedTask.platform} · ${selectedTask.keyword} · ${selectedTask.location} · ${postedWithinLabels[Number(selectedTask.postedWithinDays)] || "不限"} · ${dateTime(selectedPendingEntry.executedAt)}`;
+  }
   renderReviewLearning();
-  el("#jobs-list-title").textContent = state.jobsPane === "history" ? "历史职位" : "本次任务职位";
+  if (historyIndex) {
+    el("#jobs-list-title").textContent = "历史任务";
+    el("#jobs-summary").textContent = historyEntries.length + " 项历史任务 · 按执行时间从新到旧";
+    refreshIcons();
+    return;
+  }
+  el("#jobs-list-title").textContent = state.jobsPane === "history" ? "历史任务职位" : "待审阅职位";
   const jobs = visibleJobs();
   const paneTotal = jobsInSelectedPane().length;
+  const viewedLabel = el("#job-viewed").selectedOptions[0]?.textContent || "全部";
   el("#jobs-summary").textContent = state.jobsPane === "history"
-    ? jobs.length + " / " + paneTotal + " 个历史职位"
-    : currentRun() ? jobs.length + " / " + paneTotal + " 个本次任务职位" : "尚未开始本次任务";
-  el("#jobs-table-head").innerHTML = state.jobsPane === "history"
-    ? "<tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>状态</th><th>运行批次</th><th></th></tr>"
-    : "<tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>状态</th><th></th></tr>";
-  el("#jobs-table").innerHTML = jobs.map((job) => jobRow(job, false, state.jobsPane === "history")).join("")
-    || '<tr><td colspan="' + (state.jobsPane === "history" ? "8" : "7") + '" class="empty-cell">' + (state.jobsPane === "history" ? "没有匹配当前筛选条件的历史职位。" : "本次任务尚未导入职位。") + "</td></tr>";
+    ? jobs.length + " / " + paneTotal + " 个任务职位 · " + viewedLabel
+    : pendingEntries.length ? jobs.length + " / " + paneTotal + " 个待审阅任务职位 · " + viewedLabel : "目前没有未审阅完成的任务";
+  el("#jobs-table-head").innerHTML = "<tr><th>职位</th><th>公司 / 地点</th><th>来源</th><th>搜索</th><th>匹配</th><th>筛查状态 / 方法</th><th></th></tr>";
+  const emptyMessage = el("#job-viewed").value === "unviewed"
+    ? "当前筛选没有未看职位；可将“查看进度”切换到“已看”或“全部”。"
+    : state.jobsPane === "history" ? "没有匹配当前筛选条件的历史职位。" : "目前没有未审阅完成的任务。";
+  el("#jobs-table").innerHTML = jobs.map((job) => jobRow(job)).join("")
+    || '<tr><td colspan="7" class="empty-cell">' + emptyMessage + "</td></tr>";
+  refreshIcons();
 }
 
 function taskCategoryValidation(task) {
@@ -505,6 +925,11 @@ function renderTaskCategories() {
 
 function renderRoutine() {
   const routineTasks = state.data.routineTasks || [];
+  const availableRoutineTaskIds = new Set(routineTasks.filter((task) => task.status === "READY").map((task) => task.id));
+  for (const id of state.selectedRoutineTaskIds) {
+    if (!availableRoutineTaskIds.has(id)) state.selectedRoutineTaskIds.delete(id);
+  }
+  const selectedRoutineTasks = routineTasks.filter((task) => state.selectedRoutineTaskIds.has(task.id));
   const validations = state.data.validations || [];
   const waitingValidations = validations.filter((validation) => validation.status === "WAITING_FOR_WORKER");
   const run = currentRun();
@@ -527,14 +952,39 @@ function renderRoutine() {
   if (validations.some((validation) => ["WAITING_FOR_WORKER", "FAILED", "NEEDS_USER_ACTION"].includes(validation.status))) {
     el("#preflight-history").open = true;
   }
-  el("#routine-tasks-table").innerHTML = routineTasks.map((task) => '<tr>'
-    + "<td>" + badge(names[task.platform], "source-" + task.platform) + "</td>"
-    + "<td><strong>" + escapeHtml(task.keyword) + "</strong></td>"
-    + "<td>" + escapeHtml(task.location) + "</td>"
-    + "<td>" + escapeHtml(timeLabel(task.postedWithinDays)) + "</td>"
-    + "<td>" + badge(task.status, "status-badge") + "</td>"
-    + '<td class="action-cell"><button class="icon-button" data-run-routine-task="' + task.id + '" title="单独运行此任务"><i data-lucide="play"></i></button><button class="icon-button destructive" data-delete-routine-task="' + task.id + '" title="删除每日任务"><i data-lucide="trash-2"></i></button></td></tr>').join("")
-    || '<tr><td colspan="6" class="empty-cell">添加单条任务并完成预检后，会显示在这里。</td></tr>';
+  const selectAllRoutineTasks = el("#select-all-routine-tasks");
+  selectAllRoutineTasks.disabled = !availableRoutineTaskIds.size;
+  selectAllRoutineTasks.checked = Boolean(availableRoutineTaskIds.size && selectedRoutineTasks.length === availableRoutineTaskIds.size);
+  selectAllRoutineTasks.indeterminate = selectedRoutineTasks.length > 0 && selectedRoutineTasks.length < availableRoutineTaskIds.size;
+  el("#selected-routine-task-count").textContent = "已选 " + selectedRoutineTasks.length + " 项";
+  el("#run-selected-routine-tasks").disabled = !selectedRoutineTasks.length;
+  el("#clear-routine-selection").disabled = !selectedRoutineTasks.length;
+  el("#select-visible-routine-tasks").disabled = !availableRoutineTaskIds.size || selectedRoutineTasks.length === availableRoutineTaskIds.size;
+  el("#routine-platform-selectors").innerHTML = routinePlatformOrder.map((platform) => {
+    const tasks = routineTasks.filter((task) => task.platform === platform && task.status === "READY");
+    if (!tasks.length) return "";
+    const selectedCount = tasks.filter((task) => state.selectedRoutineTaskIds.has(task.id)).length;
+    return '<label class="routine-platform-selector" title="选择全部 ' + escapeHtml(names[platform]) + ' 任务"><input type="checkbox" data-routine-platform-select="' + platform + '"'
+      + (selectedCount === tasks.length ? " checked" : "") + '><span>' + escapeHtml(names[platform]) + '</span><small>' + selectedCount + "/" + tasks.length + "</small></label>";
+  }).join("");
+  document.querySelectorAll("[data-routine-platform-select]").forEach((checkbox) => {
+    const tasks = routineTasks.filter((task) => task.platform === checkbox.dataset.routinePlatformSelect && task.status === "READY");
+    const selectedCount = tasks.filter((task) => state.selectedRoutineTaskIds.has(task.id)).length;
+    checkbox.indeterminate = selectedCount > 0 && selectedCount < tasks.length;
+  });
+  el("#routine-tasks-table").innerHTML = routineTasks.map((task) => {
+    const todayRun = todayRoutineTaskRun(task.id);
+    const runTitle = todayRun ? "今天已运行过，仍要再次运行此任务" : "单独运行此任务";
+    return '<tr' + (state.selectedRoutineTaskIds.has(task.id) ? ' class="is-selected"' : '') + '>'
+      + '<td class="selection-column"><input type="checkbox" data-routine-task-select="' + task.id + '" aria-label="选择 ' + escapeHtml(task.keyword + "，" + task.location) + '" title="Shift + 点击可连续选择"' + (state.selectedRoutineTaskIds.has(task.id) ? " checked" : "") + (task.status === "READY" ? "" : " disabled") + "></td>"
+      + "<td>" + badge(names[task.platform], "source-" + task.platform) + "</td>"
+      + "<td><strong>" + escapeHtml(task.keyword) + "</strong></td>"
+      + "<td>" + escapeHtml(task.location) + "</td>"
+      + "<td>" + escapeHtml(timeLabel(task.postedWithinDays)) + "</td>"
+      + '<td><div class="routine-task-status">' + badge(task.status, "status-badge") + todayRoutineTaskBadge(todayRun) + "</div></td>"
+      + '<td class="action-cell"><button class="icon-button" data-run-routine-task="' + task.id + '" title="' + runTitle + '"><i data-lucide="play"></i></button><button class="icon-button destructive" data-delete-routine-task="' + task.id + '" title="删除每日任务"><i data-lucide="trash-2"></i></button></td></tr>';
+  }).join("")
+    || '<tr><td colspan="7" class="empty-cell">添加单条任务并完成预检后，会显示在这里。</td></tr>';
   el("#clear-routine-tasks").disabled = !routineTasks.length;
   el("#validations-table").innerHTML = validations.map((validation) => {
     const presentation = validationPresentation(validation);
@@ -581,21 +1031,35 @@ function renderRoutine() {
         ? '<button class="button button-quiet task-resume" data-resume-task="' + task.id + '"><i data-lucide="play"></i><span>继续</span></button>'
         : "")
       + (!["queued", "running"].includes(task.status) ? '<button class="icon-button" data-rerun-task="' + task.id + '" title="重新运行此任务"><i data-lucide="rotate-cw"></i></button>' : "")
-      + '<button class="icon-button destructive" data-delete-run-task="' + task.id + '" data-running="' + (task.status === "running" ? "true" : "false") + '" title="' + (task.status === "running" ? "取消执行中的任务" : "从本次队列移除") + '"><i data-lucide="' + (task.status === "running" ? "square" : "trash-2") + '"></i></button></td></tr>').join("")
+      + (task.status === "running" ? '<button class="icon-button stop-keep-action" data-stop-run-task="' + task.id + '" title="停止并保留当前结果"' + (task.stopRequestedAt ? " disabled" : "") + '><i data-lucide="' + (task.stopRequestedAt ? "loader-circle" : "square") + '"></i></button>' : "")
+      + '<button class="icon-button destructive" data-delete-run-task="' + task.id + '" data-running="' + (task.status === "running" ? "true" : "false") + '" title="' + (task.status === "running" ? "取消并丢弃本次结果" : "从本次队列移除") + '"><i data-lucide="trash-2"></i></button></td></tr>').join("")
       || '<tr><td colspan="7" class="empty-cell">本次运行队列已清空。</td></tr>';
     notifyPausedTasks(run);
   }
   if (!run) el("#clear-run-queue").disabled = true;
-  el("#runs-list").innerHTML = state.data.runs.map((run) => '<article class="run-row"><div><strong>'
-    + dateTime(run.startedAt) + "</strong><span>" + run.tasks.length + " 项任务</span></div><div>"
-    + badge(run.state, "run-state-badge") + '</div><div class="run-platform-counts"><span>LI '
-    + run.counters.linkedin.newJobs + "</span><span>IN " + run.counters.indeed.newJobs
-    + "</span><span>SEEK " + run.counters.seek.newJobs + "</span></div></article>").join("")
+  el("#runs-list").innerHTML = state.data.runs.map((run) => {
+    const canDelete = ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state);
+    return '<article class="run-row"><div><strong>'
+      + dateTime(run.startedAt) + "</strong><span>" + run.tasks.length + " 项任务</span></div><div>"
+      + badge(run.state, "run-state-badge") + '</div><div class="run-platform-counts"><span>LI '
+      + run.counters.linkedin.newJobs + "</span><span>IN " + run.counters.indeed.newJobs
+      + "</span><span>SEEK " + run.counters.seek.newJobs + '</span></div><div class="run-history-actions">'
+      + '<button class="icon-button destructive" data-delete-run-history="' + run.id + '" type="button" title="'
+      + (canDelete ? "删除此次运行及关联职位" : "运行结束后才能删除历史") + '"' + (canDelete ? "" : " disabled")
+      + '><i data-lucide="trash-2"></i></button></div></article>';
+  }).join("")
     || '<div class="empty-state compact-empty"><p>没有运行记录。</p></div>';
 }
 
 function taskProgressText(task) {
   if (task.status === "running") {
+    if (task.stopRequestedAt) return "已请求停止，等待 Worker 上传当前结果。";
+    if (task.progress?.phase === "cooldown" && task.progress?.cooldownUntil) {
+      const remaining = Math.max(0, Date.parse(task.progress.cooldownUntil) - Date.now());
+      const minutes = Math.floor(remaining / 60_000);
+      const seconds = Math.floor((remaining % 60_000) / 1000);
+      return `访问节流休息中 · ${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}；${task.progress.cooldownReason || "已连续访问 20 次平台页面，请稍候自动继续。"}`;
+    }
     const heartbeat = Date.parse(task.workerHeartbeatAt || task.progress?.updatedAt || task.startedAt || "");
     if (Number.isFinite(heartbeat) && Date.now() - heartbeat > 30_000) {
       return "Worker 超过 30 秒没有更新，可能已停止；可取消后重新运行。";
@@ -693,13 +1157,105 @@ function profileCandidatePanelMarkup(profile) {
     + '<div class="profile-candidate-groups" id="profile-candidate-groups">' + content + "</div></section>";
 }
 
+function profileEntryCount(profile, key) {
+  if (key === "basicInfo") return Object.values(profile.basicInfo || {}).filter(Boolean).length;
+  if (key === "visa") return Object.entries(profile.visa || {}).reduce((count, [field, value]) => count + (field === "forceKeepRequirements" ? (value || []).length : Number(Boolean(value))), 0);
+  if (key === "skills") return (profile.skills || []).length;
+  return (profile[key] || []).length;
+}
+
+function profileEntrySummary(section, entry, index) {
+  const rawMain = entry.role || entry.name || entry.degree || entry.language || entry.title || entry.description || `第 ${index + 1} 条`;
+  const main = rawMain.length > 60 ? `${rawMain.slice(0, 57)}...` : rawMain;
+  const secondary = entry.company || entry.institution || entry.organization || entry.issuer || entry.proficiency || entry.subtitle || "";
+  const dates = [entry.startDate, entry.endDate].filter(Boolean).join(" - ") || entry.issuedDate || entry.date || "";
+  return [main, secondary, dates].filter(Boolean).join(" · ");
+}
+
+function profileFieldMarkup(section, field, label, type, value) {
+  const attributes = `data-profile-entry-field="${escapeHtml(field)}"`;
+  const content = Array.isArray(value) ? value.join("\n") : value || "";
+  if (type === "textarea" || type === "lines") {
+    return '<label class="field ' + (type === "textarea" || type === "lines" ? "profile-field-wide" : "") + '"><span>' + label
+      + '</span><textarea rows="' + (type === "lines" ? "4" : "5") + '" ' + attributes + '>' + escapeHtml(content) + "</textarea></label>";
+  }
+  const inputType = ["url", "email"].includes(type) ? type : "text";
+  return '<label class="field"><span>' + label + '</span><input type="' + inputType + '" ' + attributes + ' value="' + escapeHtml(content) + '"></label>';
+}
+
+function profileEntryMarkup(section, entry, index, customSectionId = "") {
+  const fields = profileEntryFields[section] || profileEntryFields.custom;
+  const hasContent = Object.entries(entry).some(([key, value]) => key !== "id" && (Array.isArray(value)
+    ? value.some(Boolean)
+    : Boolean(String(value || "").trim())));
+  return '<details class="profile-record"' + (hasContent ? "" : " open") + ' data-profile-record data-profile-record-section="' + escapeHtml(section)
+    + '" data-profile-record-id="' + escapeHtml(entry.id || "") + '" data-custom-section-id="' + escapeHtml(customSectionId) + '"><summary><span>'
+    + escapeHtml(profileEntrySummary(section, entry, index)) + '</span><i data-lucide="chevron-down"></i></summary><div class="profile-record-body"><div class="profile-record-fields">'
+    + fields.map(([field, label, type]) => profileFieldMarkup(section, field, label, type, entry[field])).join("")
+    + '</div><div class="profile-record-actions"><button class="button button-quiet destructive" type="button" data-remove-profile-record><i data-lucide="trash-2"></i><span>删除此条</span></button></div></div></details>';
+}
+
+function basicInfoMarkup(profile) {
+  const fields = [
+    ["name", "姓名"], ["location", "地区"], ["phone", "电话"], ["email", "邮箱", "email"],
+    ["linkedinUrl", "LinkedIn 网址", "url"], ["githubUrl", "GitHub 网址", "url"], ["websiteUrl", "个人网页", "url"]
+  ];
+  return '<div class="profile-basic-grid">' + fields.map(([field, label, type]) => profileFieldMarkup("basicInfo", field, label, type, profile.basicInfo?.[field])).join("") + "</div>";
+}
+
+function visaMarkup(profile) {
+  const visa = profile.visa || {};
+  const fields = [
+    ["visaType", "签证类型"], ["visaName", "签证名称 / 子类别"], ["grantedDate", "下签时间"],
+    ["expiryDate", "到期时间"], ["details", "签证与工作权利说明", "textarea"]
+  ];
+  const keep = visa.forceKeepRequirements || [];
+  return '<div class="profile-visa-editor"><div class="profile-basic-grid">'
+    + fields.map(([field, label, type]) => profileFieldMarkup("visa", field, label, type, visa[field])).join("")
+    + '</div><section class="profile-visa-keep"><div class="profile-visa-keep-heading"><strong>额外强制保留范围</strong><span>命中这些身份或签证要求时，AI 仍会保留职位供人工查看。</span></div><div class="profile-skill-list profile-visa-keep-list">'
+    + (keep.length ? keep.map((value) => '<span class="profile-skill" data-visa-keep data-value="' + escapeHtml(value) + '"><span>' + escapeHtml(value)
+      + '</span><button type="button" data-remove-visa-keep title="删除保留范围"><i data-lucide="x"></i></button></span>').join("") : '<p class="profile-section-empty">尚未设置额外保留范围。</p>')
+    + '</div><div class="profile-skill-composer"><input id="visa-keep-input" type="text" placeholder="例如：澳洲永久居民"><button class="button button-secondary" type="button" data-add-visa-keep><i data-lucide="plus"></i><span>添加</span></button></div></section></div>';
+}
+
+function skillsMarkup(profile) {
+  const skills = profile.skills || [];
+  return '<div class="profile-skill-editor"><div class="profile-skill-list">'
+    + (skills.length ? skills.map((skill) => '<span class="profile-skill" data-profile-skill data-value="' + escapeHtml(skill) + '"><span>' + escapeHtml(skill)
+      + '</span><button type="button" data-remove-profile-skill title="删除技能"><i data-lucide="x"></i></button></span>').join("") : '<p class="profile-section-empty">尚未填写技能。</p>')
+    + '</div><div class="profile-skill-composer"><input id="profile-skill-input" type="text" placeholder="输入技能，如 Python"><button class="button button-secondary" type="button" data-add-profile-skill><i data-lucide="plus"></i><span>添加</span></button></div></div>';
+}
+
+function customSectionMarkup(section) {
+  const entries = section.entries || [];
+  return '<section class="profile-custom-section" data-custom-profile-section="' + escapeHtml(section.id) + '"><div class="profile-custom-heading"><input data-custom-section-title value="'
+    + escapeHtml(section.title || "自定义板块") + '" aria-label="自定义板块名称"><div><button class="button button-secondary" type="button" data-add-profile-record="custom" data-custom-section-id="'
+    + escapeHtml(section.id) + '"><i data-lucide="plus"></i><span>添加一条</span></button><button class="icon-button destructive" type="button" data-remove-custom-section title="删除自定义板块"><i data-lucide="trash-2"></i></button></div></div>'
+    + '<div class="profile-record-list">' + (entries.length ? entries.map((entry, index) => profileEntryMarkup("custom", entry, index, section.id)).join("") : '<p class="profile-section-empty">这个板块暂时为空。</p>') + "</div></section>";
+}
+
+function profileSectionEditor(profile) {
+  if (state.profileSection === "basicInfo") return basicInfoMarkup(profile);
+  if (state.profileSection === "visa") return visaMarkup(profile);
+  if (state.profileSection === "skills") return skillsMarkup(profile);
+  if (state.profileSection === "customSections") {
+    return '<div class="profile-custom-list">' + (profile.customSections || []).map(customSectionMarkup).join("")
+      + '<button class="button button-secondary profile-add-custom" type="button" data-add-custom-section><i data-lucide="folder-plus"></i><span>创建自定义板块</span></button></div>';
+  }
+  const definition = structuredProfileSections.find((item) => item.key === state.profileSection) || structuredProfileSections[0];
+  const entries = profile[definition.key] || [];
+  return '<div class="profile-record-toolbar"><span>' + entries.length + ' 条记录</span><button class="button button-secondary" type="button" data-add-profile-record="' + definition.key
+    + '"><i data-lucide="plus"></i><span>' + definition.addLabel + '</span></button></div><div class="profile-record-list">'
+    + (entries.length ? entries.map((entry, index) => profileEntryMarkup(definition.key, entry, index)).join("") : '<div class="profile-section-empty">这个板块暂时为空，可以保持为空或添加记录。</div>') + "</div>";
+}
+
 function renderProfile() {
   const selected = selectedProfile();
   const active = activeProfile();
   setProfilePane(state.profilePane);
   el("#profile-draft-count").textContent = String(state.data.profiles.length);
   el("#profile-current").innerHTML = active
-    ? '<i data-lucide="circle-check"></i><span>当前：' + escapeHtml(active.profile.name) + "</span>"
+    ? '<i data-lucide="circle-check"></i><span>当前：' + escapeHtml(active.profile.basicInfo?.name || "未填写姓名") + "</span>"
     : '<i data-lucide="circle-alert"></i><span>尚未激活画像</span>';
   el("#profile-status").textContent = state.data.ai.configured
     ? "AI 已配置：" + state.data.ai.model
@@ -719,20 +1275,19 @@ function renderProfile() {
   const clearOtherButton = selected.id === active?.id && state.data.profiles.length > 1
     ? '<button class="button button-danger" data-clear-other-profiles><i data-lucide="trash-2"></i><span>清理其他版本</span></button>'
     : "";
-  const tagTotal = profileTagSections.reduce((total, definition) => total + profileTagValues(p, definition.key).length, 0);
-  const candidatePanel = profileCandidatePanelMarkup(p);
-  const tagBoards = formalProfileTagSections.map((definition) => profileTagBoardMarkup(definition, p)).join("");
-  el("#profile-fields").innerHTML = '<section class="profile-identity"><div class="profile-badges">' + badge("v" + selected.version, "version-badge")
+  const sectionExists = structuredProfileSections.some((item) => item.key === state.profileSection) || state.profileSection === "customSections";
+  if (!sectionExists) state.profileSection = "basicInfo";
+  const sectionTabs = structuredProfileSections.map((definition) => '<button type="button" class="profile-section-tab ' + (state.profileSection === definition.key ? "is-active" : "")
+    + '" data-profile-section="' + definition.key + '"><i data-lucide="' + definition.icon + '"></i><span>' + definition.label + '</span><small>' + profileEntryCount(p, definition.key) + "</small></button>").join("")
+    + '<button type="button" class="profile-section-tab ' + (state.profileSection === "customSections" ? "is-active" : "")
+    + '" data-profile-section="customSections"><i data-lucide="folder-cog"></i><span>自定义板块</span><small>' + (p.customSections || []).length + "</small></button>";
+  const activeDefinition = structuredProfileSections.find((item) => item.key === state.profileSection);
+  const editorTitle = activeDefinition?.label || "自定义板块";
+  el("#profile-fields").innerHTML = '<section class="profile-record-header"><div class="profile-badges">' + badge("v" + selected.version, "version-badge")
     + badge(selected.status, selected.id === active?.id ? "active-badge" : "status-badge")
-    + badge(profileEngineLabel(selected.engine), "status-badge") + "</div>"
-    + '<label class="field full"><span>画像名称</span><input id="p-name" value="' + escapeHtml(p.name) + '"></label>'
-    + '<label class="field full"><span>职业标题</span><input id="p-headline" value="' + escapeHtml(p.headline) + '"></label>'
-    + '<label class="field full"><span>摘要</span><textarea id="p-summary" rows="4">' + escapeHtml(p.summary) + "</textarea></label>"
-    + '</section><section class="profile-tag-workbench"><div class="profile-tag-heading"><h3>画像标签</h3><div class="profile-tag-heading-actions"><span class="profile-selection-count" id="profile-selection-count">已选择 0 项</span>'
-    + '<button class="icon-button destructive" id="delete-profile-chips" type="button" title="删除所选标签" disabled><i data-lucide="trash-2"></i></button><span class="profile-tag-total" id="profile-tag-total">'
-    + tagTotal + ' 项</span></div></div><div class="profile-organizer">' + candidatePanel
-    + '<section class="profile-organizer-pane profile-destination-panel"><div class="profile-organizer-heading"><div><h4>正式画像</h4><small id="profile-formal-count">' + (tagTotal - profileTagValues(p, "candidateItems").length)
-    + ' 项</small></div></div><div class="profile-tag-grid">' + tagBoards + '</div></section></div></section><div class="editor-actions"><button class="button button-secondary" data-save-profile="' + selected.id
+    + badge(profileEngineLabel(selected.engine), "status-badge") + '</div><p>简历提取结果可逐项修改；空白板块不会影响保存。</p></section><div class="profile-record-workspace"><nav class="profile-section-nav" aria-label="画像板块">'
+    + sectionTabs + '</nav><section class="profile-section-editor"><div class="profile-section-heading"><div><p>当前板块</p><h3>' + editorTitle + '</h3></div></div>'
+    + profileSectionEditor(p) + '</section></div><div class="editor-actions"><button class="button button-secondary" data-save-profile="' + selected.id
     + '"><i data-lucide="save"></i><span>保存画像</span></button>' + activeButton + clearOtherButton + "</div>";
 }
 
@@ -751,9 +1306,33 @@ function settingsRow(kind, item) {
 function renderSettings() {
   const settings = state.data.settings;
   el("#execution-mode").value = "sequential";
+  const timing = settings.workerTiming || {};
+  el("#timing-access-limit").value = timing.accessLimit ?? 20;
+  el("#timing-cooldown-minutes").value = timing.cooldownMinutes ?? 5;
+  el("#timing-action-delay").value = timing.actionDelaySeconds ?? 1;
+  el("#timing-scroll-delay").value = timing.scrollDelaySeconds ?? 2;
+  el("#timing-page-delay").value = timing.pageDelaySeconds ?? 10;
+  el("#timing-jd-interval").value = timing.jdIntervalSeconds ?? 1;
+  el("#timing-jd-request-timeout").value = timing.jdRequestTimeoutSeconds ?? 5;
+  el("#timing-jd-page-timeout").value = timing.jdPageTimeoutSeconds ?? 10;
   const thresholds = [["strongMatch", "强匹配"], ["goodMatch", "好匹配"], ["maybe", "可考虑"], ["lowMatch", "低匹配"]];
   el("#threshold-row").innerHTML = thresholds.map((item) => '<label class="threshold"><span>' + item[1]
     + '</span><input type="number" min="0" max="100" data-threshold="' + item[0] + '" value="' + settings.thresholds[item[0]] + '"></label>').join("");
+  renderPreferenceLearningSettings();
+  const activeExclusions = settings.exclusionKeywords || [];
+  const pendingSuggestions = (state.data.exclusionSuggestions || []).filter((suggestion) => suggestion.status === "pending"
+    && !exclusionKeywordCovered(suggestion.keyword, activeExclusions));
+  el("#active-exclusion-count").textContent = activeExclusions.length + " 项";
+  el("#active-exclusion-keywords").innerHTML = activeExclusions.map((keyword) => '<span class="exclusion-chip"><span>' + escapeHtml(keyword)
+    + '</span><button class="icon-button" type="button" data-remove-active-exclusion="' + encodeURIComponent(keyword) + '" title="停止使用这个排除词"><i data-lucide="x"></i></button></span>').join("")
+    || '<p class="exclusion-empty">当前没有生效的排除关键词。</p>';
+  el("#pending-exclusion-count").textContent = pendingSuggestions.length + " 项";
+  el("#exclusion-suggestions").innerHTML = pendingSuggestions.map((suggestion) => '<article class="exclusion-suggestion">'
+    + '<div><strong>' + escapeHtml(suggestion.keyword) + '</strong><p>' + escapeHtml(suggestion.reason || "AI 根据明确不匹配的完整 JD 提出此建议。") + '</p>'
+    + (suggestion.sourceTitles?.length ? '<small>来源：' + escapeHtml(suggestion.sourceTitles.slice(0, 3).join("；")) + '</small>' : '') + '</div>'
+    + '<div><button class="button button-secondary" type="button" data-approve-exclusion-suggestion="' + suggestion.id + '"><i data-lucide="check"></i><span>批准</span></button>'
+    + '<button class="icon-button" type="button" data-dismiss-exclusion-suggestion="' + suggestion.id + '" title="忽略此建议"><i data-lucide="x"></i></button></div></article>').join("")
+    || '<p class="exclusion-empty">暂无待审核建议。AI 不会自行启用排除词。</p>';
   if (!state.aiConfigDirty) {
     const ai = state.data.ai;
     el("#ai-base-url").value = ai.baseUrl || "";
@@ -771,12 +1350,77 @@ function renderSettings() {
   el("#clear-ai-key").disabled = !ai.hasApiKey;
 }
 
+function renderPreferenceLearningSettings() {
+  const target = el("#settings-learning-content");
+  const model = state.data.preferenceModel;
+  if (!model) {
+    target.innerHTML = '<p class="review-learning-empty">尚未形成学习偏好。完成一次职位审阅复盘后会显示在这里。</p>';
+    return;
+  }
+  const reflection = (state.data.reviewReflections || []).find((item) => item.version === model.version
+    && item.runId === model.sourceRunId) || null;
+  const engine = reflection?.engine || model.engine;
+  target.innerHTML = '<div class="learning-summary"><div><strong>学习摘要</strong>'
+    + '<span class="learning-version">v' + model.version + (model.updatedAt ? " · " + escapeHtml(dateTime(model.updatedAt)) : "") + "</span>"
+    + (engine === "ai" ? '<span class="badge ai-review-badge"><i data-lucide="sparkles"></i>AI 复盘</span>' : '<span class="badge status-badge">本地复盘</span>')
+    + '</div><p>' + escapeHtml(model.summary) + "</p></div>"
+    + (model.targetSignals?.length ? '<div class="learning-rule-row"><strong>优先信号</strong><div>' + learningChips(model.targetSignals, "is-target") + "</div></div>" : "")
+    + (model.deprioritizeSignals?.length ? '<div class="learning-rule-row"><strong>降低优先级</strong><div>' + learningChips(model.deprioritizeSignals, "is-avoid") + "</div></div>" : "")
+    + (model.screeningGuidance?.length ? '<div class="learning-guidance"><strong>下次筛选</strong><ul>' + model.screeningGuidance.map((item) => "<li>" + escapeHtml(item) + "</li>").join("") + "</ul></div>" : "")
+    + (reflection?.aiError ? '<p class="form-note warning-note">AI 复盘未完成，已使用本地规则：' + escapeHtml(reflection.aiError) + "</p>" : "");
+}
+
+async function addExclusionKeyword() {
+  const input = el("#manual-exclusion-keyword");
+  const keyword = input.value.trim();
+  if (!keyword) return toast("请输入排除关键词。", "error");
+  try {
+    await api("/api/settings/exclusion-keywords", { method: "POST", body: JSON.stringify({ keyword }) });
+    input.value = "";
+    await reload();
+    toast("排除词已启用；启动任务前仍会再次要求确认。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function approveExclusionSuggestion(id) {
+  try {
+    await api("/api/exclusion-suggestions/" + id, { method: "POST", body: "{}" });
+    await reload();
+    toast("建议已批准并加入生效排除词。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function dismissExclusionSuggestion(id) {
+  try {
+    await api("/api/exclusion-suggestions/" + id, { method: "DELETE" });
+    await reload();
+    toast("已忽略这条排除建议。");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function removeActiveExclusion(encodedKeyword) {
+  try {
+    await api("/api/settings/exclusion-keywords/" + encodedKeyword, { method: "DELETE" });
+    await reload();
+    toast("这个排除词已停止生效。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
 function workerCopyMarkup(worker, disabled = false) {
   return '<button class="button button-secondary" data-copy-worker="' + worker.id + '"' + (disabled ? " disabled" : "") + '><i data-lucide="copy"></i><span>复制代码</span></button>';
 }
 
 function workerInstallMarkup(worker) {
-  return '<a class="button button-primary" data-install-worker="' + worker.id + '" href="' + worker.path
+  const installPath = "/workers/install/" + worker.id + "-agent-worker-" + encodeURIComponent(worker.version) + ".user.js";
+  return '<a class="button button-primary" data-install-worker="' + worker.id + '" href="' + installPath
     + '" target="_blank" rel="noopener"><i data-lucide="download"></i><span>安装 / 更新</span></a>';
 }
 
@@ -812,7 +1456,7 @@ function armHistoryResetTimeout() {
     state.historyReset.window?.close();
     state.historyReset.window = null;
     renderHistoryResetControl();
-    toast("Worker 历史清理未在 45 秒内完成。请确认三份 Worker 已更新到 v2.2.1，然后重试。", "error");
+    toast("Worker 历史清理未在 45 秒内完成。请在安装设置中更新三份 Worker 后重试。", "error");
   }, 45_000);
 }
 
@@ -886,6 +1530,9 @@ async function launchRun(routineTaskIds = null) {
     } else launcher?.close();
     state.jobsPane = "current";
     state.historyRunId = "";
+    state.historyTaskId = "";
+    state.currentRunId = "";
+    state.currentRunTaskId = "";
     state.routinePane = "monitor";
     await reload();
     state.view = "routine";
@@ -894,18 +1541,90 @@ async function launchRun(routineTaskIds = null) {
     toast(blocked
       ? "Worker 启动窗口被浏览器拦截，请允许此站点弹窗。"
       : "已创建 " + result.run.tasks.length + " 项任务；Worker 会按队列依次处理。", blocked ? "error" : "success");
+    return result;
   } catch (error) {
     launcher?.close();
     toast(error.message, "error");
+    return null;
   }
 }
 
 function createRun() {
-  return launchRun();
+  return requestRunConfirmation();
 }
 
 function runRoutineTask(id) {
-  return launchRun([id]);
+  return requestRunConfirmation([id]);
+}
+
+function runSelectedRoutineTasks() {
+  const availableIds = new Set((state.data.routineTasks || []).filter((task) => task.status === "READY").map((task) => task.id));
+  const selectedIds = [...state.selectedRoutineTaskIds].filter((id) => availableIds.has(id));
+  if (!selectedIds.length) return toast("请先勾选要一起运行的任务。", "error");
+  return requestRunConfirmation(selectedIds);
+}
+
+function readyRoutineTaskIds(platform = null) {
+  return (state.data.routineTasks || [])
+    .filter((task) => task.status === "READY" && (!platform || task.platform === platform))
+    .map((task) => task.id);
+}
+
+function selectRoutineTaskRange(id, checked, shiftKey) {
+  const ids = readyRoutineTaskIds();
+  const currentIndex = ids.indexOf(id);
+  const anchorIndex = ids.indexOf(state.routineSelectionAnchorId);
+  const range = shiftKey && anchorIndex >= 0 && currentIndex >= 0
+    ? ids.slice(Math.min(anchorIndex, currentIndex), Math.max(anchorIndex, currentIndex) + 1)
+    : [id];
+  range.forEach((taskId) => {
+    if (checked) state.selectedRoutineTaskIds.add(taskId);
+    else state.selectedRoutineTaskIds.delete(taskId);
+  });
+  state.routineSelectionAnchorId = id;
+}
+
+function setRoutineTaskSelection(ids, checked) {
+  ids.forEach((id) => {
+    if (checked) state.selectedRoutineTaskIds.add(id);
+    else state.selectedRoutineTaskIds.delete(id);
+  });
+  if (!checked && !state.selectedRoutineTaskIds.size) state.routineSelectionAnchorId = "";
+  renderRoutine();
+  refreshIcons();
+}
+
+function requestRunConfirmation(routineTaskIds = null) {
+  const allTasks = (state.data.routineTasks || []).filter((task) => task.status === "READY");
+  const selected = routineTaskIds ? allTasks.filter((task) => routineTaskIds.includes(task.id)) : allTasks;
+  if (!selected.length) return toast("没有可运行的已验证任务。", "error");
+  state.pendingRunTaskIds = routineTaskIds ? selected.map((task) => task.id) : null;
+  const exclusions = state.data.settings.exclusionKeywords || [];
+  el("#run-exclusion-review").innerHTML = '<div class="run-confirm-summary"><strong>本次 ' + selected.length + ' 项任务</strong><span>'
+    + escapeHtml([...new Set(selected.map((task) => names[task.platform]))].join(" / ")) + '</span></div>'
+    + (exclusions.length
+      ? '<div class="run-confirm-keywords">' + exclusions.map((keyword) => '<span>' + escapeHtml(keyword) + '</span>').join("") + '</div>'
+      : '<p class="exclusion-empty">当前没有生效的排除关键词，本次 Worker 不会按排除词跳过职位。</p>');
+  el("#run-exclusion-confirmed").checked = false;
+  el("#confirm-start-run").disabled = true;
+  el("#run-confirmation-dialog").showModal();
+  refreshIcons();
+}
+
+async function confirmStartRun(event) {
+  event.preventDefault();
+  if (!el("#run-exclusion-confirmed").checked) return;
+  const button = el("#confirm-start-run");
+  button.disabled = true;
+  const requestedIds = state.pendingRunTaskIds;
+  const result = await launchRun(requestedIds);
+  if (!result) {
+    button.disabled = false;
+    return;
+  }
+  el("#run-confirmation-dialog").close();
+  if (requestedIds) requestedIds.forEach((id) => state.selectedRoutineTaskIds.delete(id));
+  state.pendingRunTaskIds = null;
 }
 
 async function uploadResume() {
@@ -1201,24 +1920,165 @@ function finishProfileChipPointerDrag(event) {
   if (moved) toast("标签已移动。", "success");
 }
 
+function profileRecordFromNode(node) {
+  const record = { id: node.dataset.profileRecordId || `entry-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` };
+  node.querySelectorAll("[data-profile-entry-field]").forEach((input) => {
+    const field = input.dataset.profileEntryField;
+    record[field] = ["highlights", "technologies"].includes(field)
+      ? input.value.split(/\n+/).map((value) => value.trim()).filter(Boolean)
+      : input.value.trim();
+  });
+  return record;
+}
+
 function profileForm() {
-  return {
-    name: el("#p-name").value,
-    headline: el("#p-headline").value,
-    summary: el("#p-summary").value,
-    targetRoles: profileChipValues("targetRoles"),
-    focusAreas: profileChipValues("focusAreas"),
-    skills: profileChipValues("skills"),
-    education: profileChipValues("education"),
-    preferences: {
-      locations: profileChipValues("locations"),
-      workTypes: profileChipValues("workTypes"),
-      exclusions: profileChipValues("exclusions")
-    },
-    candidateItems: profileChipValues("candidateItems"),
-    candidateSuggestions: Object.fromEntries([...document.querySelectorAll('[data-profile-chip-section="candidateItems"]')]
-      .map((chip) => [chip.dataset.value, formalProfileTagKeys.has(chip.dataset.suggestedSection) ? chip.dataset.suggestedSection : suggestProfileSection(chip.dataset.value)]))
-  };
+  const selected = selectedProfile();
+  const profile = JSON.parse(JSON.stringify(selected?.profile || { schemaVersion: 2 }));
+  profile.schemaVersion = 2;
+  if (state.profileSection === "basicInfo") {
+    profile.basicInfo ||= {};
+    document.querySelectorAll("#profile-fields [data-profile-entry-field]").forEach((input) => {
+      profile.basicInfo[input.dataset.profileEntryField] = input.value.trim();
+    });
+  } else if (state.profileSection === "visa") {
+    profile.visa ||= {};
+    document.querySelectorAll("#profile-fields [data-profile-entry-field]").forEach((input) => {
+      profile.visa[input.dataset.profileEntryField] = input.value.trim();
+    });
+    profile.visa.forceKeepRequirements = [...document.querySelectorAll("#profile-fields [data-visa-keep]")]
+      .map((node) => node.dataset.value).filter(Boolean);
+  } else if (state.profileSection === "skills") {
+    profile.skills = [...document.querySelectorAll("#profile-fields [data-profile-skill]")].map((node) => node.dataset.value).filter(Boolean);
+  } else if (state.profileSection === "customSections") {
+    profile.customSections = [...document.querySelectorAll("#profile-fields [data-custom-profile-section]")].map((section) => ({
+      id: section.dataset.customProfileSection,
+      title: section.querySelector("[data-custom-section-title]")?.value.trim() || "自定义板块",
+      entries: [...section.querySelectorAll("[data-profile-record]")].map(profileRecordFromNode)
+    }));
+  } else if (structuredProfileSections.some((item) => item.key === state.profileSection)) {
+    profile[state.profileSection] = [...document.querySelectorAll("#profile-fields [data-profile-record]")].map(profileRecordFromNode);
+  }
+  return profile;
+}
+
+function commitProfileEditor() {
+  const selected = selectedProfile();
+  if (selected && el("#profile-fields")?.querySelector(".profile-record-workspace")) selected.profile = profileForm();
+  return selected?.profile;
+}
+
+function emptyProfileEntry(section) {
+  const fields = profileEntryFields[section] || profileEntryFields.custom;
+  return Object.fromEntries([["id", `${section}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`], ...fields.map(([field, , type]) => [field, type === "lines" ? [] : ""])]);
+}
+
+function setProfileSection(section) {
+  commitProfileEditor();
+  state.profileSection = section;
+  renderProfile();
+  refreshIcons();
+}
+
+function addProfileRecord(section, customSectionId = "") {
+  const profile = commitProfileEditor();
+  if (!profile) return;
+  let entry;
+  if (section === "custom") {
+    const custom = profile.customSections.find((item) => item.id === customSectionId);
+    if (!custom) return;
+    entry = emptyProfileEntry("custom");
+    custom.entries.push(entry);
+  } else {
+    profile[section] ||= [];
+    entry = emptyProfileEntry(section);
+    profile[section].push(entry);
+  }
+  renderProfile();
+  refreshIcons();
+  const record = document.querySelector(`[data-profile-record-id="${entry.id}"]`);
+  record?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  record?.querySelector("input, textarea")?.focus();
+}
+
+function removeProfileRecord(button) {
+  const profile = commitProfileEditor();
+  const record = button.closest("[data-profile-record]");
+  if (!profile || !record) return;
+  const id = record.dataset.profileRecordId;
+  if (record.dataset.profileRecordSection === "custom") {
+    const custom = profile.customSections.find((item) => item.id === record.dataset.customSectionId);
+    if (custom) custom.entries = custom.entries.filter((item) => item.id !== id);
+  } else {
+    const section = record.dataset.profileRecordSection;
+    profile[section] = (profile[section] || []).filter((item) => item.id !== id);
+  }
+  renderProfile();
+  refreshIcons();
+}
+
+function addProfileSkill() {
+  const profile = commitProfileEditor();
+  const input = el("#profile-skill-input");
+  const value = input?.value.trim();
+  if (!profile || !value) return;
+  profile.skills ||= [];
+  if (!profile.skills.some((skill) => skill.toLowerCase() === value.toLowerCase())) profile.skills.push(value);
+  renderProfile();
+  refreshIcons();
+}
+
+function removeProfileSkill(button) {
+  const profile = commitProfileEditor();
+  const value = button.closest("[data-profile-skill]")?.dataset.value;
+  if (!profile || !value) return;
+  profile.skills = (profile.skills || []).filter((skill) => skill !== value);
+  renderProfile();
+  refreshIcons();
+}
+
+function addVisaKeepRequirement() {
+  const profile = commitProfileEditor();
+  const input = el("#visa-keep-input");
+  const value = input?.value.trim();
+  if (!profile || !value) return;
+  profile.visa ||= {};
+  profile.visa.forceKeepRequirements ||= [];
+  if (!profile.visa.forceKeepRequirements.some((item) => item.toLowerCase() === value.toLowerCase())) {
+    profile.visa.forceKeepRequirements.push(value);
+  }
+  renderProfile();
+  refreshIcons();
+}
+
+function removeVisaKeepRequirement(button) {
+  const profile = commitProfileEditor();
+  const value = button.closest("[data-visa-keep]")?.dataset.value;
+  if (!profile || !value) return;
+  profile.visa.forceKeepRequirements = (profile.visa.forceKeepRequirements || []).filter((item) => item !== value);
+  renderProfile();
+  refreshIcons();
+}
+
+function addCustomProfileSection() {
+  const profile = commitProfileEditor();
+  if (!profile) return;
+  profile.customSections ||= [];
+  const id = `section-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  profile.customSections.push({ id, title: "新板块", entries: [] });
+  renderProfile();
+  refreshIcons();
+  const title = document.querySelector(`[data-custom-profile-section="${id}"] [data-custom-section-title]`);
+  title?.focus();
+  title?.select();
+}
+
+function removeCustomProfileSection(button) {
+  const profile = commitProfileEditor();
+  const id = button.closest("[data-custom-profile-section]")?.dataset.customProfileSection;
+  if (!profile || !id || !window.confirm("删除这个自定义板块及其中所有内容？")) return;
+  profile.customSections = (profile.customSections || []).filter((section) => section.id !== id);
+  renderProfile();
+  refreshIcons();
 }
 
 async function saveProfile(id) {
@@ -1260,7 +2120,17 @@ function settingPayload() {
   return {
     ...state.data.settings,
     thresholds,
-    executionMode: el("#execution-mode").value
+    executionMode: el("#execution-mode").value,
+    workerTiming: {
+      accessLimit: Number(el("#timing-access-limit").value),
+      cooldownMinutes: Number(el("#timing-cooldown-minutes").value),
+      actionDelaySeconds: Number(el("#timing-action-delay").value),
+      scrollDelaySeconds: Number(el("#timing-scroll-delay").value),
+      pageDelaySeconds: Number(el("#timing-page-delay").value),
+      jdIntervalSeconds: Number(el("#timing-jd-interval").value),
+      jdRequestTimeoutSeconds: Number(el("#timing-jd-request-timeout").value),
+      jdPageTimeoutSeconds: Number(el("#timing-jd-page-timeout").value)
+    }
   };
 }
 
@@ -1271,7 +2141,7 @@ function categoryTaskEditorRow(task = {}) {
   const timeOptions = Object.entries(postedWithinLabels).map(([value, label]) => '<option value="' + value + '"' + (postedWithinDays === Number(value) ? " selected" : "") + '>' + label + '</option>').join("");
   return '<div class="category-task-editor-row" data-category-task-id="' + escapeHtml(task.id || "") + '">'
     + '<label class="field"><span>平台</span><select data-category-task-field="platform">' + platformOptions + '</select></label>'
-    + '<label class="field category-task-keyword"><span>关键词</span><input data-category-task-field="keyword" required maxlength="160" value="' + escapeHtml(task.keyword || "") + '"></label>'
+    + '<label class="field category-task-keyword"><span>关键词（逗号表示任一）</span><input data-category-task-field="keyword" required maxlength="160" placeholder="intern, internship" value="' + escapeHtml(task.keyword || "") + '"></label>'
     + '<label class="field category-task-location"><span>地点</span><input data-category-task-field="location" required maxlength="120" value="' + escapeHtml(task.location || "") + '"></label>'
     + '<label class="field"><span>时间</span><select data-category-task-field="postedWithinDays">' + timeOptions + '</select></label>'
     + '<button class="icon-button destructive category-task-remove" type="button" data-remove-category-task title="删除子任务"><i data-lucide="trash-2"></i></button>'
@@ -1517,7 +2387,7 @@ async function clearRoutineTasks() {
 
 async function deleteRunTask(id, isRunning) {
   const message = isRunning
-    ? "取消这个正在执行的任务？当前页面可能会继续完成扫描，但其回传结果不会导入。"
+    ? "取消并丢弃这个正在执行的任务？Worker 后续回传的本次结果不会导入。"
     : "从本次运行队列移除这个任务？";
   if (!window.confirm(message)) return;
   const run = currentRun();
@@ -1526,6 +2396,93 @@ async function deleteRunTask(id, isRunning) {
     const result = await api("/api/runs/" + run.id + "/tasks/" + id, { method: "DELETE" });
     await reload();
     toast(result.cancelled ? "任务已取消，后续回传会被忽略。" : "任务已从本次队列移除。");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function stopRunTask(id) {
+  if (!window.confirm("停止这个任务并保留目前已经获取的职位？Worker 会尽快结束并上传当前结果，然后继续队列中的下一项任务。")) return;
+  const run = currentRun();
+  if (!run) return;
+  try {
+    await api("/api/runs/" + run.id + "/tasks/" + id + "/stop", { method: "POST", body: "{}" });
+    await reload();
+    toast("已通知 Worker 停止并保留当前结果。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function markRunTaskViewed(runId, id, button) {
+  const entry = pendingReviewTaskEntries().find((item) => item.runId === runId && item.taskId === id);
+  if (!entry) return;
+  const unviewed = entry.jobs.filter((job) => !job.viewedAt).length;
+  if (!window.confirm(`将“${entry.task.keyword} / ${entry.task.location}”的 ${entry.jobs.length} 个职位全部标记为已看？\n\n其中 ${unviewed} 个目前未看；职位和审阅结果仍会保留在历史记录中。`)) return;
+  const previousHtml = button?.innerHTML || "";
+  if (button) {
+    button.disabled = true;
+    button.classList.add("is-busy");
+    button.innerHTML = '<i data-lucide="loader-circle" class="button-spinner"></i><span>正在标记</span>';
+    refreshIcons();
+  }
+  try {
+    const result = await api("/api/runs/" + runId + "/tasks/" + id + "/viewed", { method: "PUT", body: "{}" });
+    if (state.currentRunId === runId && state.currentRunTaskId === id) {
+      state.currentRunId = "";
+      state.currentRunTaskId = "";
+    }
+    await reload();
+    toast("已将该任务的 " + result.total + " 个职位标记为已看；任务已从待审阅列表移除。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.classList.remove("is-busy");
+      button.innerHTML = previousHtml;
+      refreshIcons();
+    }
+  }
+}
+
+async function deleteJobStatTask(runId, id) {
+  const run = state.data.runs.find((item) => item.id === runId);
+  const task = run?.tasks.find((item) => item.id === id);
+  if (!run || !task) return;
+  const jobCount = state.data.jobs.filter((job) => job.runId === run.id && matchingRunTask(run, job)?.id === id).length;
+  const message = `删除“${task.keyword} / ${task.location}”的任务统计及 ${jobCount} 个关联职位？\n\n每日任务和任务类别不会被删除。`;
+  if (!window.confirm(message)) return;
+  try {
+    const result = await api("/api/runs/" + run.id + "/tasks/" + id + "/results", { method: "DELETE" });
+    if (state.currentRunId === run.id && state.currentRunTaskId === id) {
+      state.currentRunId = "";
+      state.currentRunTaskId = "";
+    }
+    await reload();
+    toast("已删除该任务统计及 " + result.removed.jobs + " 个关联职位。");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function deleteRunHistory(id) {
+  const run = state.data.runs.find((item) => item.id === id);
+  if (!run) return;
+  const jobCount = state.data.jobs.filter((job) => job.runId === id).length;
+  const message = `删除 ${dateTime(run.startedAt)} 的运行历史、${run.tasks.length} 项任务统计及 ${jobCount} 个关联职位？\n\n每日任务、内置预设和自定义任务类别不会被删除。`;
+  if (!window.confirm(message)) return;
+  try {
+    const result = await api("/api/runs/" + id, { method: "DELETE" });
+    if (state.historyRunId === id) {
+      state.historyRunId = "";
+      state.historyTaskId = "";
+    }
+    if (state.currentRunId === id) {
+      state.currentRunId = "";
+      state.currentRunTaskId = "";
+    }
+    await reload();
+    toast("已删除该次运行及 " + result.removed.jobs + " 个关联职位。");
   } catch (error) {
     toast(error.message, "error");
   }
@@ -1685,7 +2642,8 @@ async function clearAllHistory() {
     armHistoryResetTimeout();
     resetWindow.location.href = "https://www.linkedin.com/jobs/search/?jobAgentReset=1&jobAgentResetAll=1";
     const count = Object.values(result.cleared || {}).reduce((total, value) => total + Number(value || 0), 0);
-    toast(`Agent 已清除 ${count} 条记录，正在依次清理三个 Worker。`);
+    const preservedCategories = Number(result.preserved?.taskCategories || 0);
+    toast(`Agent 已清除 ${count} 条记录，保留 ${preservedCategories} 个任务类别；正在依次清理三个 Worker。`);
   } catch (error) {
     clearTimeout(state.historyReset.timeout);
     state.historyReset.running = false;
@@ -1728,19 +2686,228 @@ async function importJobs(event) {
   }
 }
 
-function openFeedback(id) {
+const legacyScoreTechnologyTerms = [
+  ["Python", /\bpython\b/i], ["JavaScript", /\bjavascript\b/i], ["TypeScript", /\btypescript\b/i],
+  ["Java", /\bjava\b/i], ["C++", /\bc\+\+\b/i], ["React", /\breact\b/i], ["Next.js", /\bnext\.?js\b/i],
+  ["Node.js", /\bnode\.?js\b/i], ["SQL", /\b(?:sql|mysql|postgres|pl\/pgsql)\b/i], ["Firebase", /\bfirebase|firestore\b/i],
+  ["AWS", /\baws\b/i], ["Azure", /\bazure\b/i], ["GCP", /\bgcp\b/i], ["Docker", /\bdocker|containers?\b/i],
+  ["Kubernetes", /\bkubernetes\b/i], ["Git", /\bgit\b/i], ["TensorFlow", /\btensorflow\b/i], ["PyTorch", /\bpytorch\b/i],
+  ["scikit-learn", /\bscikit-learn\b/i], ["Pandas", /\bpandas\b/i], ["LLM", /\bllm\b/i], ["AI / ML", /\b(?:artificial intelligence|machine learning|ai\/ml)\b/i],
+  ["CI/CD", /\bci\/cd\b/i], ["API", /\bapis?\b/i], ["DevOps", /\bdevops\b/i]
+];
+const legacyScoreDomains = [
+  ["言语病理与临床健康", /speech patholog|speech\/language|dysphagia|\baac\b|spa registration/i],
+  ["职业治疗或相关临床健康", /occupational therap|allied health|\bahpra\b|\bndis\b|participant care/i],
+  ["土木工程与基础设施", /civil engineer|dams?|hydropower|geotechnical|structural|water infrastructure/i],
+  ["水文测量、地理空间或海事", /hydrograph|surveying|geomatics|geospatial|marine|offshore|bathymetric|oceanographic/i],
+  ["木工、建筑或职业培训", /carpentry|construction|vet\/tae|tae40122/i],
+  ["数字营销与传播", /digital marketing|social media|email marketing|campaign management|promotional communications/i],
+  ["人力资源与 People Operations", /human resources|people operations|people\/human resources|\bhr\b/i],
+  ["销售或零售", /retail|sales role|technical sales/i]
+];
+
+function containsChinese(value) {
+  return /[\u3400-\u9fff]/.test(String(value || ""));
+}
+
+function legacyTechnologyTerms(value) {
+  return legacyScoreTechnologyTerms.filter(([, pattern]) => pattern.test(String(value || ""))).map(([label]) => label);
+}
+
+function legacyDomain(value) {
+  return legacyScoreDomains.find(([, pattern]) => pattern.test(String(value || "")))?.[0] || "";
+}
+
+function localizeLegacyEvidence(value, tone) {
+  const original = String(value || "").trim();
+  if (!original || containsChinese(original)) return original;
+  const lower = original.toLowerCase();
+  const technologies = legacyTechnologyTerms(original);
+  const domain = legacyDomain(original);
+  if (tone === "is-positive") {
+    if (/degree|master|bachelor|university|academic background|tertiary graduate|graduat(?:ed|ing)/i.test(original)) {
+      return technologies.length ? `教育背景匹配，并涉及：${technologies.join("、")}` : "教育背景或毕业阶段符合岗位要求";
+    }
+    if (technologies.length) return `技术或工具匹配：${technologies.join("、")}`;
+    if (/software|full-stack|front-?end|back-?end|web |application development/i.test(original)) return "软件或 Web 开发经历与岗位要求匹配";
+    if (/early-career|graduate-level|entry-level|junior/i.test(original)) return "职业阶段符合毕业生或初级岗位定位";
+    if (/communication|stakeholder|teamwork|collaborat|leadership|tutoring|mentor/i.test(original)) return "沟通、协作或辅导经历与岗位要求匹配";
+    if (/location|melbourne|australia|remote|hybrid/i.test(original)) return "地点或工作方式与候选人偏好匹配";
+    if (/analytical|problem-solving|attention to detail|testing|debugging/i.test(original)) return "分析、问题解决或质量保障能力匹配";
+    if (/documentation|report writing/i.test(original)) return "文档与报告能力与岗位要求匹配";
+    if (/interest|learning|professional development|innovation/i.test(original)) return "学习意愿或技术兴趣与岗位方向匹配";
+    if (domain) return `具有可迁移到${domain}的相关经历`;
+    return "相关经历或能力与岗位要求存在匹配";
+  }
+  if (/work rights?|visa|citizen|permanent residen|sponsorship|security clearance/i.test(original)) return "签证、工作权利或安全审查条件需要确认";
+  if (/wam|gpa|minimum 70|average/i.test(original)) return "成绩门槛尚未在画像中明确确认";
+  if (/full-time|commence|availability|duration|student visa period|still (?:undertaking|completing)/i.test(original)) return "到岗时间、全职安排或签证有效期需要确认";
+  if (/located|based on-site|relocation|on-site/i.test(original)) return "工作地点或到岗方式与当前所在地可能不一致";
+  if (/voluntary|unpaid|side income/i.test(original)) return "岗位性质或薪酬安排可能不符合预期";
+  if (/driver|vehicle|police check|worker screening|working with children|first aid|cpr|background check/i.test(original)) return "驾照、车辆或岗位检查条件未在画像中体现";
+  if (/degree|qualification|certificate|registration|eligibility|membership|licen[cs]e/i.test(original)) return domain ? `缺少${domain}所需的学历、资质或注册条件` : "岗位要求的学历、资质或证书未在画像中体现";
+  if (domain) return `岗位核心方向偏向${domain}，与当前技术求职方向不一致`;
+  if (technologies.length) return `部分核心技术要求未在画像中明确体现：${technologies.join("、")}`;
+  if (/no |limited|lack|not clearly|rather than|experience/i.test(lower)) return "岗位要求的相关经验未在画像中充分体现";
+  if (/broad|select an actively hiring pathway/i.test(original)) return "岗位范围较宽，具体方向或地点需要进一步确认";
+  return "AI 识别到一项需要人工确认的岗位风险";
+}
+
+function localizedScoreEvidence(items, tone) {
+  return [...new Set((Array.isArray(items) ? items : []).map((item) => localizeLegacyEvidence(item, tone)).filter(Boolean))];
+}
+
+function localizedScoreReason(screening, category) {
+  const reason = String(screening.reason || "").trim();
+  if (containsChinese(reason)) return reason;
+  if (screening.workRights?.assessment === "INELIGIBLE") return localizedWorkRightsReason(screening.workRights);
+  const domain = legacyDomain([reason, ...(screening.concerns || [])].join(" "));
+  if (category === "REJECTED" && domain) return `岗位核心方向偏向${domain}，与当前职业画像和求职方向不匹配。`;
+  if (!screening.jdReviewed) return `当前仅完成职位标题初筛，结果为“${scoreCategoryLabels[category] || "待确认"}”；读取完整 JD 后会更新评分。`;
+  const matched = localizedScoreEvidence(screening.matchedAreas, "is-positive").length;
+  const concerns = localizedScoreEvidence(screening.concerns, "is-concern").length;
+  return `完整 JD 审阅结果为“${scoreCategoryLabels[category] || "待确认"}”，识别到 ${matched} 项匹配证据和 ${concerns} 项风险。`;
+}
+
+function localizedWorkRightsReason(workRights) {
+  const reason = String(workRights?.reason || "").trim();
+  if (containsChinese(reason)) return reason;
+  return {
+    ELIGIBLE: "根据 JD 与职业画像中的签证信息，当前工作权利要求符合。",
+    INELIGIBLE: "JD 明确要求的工作权利条件与当前职业画像不符。",
+    UNCERTAIN: "JD 或职业画像中的工作权利信息不足，需要人工确认。",
+    OVERRIDE_KEEP: "JD 的身份或工作权利要求命中了用户设置的强制保留条件，因此保留供人工确认。",
+    NOT_STATED: "JD 未说明强制的公民身份、永久居留、签证、担保或工作权利要求。"
+  }[workRights?.assessment] || "尚无明确的签证或工作权利说明。";
+}
+
+function localizedWorkRightsRequirement(value) {
+  const original = String(value || "").trim();
+  if (!original || containsChinese(original)) return original;
+  if (/permanent residen/i.test(original)) return "Australian Permanent Resident（具体条件与例外请核对原 JD）";
+  if (/citizen/i.test(original)) return /new zealand/i.test(original) ? "Australian or New Zealand Citizen" : "Australian Citizen";
+  if (/full working rights|authorized to work|work visa entitlements/i.test(original)) return "full working rights in Australia（具备有效工作权利）";
+  if (/valid visa/i.test(original)) return "valid visa permitting the role（允许从事该职位的有效签证）";
+  if (/commence|full-time/i.test(original)) return "满足职位规定的全职到岗时间";
+  if (/background check|police check|auscheck|medical assessment/i.test(original)) return "可能需要完成背景、警察、AusCheck 或健康检查";
+  return "JD 还包含一项需要人工核对的身份或到岗要求";
+}
+
+function scoreEvidenceMarkup(values, emptyText, tone) {
+  if (!values.length) return '<p class="score-empty">' + escapeHtml(emptyText) + "</p>";
+  return '<ul class="score-evidence-list ' + tone + '">' + values.map((item) => '<li>' + escapeHtml(item) + "</li>").join("") + "</ul>";
+}
+
+function scoreThresholdText() {
+  const thresholds = state.data?.settings?.thresholds || { strongMatch: 85, goodMatch: 70, maybe: 50, lowMatch: 30 };
+  const range = (minimum, maximum) => maximum >= minimum ? `${minimum}-${maximum}` : String(minimum);
+  return `强匹配 >= ${thresholds.strongMatch} · 良好匹配 ${range(thresholds.goodMatch, thresholds.strongMatch - 1)} · 可考虑 ${range(thresholds.maybe, thresholds.goodMatch - 1)} · 低匹配 ${range(thresholds.lowMatch, thresholds.maybe - 1)} · 已排除 < ${thresholds.lowMatch}`;
+}
+
+function scoreEngineDetails(screening) {
+  const engine = String(screening.engine || "local-rules");
+  if (/^ai(?:$|-)/i.test(engine)) {
+    return {
+      label: screening.jdReviewed ? "AI 综合审阅 · 完整 JD" : "AI 流程尚未完成",
+      note: "AI 根据完整 JD 与职业画像进行语义综合评分；证据项共同构成判断，不使用可验证的固定逐项加减分公式。"
+    };
+  }
+  if (screening.jdReviewed) {
+    return {
+      label: "本地规则 · 完整 JD",
+      note: "本地规则以 50 分为基础，根据技术匹配点、画像技能、风险项和人工偏好信号调整，并限制在 0-100 分。"
+    };
+  }
+  return {
+    label: "本地标题初筛",
+    note: "当前分数只依据职位标题和人工偏好信号，用于决定是否继续获取 JD；完成 AI JD 审阅后会被更准确的分数替换。"
+  };
+}
+
+function openScoreDetails(id) {
+  const job = state.data.jobs.find((item) => item.id === id);
+  if (!job) return;
+  const screening = job.screening || {};
+  const engine = scoreEngineDetails(screening);
+  const score = Number.isFinite(Number(screening.roleFitScore)) ? Number(screening.roleFitScore) : Number(screening.score) || 0;
+  const category = effectiveJobCategory(job) || "LOW_MATCH";
+  const workRights = screening.workRights || null;
+  const matchedEvidence = localizedScoreEvidence(screening.matchedAreas, "is-positive");
+  const concernEvidence = localizedScoreEvidence(screening.concerns, "is-concern");
+  const requirements = [...new Set((workRights?.requirements || []).map(localizedWorkRightsRequirement).filter(Boolean))];
+  const workRightsCopy = workRights
+    ? '<div class="score-visa-heading"><strong>' + escapeHtml(workRightsLabels[workRights.assessment] || workRights.assessment || "待确认") + '</strong>'
+      + badge(workRightsShortLabels[workRights.assessment] || "待确认", "work-rights-score") + '</div>'
+      + '<p>' + escapeHtml(localizedWorkRightsReason(workRights)) + '</p>'
+      + (requirements.length ? '<p class="score-requirements"><span>JD 要求</span>' + escapeHtml(requirements.join("；")) + "</p>" : "")
+    : '<p class="score-empty">尚未读取完整 JD，因此还没有签证或工作权利结论。</p>';
+
+  el("#score-dialog-title").textContent = job.title;
+  el("#score-job-meta").textContent = [job.company, job.location, names[job.source]].filter(Boolean).join(" · ");
+  el("#score-dialog-content").innerHTML = '<div class="score-summary" data-category="' + escapeHtml(category.toLowerCase()) + '">'
+    + '<div class="score-total"><strong>' + score + '</strong><span>/ 100</span></div>'
+    + '<div class="score-summary-copy">' + badge(scoreCategoryLabels[category] || category, "category-" + category.toLowerCase())
+    + '<p>' + escapeHtml(localizedScoreReason(screening, category)) + "</p>"
+    + (isRejectionCorrection(job) ? '<p class="score-override-note">你已标记原 Rejected 判断不正确；当前按 Maybe 保留并等待人工复核。</p>' : "")
+    + "</div></div>"
+    + '<dl class="score-facts">'
+    + '<div><dt>评分对象</dt><dd>岗位匹配度</dd></div>'
+    + '<div><dt>审阅方式</dt><dd>' + escapeHtml(engine.label) + "</dd></div>"
+    + '<div><dt>标题判断</dt><dd>' + escapeHtml(titleClassificationLabels[screening.titleClassification] || screening.titleClassification || "未判断") + "</dd></div>"
+    + '<div><dt>当前状态</dt><dd>' + escapeHtml(screeningStatusLabels[screening.screeningStatus] || "未审阅") + "</dd></div>"
+    + "</dl>"
+    + '<section class="score-section"><div class="score-section-heading"><i data-lucide="circle-plus"></i><h3>匹配证据</h3><span>' + matchedEvidence.length + " 项</span></div>"
+    + scoreEvidenceMarkup(matchedEvidence, "当前没有记录明确的匹配证据。", "is-positive") + "</section>"
+    + '<section class="score-section"><div class="score-section-heading"><i data-lucide="triangle-alert"></i><h3>风险与扣分依据</h3><span>' + concernEvidence.length + " 项</span></div>"
+    + scoreEvidenceMarkup(concernEvidence, "当前没有记录明确的风险项。", "is-concern") + "</section>"
+    + '<section class="score-section"><div class="score-section-heading"><i data-lucide="badge-check"></i><h3>身份与签证</h3></div><div class="score-visa">' + workRightsCopy + "</div></section>"
+    + '<section class="score-method"><h3>这个分数怎么来的</h3><p>' + escapeHtml(engine.note) + '</p><small>' + escapeHtml(scoreThresholdText()) + "</small>"
+    + (workRights?.assessment === "INELIGIBLE" ? '<p class="score-override-note">岗位匹配分仍保留为 ' + score + '，但明确的工作权利冲突会把最终分类改为 Rejected。</p>' : "")
+    + "</section>";
+  refreshIcons();
+  el("#score-dialog").showModal();
+}
+
+function openFeedback(id, mode = "positive") {
   const job = state.data.jobs.find((item) => item.id === id);
   if (!job) return;
   state.feedbackJobId = id;
+  state.feedbackMode = mode === "negative" ? "negative" : "positive";
+  const rejected = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
+  const negative = state.feedbackMode === "negative";
   el("#feedback-title").textContent = job.title;
   el("#feedback-job-meta").textContent = [job.company, job.location, names[job.source]].filter(Boolean).join(" · ");
-  const reason = job.feedback?.reason || "";
+  document.querySelectorAll(".feedback-positive-reason").forEach((item) => { item.hidden = negative || rejected; });
+  document.querySelectorAll(".feedback-negative-reason").forEach((item) => { item.hidden = !negative || rejected; });
+  el("#feedback-no-reason").hidden = rejected;
+  el("#feedback-rejection-correct").hidden = !rejected || negative;
+  el("#feedback-rejection-wrong").hidden = !rejected || !negative;
+  el("#feedback-no-reason-copy").textContent = negative
+    ? "只记录这是我不想继续看的职位"
+    : "只记录这是值得继续看的职位";
+  el("#feedback-form-note").textContent = rejected
+    ? negative
+      ? "这会纠正 Rejected 判断、按 Maybe 保留职位，并移除由该职位产生的待审核排除词。"
+      : "这会确认 Rejected 判断，并让 Agent 在复盘时整理候选排除词；候选词仍需你审核。"
+    : negative
+      ? "没用反馈会成为负向偏好证据，并自动将职位标记为已看。"
+      : "有用反馈会成为正向偏好证据，并自动将职位标记为已看。";
+  const feedbackMatchesMode = rejected
+    ? negative ? isRejectionCorrection(job) : isRejectionApproval(job)
+    : negative ? job.feedback?.helpfulness === "NOT_HELPFUL" : hasLikedJobFeedback(job);
+  const reason = feedbackMatchesMode
+    ? job.feedback?.reason || ""
+    : rejected ? negative ? "CLASSIFICATION_WRONG" : "REJECTION_CORRECT"
+      : negative ? "NOT_RELEVANT" : "";
   const reasonInput = document.querySelector('input[name="feedback-reason"][value="' + reason + '"]')
     || document.querySelector('input[name="feedback-reason"][value=""]');
   reasonInput.checked = true;
-  el("#feedback-note").value = job.feedback?.note || "";
-  el("#remove-feedback").hidden = job.feedback?.helpfulness !== "NOT_HELPFUL";
+  el("#feedback-note").value = feedbackMatchesMode ? job.feedback?.note || "" : "";
+  el("#remove-feedback").hidden = !job.feedback;
+  el("#save-feedback").innerHTML = '<i data-lucide="' + (negative ? "thumbs-down" : "thumbs-up") + '"></i><span>'
+    + (rejected ? negative ? "保存纠错" : "确认判断正确" : negative ? "保存没用" : "保存有用") + "</span>";
   el("#feedback-dialog").showModal();
+  refreshIcons();
 }
 
 async function saveJobFeedback(event) {
@@ -1749,17 +2916,27 @@ async function saveJobFeedback(event) {
   const button = el("#save-feedback");
   button.disabled = true;
   try {
+    const reason = document.querySelector('input[name="feedback-reason"]:checked')?.value || null;
+    const correction = reason === "CLASSIFICATION_WRONG";
+    const approvedRejection = reason === "REJECTION_CORRECT";
+    const negative = state.feedbackMode === "negative" && !correction;
     await api("/api/jobs/" + state.feedbackJobId + "/feedback", {
       method: "PUT",
       body: JSON.stringify({
-        notHelpful: true,
-        reason: document.querySelector('input[name="feedback-reason"]:checked')?.value || null,
+        helpfulness: correction ? "REJECTION_INCORRECT" : negative ? "NOT_HELPFUL" : "HELPFUL",
+        reason,
         note: el("#feedback-note").value
       })
     });
     el("#feedback-dialog").close();
     await reload();
-    toast("已记录“没帮助”，完成本次审阅后可让 Agent 复盘。");
+    toast(correction
+      ? "已纠正 Rejected 判断；该职位已保留，复盘时 Agent 会学习这次纠错。"
+      : approvedRejection
+        ? "已确认 Rejected 判断正确；Agent 会据此整理待审核排除词。"
+      : negative
+        ? "已记录“没用”并标记为已看；复盘时 Agent 会学习你的负向偏好。"
+      : "已记录“有用”，完成本次审阅后 Agent 会学习你的正向偏好。", "success");
   } catch (error) {
     toast(error.message, "error");
   } finally {
@@ -1774,7 +2951,7 @@ async function removeJobFeedback() {
   try {
     await api("/api/jobs/" + state.feedbackJobId + "/feedback", {
       method: "PUT",
-      body: JSON.stringify({ notHelpful: false })
+      body: JSON.stringify({ helpful: false })
     });
     el("#feedback-dialog").close();
     await reload();
@@ -1789,6 +2966,7 @@ async function removeJobFeedback() {
 async function completeRunReview() {
   const run = selectedReviewRun();
   if (!run) return;
+  const archiveAfterReflection = state.jobsPane === "current";
   const button = el("#complete-run-review");
   const label = button.querySelector("span");
   const original = label.textContent;
@@ -1798,7 +2976,17 @@ async function completeRunReview() {
   try {
     const result = await api("/api/runs/" + run.id + "/reflection", { method: "POST", body: "{}" });
     await reload();
-    toast(result.reflection.engine === "ai" ? "AI 已完成本次审阅复盘。" : "本地复盘已完成；偏好会用于后续筛选。");
+    if (archiveAfterReflection) {
+      state.jobsPane = "history";
+      state.historyRunId = "";
+      state.historyTaskId = "";
+      state.currentRunId = "";
+      state.currentRunTaskId = "";
+      render();
+    }
+    toast(result.reflection.engine === "ai"
+      ? "AI 已完成本次审阅复盘；学习偏好和候选排除词已更新至搜索设置。"
+      : "本地复盘已完成；学习偏好和候选排除词已更新至搜索设置。");
   } catch (error) {
     label.textContent = original;
     button.disabled = false;
@@ -1808,50 +2996,120 @@ async function completeRunReview() {
   }
 }
 
-function openReview(id) {
-  const job = state.data.jobs.find((item) => item.id === id);
-  if (!job) return;
-  state.jobId = id;
-  el("#review-source").textContent = names[job.source] || job.source;
-  el("#review-title").textContent = job.title;
-  el("#review-meta").innerHTML = escapeHtml(job.company || "-") + " · " + escapeHtml(job.location || "-") + " " + badge(job.screening.category, "category-" + job.screening.category.toLowerCase()) + aiReviewBadge(job);
-  el("#review-description").value = job.description || "";
-  el("#review-note").textContent = job.screening.reason || "";
-  el("#review-dialog").showModal();
-  refreshIcons();
+async function toggleJobViewed(id, viewed) {
+  try {
+    await api("/api/jobs/" + id + "/viewed", {
+      method: "PUT",
+      body: JSON.stringify({ viewed: !viewed })
+    });
+    await reload();
+    toast(viewed ? "已恢复为未看。" : "已标记为看过；下次会从其后的未看职位继续。");
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
-async function reviewJob(event) {
-  event.preventDefault();
-  const button = el("#submit-review");
-  if (button.disabled) return;
-  const label = button.querySelector("span");
+async function retryFailedJds() {
+  const jobs = failedJdJobsInSelectedPane();
+  if (!jobs.length) return toast("当前批次没有需要重新获取的 JD。", "error");
+  const platformCounts = jobs.reduce((counts, job) => {
+    counts[job.source] = (counts[job.source] || 0) + 1;
+    return counts;
+  }, {});
+  const breakdown = Object.entries(platformCounts)
+    .map(([platform, count]) => `${names[platform] || platform} ${count}`)
+    .join(" · ");
+  if (!window.confirm(`按顺序重新获取 ${jobs.length} 个失败 JD？\n\n${breakdown}\n\n只会使用一个 Worker 窗口；普通失败会继续下一项，遇到登录或机器人验证时会暂停。`)) return;
+  const launcher = window.open("about:blank", "job-agent-jd-retry");
+  if (!launcher) return toast("浏览器阻止了 JD 获取窗口，请允许本站打开弹窗后重试。", "error");
+  const button = el("#retry-failed-jds");
   button.disabled = true;
-  if (label) label.textContent = "AI 审阅中...";
+  button.classList.add("is-busy");
+  button.innerHTML = '<i data-lucide="loader-circle" class="button-spinner"></i><span>准备获取...</span>';
+  refreshIcons();
   try {
-    const result = await api("/api/jobs/" + state.jobId + "/review", {
+    const result = await api("/api/jobs/retry-failed-jd", {
       method: "POST",
-      body: JSON.stringify({ description: el("#review-description").value })
+      body: JSON.stringify({ jobIds: jobs.map((job) => job.id) })
     });
-    el("#review-dialog").close();
+    if (!result.launchUrl) throw new Error("没有可打开的 JD 页面。");
+    launcher.location.replace(result.launchUrl);
     await reload();
     state.view = "jobs";
     render();
-    toast(result.job.screening.screeningStatus === "AI_ERROR" ? "JD 审阅出现错误，已保留岗位。" : "JD 审阅已完成。");
+    toast(`已开始按顺序重新获取 ${result.total} 个 JD；Agent 会自动同步结果。`);
   } catch (error) {
+    launcher.close();
+    button.disabled = false;
+    button.classList.remove("is-busy");
+    toast(error.message, "error");
+  }
+}
+
+async function rereviewJob(id, button) {
+  const job = state.data.jobs.find((item) => item.id === id);
+  if (!job || button.disabled) return;
+  const hasCompleteJd = hasCompleteJobJd(job);
+  const confirmation = hasCompleteJd
+    ? `重新使用完整 JD 和当前职业画像审阅“${job.title}”？\n\n这会调用一次 AI，并覆盖该职位当前的匹配评分和理由。`
+    : `打开原职位获取“${job.title}”的完整 JD，并在获取后自动进行 AI 审阅？`;
+  if (!window.confirm(confirmation)) return;
+  const jdWindow = hasCompleteJd ? null : window.open("about:blank", "_blank");
+  if (!hasCompleteJd && !jdWindow) {
+    toast("浏览器阻止了职位页面，请允许此站点打开弹窗后重试。", "error");
+    return;
+  }
+  const previousHtml = button.innerHTML;
+  button.disabled = true;
+  button.classList.add("is-busy");
+  button.innerHTML = '<i data-lucide="loader-circle"></i>';
+  refreshIcons();
+  try {
+    if (!hasCompleteJd) {
+      const result = await api("/api/jobs/" + id + "/fetch-jd", { method: "POST", body: "{}" });
+      jdWindow.location.replace(result.launchUrl);
+      await reload();
+      state.view = "jobs";
+      render();
+      toast("已打开原职位，Worker 正在获取完整 JD；完成后会自动 AI 审阅。");
+      return;
+    }
+    const result = await api("/api/jobs/" + id + "/review", {
+      method: "POST",
+      body: "{}"
+    });
+    await reload();
+    state.view = "jobs";
+    render();
+    toast(result.job.screening.screeningStatus === "AI_ERROR" ? "重新审阅失败，职位和原 JD 已保留。" : "AI 已使用完整 JD 重新审阅此职位。");
+  } catch (error) {
+    if (jdWindow && !jdWindow.closed) jdWindow.close();
     toast(error.message, "error");
   } finally {
-    button.disabled = false;
-    if (label) label.textContent = "审阅 JD";
+    if (button.isConnected) {
+      button.disabled = false;
+      button.classList.remove("is-busy");
+      button.innerHTML = previousHtml;
+      refreshIcons();
+    }
   }
 }
 
 document.addEventListener("click", (event) => {
+  const routineTaskCheckbox = event.target.closest("[data-routine-task-select]");
+  if (routineTaskCheckbox) {
+    selectRoutineTaskRange(routineTaskCheckbox.dataset.routineTaskSelect, routineTaskCheckbox.checked, event.shiftKey);
+    renderRoutine();
+    return refreshIcons();
+  }
   const view = event.target.closest("[data-view]");
   if (view) {
     if (view.dataset.view === "jobs" && state.view !== "jobs") {
       state.jobsPane = "current";
       state.historyRunId = "";
+      state.historyTaskId = "";
+      state.currentRunId = "";
+      state.currentRunTaskId = "";
     }
     state.view = view.dataset.view;
     return render();
@@ -1860,19 +3118,79 @@ document.addEventListener("click", (event) => {
   if (jobsPane) {
     state.jobsPane = jobsPane.dataset.jobsPane;
     state.historyRunId = "";
+    state.historyTaskId = "";
+    state.currentRunId = "";
+    state.currentRunTaskId = "";
     renderJobs();
     return refreshIcons();
   }
+  const openHistoryTask = event.target.closest("[data-open-history-task]");
+  if (openHistoryTask) {
+    state.jobsPane = "history";
+    state.historyRunId = openHistoryTask.dataset.historyRun;
+    state.historyTaskId = openHistoryTask.dataset.openHistoryTask;
+    el("#job-search").value = "";
+    el("#job-category").value = "";
+    el("#job-source").value = "";
+    el("#job-status").value = "";
+    el("#job-viewed").value = "all";
+    el("#job-sort").value = "priority";
+    renderJobs();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    return;
+  }
+  if (event.target.closest("#back-history-tasks")) {
+    state.historyRunId = "";
+    state.historyTaskId = "";
+    renderJobs();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    return;
+  }
   const profilePane = event.target.closest("[data-profile-pane]");
-  if (profilePane) return setProfilePane(profilePane.dataset.profilePane);
+  if (profilePane) {
+    if (state.profilePane === "editor" && profilePane.dataset.profilePane === "upload") commitProfileEditor();
+    return setProfilePane(profilePane.dataset.profilePane);
+  }
   const routinePane = event.target.closest("[data-routine-pane]");
   if (routinePane) return setRoutinePane(routinePane.dataset.routinePane);
-  const review = event.target.closest("[data-review]");
-  if (review) return openReview(review.dataset.review);
+  const scoreDetails = event.target.closest("[data-score-details]");
+  if (scoreDetails) return openScoreDetails(scoreDetails.dataset.scoreDetails);
+  const rereview = event.target.closest("[data-rereview]");
+  if (rereview) return rereviewJob(rereview.dataset.rereview, rereview);
   const feedback = event.target.closest("[data-feedback]");
-  if (feedback) return openFeedback(feedback.dataset.feedback);
+  if (feedback) return openFeedback(feedback.dataset.feedback, feedback.dataset.feedbackMode);
+  const viewedButton = event.target.closest("[data-toggle-viewed]");
+  if (viewedButton) return toggleJobViewed(viewedButton.dataset.toggleViewed, viewedButton.dataset.viewed === "true");
+  const clearJobTaskFilter = event.target.closest("[data-clear-job-task-filter]");
+  if (clearJobTaskFilter) {
+    state.currentRunId = "";
+    state.currentRunTaskId = "";
+    renderJobs();
+    return refreshIcons();
+  }
   const profile = event.target.closest("[data-profile]");
-  if (profile) { state.profileId = profile.dataset.profile; state.profilePane = "editor"; renderProfile(); return refreshIcons(); }
+  if (profile) {
+    commitProfileEditor();
+    state.profileId = profile.dataset.profile;
+    state.profilePane = "editor";
+    renderProfile();
+    return refreshIcons();
+  }
+  const profileSection = event.target.closest("[data-profile-section]");
+  if (profileSection) return setProfileSection(profileSection.dataset.profileSection);
+  const addProfileRecordButton = event.target.closest("[data-add-profile-record]");
+  if (addProfileRecordButton) return addProfileRecord(addProfileRecordButton.dataset.addProfileRecord, addProfileRecordButton.dataset.customSectionId);
+  const removeProfileRecordButton = event.target.closest("[data-remove-profile-record]");
+  if (removeProfileRecordButton) return removeProfileRecord(removeProfileRecordButton);
+  if (event.target.closest("[data-add-profile-skill]")) return addProfileSkill();
+  const removeProfileSkillButton = event.target.closest("[data-remove-profile-skill]");
+  if (removeProfileSkillButton) return removeProfileSkill(removeProfileSkillButton);
+  if (event.target.closest("[data-add-visa-keep]")) return addVisaKeepRequirement();
+  const removeVisaKeepButton = event.target.closest("[data-remove-visa-keep]");
+  if (removeVisaKeepButton) return removeVisaKeepRequirement(removeVisaKeepButton);
+  if (event.target.closest("[data-add-custom-section]")) return addCustomProfileSection();
+  const removeCustomSectionButton = event.target.closest("[data-remove-custom-section]");
+  if (removeCustomSectionButton) return removeCustomProfileSection(removeCustomSectionButton);
   const profileChip = event.target.closest("[data-profile-chip]");
   if (profileChip) return state.suppressProfileChipClick ? undefined : toggleProfileChip(profileChip);
   const addProfileChipButton = event.target.closest("[data-add-profile-chip]");
@@ -1928,10 +3246,36 @@ document.addEventListener("click", (event) => {
   if (addValidationTaskButton) return addValidationTask(addValidationTaskButton.dataset.addValidationTask);
   const rerunTaskButton = event.target.closest("[data-rerun-task]");
   if (rerunTaskButton) return rerunTask(rerunTaskButton.dataset.rerunTask);
+  const stopRunTaskButton = event.target.closest("[data-stop-run-task]");
+  if (stopRunTaskButton) return stopRunTask(stopRunTaskButton.dataset.stopRunTask);
   const deleteRunTaskButton = event.target.closest("[data-delete-run-task]");
   if (deleteRunTaskButton) return deleteRunTask(deleteRunTaskButton.dataset.deleteRunTask, deleteRunTaskButton.dataset.running === "true");
+  const markTaskViewedButton = event.target.closest("[data-mark-task-viewed]");
+  if (markTaskViewedButton) return markRunTaskViewed(markTaskViewedButton.dataset.jobStatRun, markTaskViewedButton.dataset.markTaskViewed, markTaskViewedButton);
+  const deleteJobStatTaskButton = event.target.closest("[data-delete-job-stat-task]");
+  if (deleteJobStatTaskButton) return deleteJobStatTask(deleteJobStatTaskButton.dataset.jobStatRun, deleteJobStatTaskButton.dataset.deleteJobStatTask);
+  const filterJobStatTask = event.target.closest("[data-filter-job-stat-task]");
+  if (filterJobStatTask) {
+    const id = filterJobStatTask.dataset.filterJobStatTask;
+    const runId = filterJobStatTask.dataset.jobStatRun;
+    const active = state.currentRunId === runId && state.currentRunTaskId === id;
+    state.currentRunId = active ? "" : runId;
+    state.currentRunTaskId = active ? "" : id;
+    renderJobs();
+    refreshIcons();
+    el("#active-job-task-filter").scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
+  const deleteRunHistoryButton = event.target.closest("[data-delete-run-history]");
+  if (deleteRunHistoryButton) return deleteRunHistory(deleteRunHistoryButton.dataset.deleteRunHistory);
   const copyWorkerButton = event.target.closest("[data-copy-worker]");
   if (copyWorkerButton) return copyWorkerScript(copyWorkerButton);
+  const approveExclusionButton = event.target.closest("[data-approve-exclusion-suggestion]");
+  if (approveExclusionButton) return approveExclusionSuggestion(approveExclusionButton.dataset.approveExclusionSuggestion);
+  const dismissExclusionButton = event.target.closest("[data-dismiss-exclusion-suggestion]");
+  if (dismissExclusionButton) return dismissExclusionSuggestion(dismissExclusionButton.dataset.dismissExclusionSuggestion);
+  const removeActiveExclusionButton = event.target.closest("[data-remove-active-exclusion]");
+  if (removeActiveExclusionButton) return removeActiveExclusion(removeActiveExclusionButton.dataset.removeActiveExclusion);
   const closeDialog = event.target.closest("[data-close-dialog]");
   if (closeDialog) return el("#" + closeDialog.dataset.closeDialog).close();
   const add = event.target.closest("[data-add]");
@@ -1943,8 +3287,17 @@ document.addEventListener("click", (event) => {
 document.addEventListener("input", (event) => {
   if (event.target.matches("#job-search")) renderJobs();
   if (event.target.matches("#ai-base-url, #ai-model, #ai-api-key")) state.aiConfigDirty = true;
+  if (event.target.matches("#run-exclusion-confirmed")) el("#confirm-start-run").disabled = !event.target.checked;
 });
 document.addEventListener("keydown", (event) => {
+  if (event.target.matches("#profile-skill-input") && event.key === "Enter") {
+    event.preventDefault();
+    return addProfileSkill();
+  }
+  if (event.target.matches("#visa-keep-input") && event.key === "Enter") {
+    event.preventDefault();
+    return addVisaKeepRequirement();
+  }
   const input = event.target.closest("[data-profile-inline-add] input");
   if (!input) return;
   if (event.key === "Escape") {
@@ -1962,12 +3315,7 @@ document.addEventListener("pointermove", moveProfileChipPointer, { passive: fals
 document.addEventListener("pointerup", finishProfileChipPointerDrag);
 document.addEventListener("pointercancel", finishProfileChipPointerDrag);
 document.addEventListener("change", (event) => {
-  if (event.target.matches("#job-category, #job-source, #job-status, #job-sort")) renderJobs();
-  if (event.target.matches("#job-history-run")) {
-    state.historyRunId = event.target.value;
-    renderJobs();
-    refreshIcons();
-  }
+  if (event.target.matches("#job-category, #job-source, #job-status, #job-viewed, #job-sort")) renderJobs();
   if (event.target.matches("#ai-wire-api")) state.aiConfigDirty = true;
   if (event.target.matches("[data-category-select]")) {
     const id = event.target.dataset.categorySelect;
@@ -1982,6 +3330,12 @@ document.addEventListener("change", (event) => {
       : new Set();
     renderTaskCategories();
     refreshIcons();
+  }
+  if (event.target.matches("[data-routine-platform-select]")) {
+    setRoutineTaskSelection(readyRoutineTaskIds(event.target.dataset.routinePlatformSelect), event.target.checked);
+  }
+  if (event.target.matches("#select-all-routine-tasks")) {
+    setRoutineTaskSelection(readyRoutineTaskIds(), event.target.checked);
   }
 });
 
@@ -2023,6 +3377,9 @@ window.addEventListener("message", (event) => {
 
 el("#start-run").addEventListener("click", createRun);
 el("#start-run-secondary").addEventListener("click", createRun);
+el("#run-selected-routine-tasks").addEventListener("click", runSelectedRoutineTasks);
+el("#select-visible-routine-tasks").addEventListener("click", () => setRoutineTaskSelection(readyRoutineTaskIds(), true));
+el("#clear-routine-selection").addEventListener("click", () => setRoutineTaskSelection([...state.selectedRoutineTaskIds], false));
 el("#open-routine-task").addEventListener("click", openRoutineTaskDialog);
 el("#open-task-category").addEventListener("click", () => openTaskCategoryDialog());
 el("#add-category-task").addEventListener("click", () => addCategoryTaskEditor());
@@ -2031,11 +3388,14 @@ el("#import-selected-categories").addEventListener("click", () => prepareSelecte
 el("#start-preflight-batch").addEventListener("click", startPreflightBatch);
 el("#clear-routine-tasks").addEventListener("click", clearRoutineTasks);
 el("#clear-run-queue").addEventListener("click", clearRunQueue);
+el("#delete-selected-history-run").addEventListener("click", () => deleteRunHistory(state.historyRunId));
+el("#retry-failed-jds").addEventListener("click", retryFailedJds);
 el("#open-import").addEventListener("click", openImport);
 el("#extract-resume").addEventListener("click", uploadResume);
 el("#copy-external-profile-prompt").addEventListener("click", copyExternalGptPrompt);
 el("#generate-profile").addEventListener("click", generateProfile);
 el("#save-settings").addEventListener("click", saveSettings);
+el("#add-exclusion-keyword").addEventListener("click", addExclusionKeyword);
 el("#save-ai-config").addEventListener("click", saveAiConfig);
 el("#test-ai-config").addEventListener("click", testAiConfig);
 el("#clear-ai-key").addEventListener("click", clearAiKey);
@@ -2045,9 +3405,8 @@ el("#confirm-clear-all-history").addEventListener("click", clearAllHistory);
 el("#import-form").addEventListener("submit", importJobs);
 el("#routine-task-form").addEventListener("submit", submitRoutineTask);
 el("#task-category-form").addEventListener("submit", saveTaskCategory);
-el("#review-form").addEventListener("submit", reviewJob);
-el("#submit-review").addEventListener("click", reviewJob);
 el("#feedback-form").addEventListener("submit", saveJobFeedback);
+el("#run-confirmation-form").addEventListener("submit", confirmStartRun);
 el("#remove-feedback").addEventListener("click", removeJobFeedback);
 el("#complete-run-review").addEventListener("click", completeRunReview);
 
@@ -2056,6 +3415,32 @@ reload().catch((error) => {
   toast(error.message, "error");
 });
 
-setInterval(() => {
-  if (state.view === "overview" || state.view === "routine") reload().catch(() => {});
-}, 8000);
+let autoReloadInFlight = false;
+let lastAutoReloadAt = 0;
+
+function agentDataIsChanging() {
+  const latestRunIsActive = state.data?.runs?.[0]?.tasks?.some((task) => ["queued", "running"].includes(task.status));
+  const aiIsWorking = state.data?.jobs?.some((job) => ["JD_FETCHING", "AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus));
+  return Boolean(latestRunIsActive || aiIsWorking || state.data?.jdRetryBatches?.length);
+}
+
+async function autoReload() {
+  if (autoReloadInFlight || document.visibilityState === "hidden") return;
+  if (!["overview", "routine", "jobs"].includes(state.view)) return;
+  const refreshInterval = agentDataIsChanging() ? 2500 : 8000;
+  if (Date.now() - lastAutoReloadAt < refreshInterval) return;
+  autoReloadInFlight = true;
+  try {
+    await reload();
+    lastAutoReloadAt = Date.now();
+  } catch {}
+  finally {
+    autoReloadInFlight = false;
+  }
+}
+
+setInterval(autoReload, 2500);
+window.addEventListener("focus", () => { void autoReload(); });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void autoReload();
+});

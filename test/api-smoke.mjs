@@ -1,13 +1,72 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const directory = await mkdtemp(join(tmpdir(), "job-agent-smoke-"));
 const port = await availablePort();
+const aiPort = await availablePort();
 let serverOutput = "";
+const aiServer = createHttpServer(async (request, response) => {
+  let body = "";
+  for await (const chunk of request) body += chunk;
+  const payload = JSON.parse(body || "{}");
+  const isReflection = /Consolidate a candidate's job-screening preferences/i.test(payload.instructions || "");
+  const reflectionInput = isReflection ? JSON.parse(payload.input || "{}") : null;
+  const hasConfirmedRejection = reflectionInput?.rejectedJobSignals?.some((item) => item.humanConfirmed
+    && item.feedbackReason === "REJECTION_CORRECT");
+  const output = isReflection
+    ? hasConfirmedRejection ? {
+        summary: "The mocked AI omitted confirmed negative evidence.",
+        targetSignals: [],
+        deprioritizeSignals: [],
+        avoidSignals: [],
+        titleExclusions: [],
+        screeningGuidance: []
+      } : {
+        summary: "测试复盘已记录用户不需要 Graduate Analyst。",
+        targetSignals: ["software engineering"],
+        deprioritizeSignals: [],
+        avoidSignals: ["Graduate Analyst"],
+        titleExclusions: ["Graduate Analyst"],
+        screeningGuidance: ["降低 Graduate Analyst 的评分。"]
+      }
+    : String(payload.input || "").includes("Retail Merchandising Graduate")
+      ? {
+          titleClassification: "CLEAR_REJECT",
+          score: 12,
+          reason: "The role focuses on retail merchandising rather than the candidate's target technology work.",
+          matchedAreas: [],
+          concerns: ["Retail merchandising focus"],
+          jdReviewed: true,
+          workRights: { assessment: "NOT_STATED", reason: "The JD does not state a work-rights requirement.", requirements: [] },
+          preferenceSignals: {
+            targetKeywords: [],
+            exclusionKeywords: ["retail merchandising"],
+            exclusionReason: "This phrase identifies the irrelevant retail function."
+          }
+        }
+    : {
+        titleClassification: "CLEAR_MATCH",
+        score: 88,
+        reason: "The complete JD aligns with the candidate's Python, SQL, cloud, and software automation profile.",
+        matchedAreas: ["Python", "SQL", "cloud automation"],
+        concerns: [],
+        jdReviewed: true
+      };
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify({
+    output_text: JSON.stringify(output),
+    usage: { input_tokens: 120, output_tokens: 45, total_tokens: 165 }
+  }));
+});
+await new Promise((resolve, reject) => {
+  aiServer.once("error", reject);
+  aiServer.listen(aiPort, "127.0.0.1", resolve);
+});
 const child = spawn(process.execPath, ["server.mjs"], {
   cwd: new URL("..", import.meta.url),
   env: {
@@ -25,7 +84,7 @@ child.stdout.on("data", (chunk) => { serverOutput += chunk.toString(); });
 child.stderr.on("data", (chunk) => { serverOutput += chunk.toString(); });
 
 async function availablePort() {
-  const probe = createServer();
+  const probe = createNetServer();
   await new Promise((resolve, reject) => {
     probe.once("error", reject);
     probe.listen(0, "127.0.0.1", resolve);
@@ -90,18 +149,76 @@ async function validateRoutineTask(platform, postedWithinDays) {
 
 try {
   await waitForServer();
+  const workerTimingResponse = await request("/api/worker/settings");
+  assert.deepEqual(workerTimingResponse.workerTiming, {
+    accessLimit: 20,
+    cooldownMinutes: 5,
+    actionDelaySeconds: 1,
+    scrollDelaySeconds: 2,
+    pageDelaySeconds: 10,
+    jdIntervalSeconds: 1,
+    jdRequestTimeoutSeconds: 5,
+    jdPageTimeoutSeconds: 10
+  });
   const workerResponse = await fetch("http://127.0.0.1:" + port + "/workers/seek/seek-agent-worker.user.js");
   const workerScript = await workerResponse.text();
   assert.equal(workerResponse.ok, true);
   assert.match(workerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(workerScript, /Job Agent Worker - SEEK/);
-  assert.match(workerScript, /@version\s+2\.2\.1/);
+  assert.match(workerScript, /@version\s+1\.0\.0/);
+  assert.match(workerScript, /const APP_VERSION = "1\.0\.0"/);
+  assert.match(workerScript, /function agentShowNaturalSeekKeyword/);
+  assert.match(workerScript, /Do not dispatch an input event/);
+  const naturalKeywordFunction = extractNamedFunction(workerScript, "agentShowNaturalSeekKeyword");
+  const scheduledKeywordUpdates = [];
+  const fakeSeekKeywordInput = { value: '"graduate"' };
+  const showNaturalSeekKeyword = Function("agentFirst", "agentNormalizeSeekKeyword", "setTimeout",
+    `${naturalKeywordFunction}; return agentShowNaturalSeekKeyword;`)(
+    () => fakeSeekKeywordInput,
+    (value) => String(value || "").trim().replace(/^["']|["']$/g, "").toLowerCase(),
+    (callback) => scheduledKeywordUpdates.push(callback)
+  );
+  showNaturalSeekKeyword("graduate");
+  assert.equal(fakeSeekKeywordInput.value, "graduate");
+  assert.equal(scheduledKeywordUpdates.length, 2);
+  assert.match(workerScript, /agentWaitForSearchResults/);
+  assert.match(workerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
+  assert.match(workerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
+  assert.match(workerScript, /Job Agent 访问节奏/);
+  assert.match(workerScript, /agentEnrichJobs/);
+  assert.match(workerScript, /\/api\/worker\/title-plan/);
+  assert.match(workerScript, /data-automation=\"jobAdDetails\"/);
+  assert.match(workerScript, /@match\s+https:\/\/au\.seek\.com\/job\/\*/);
+  assert.match(workerScript, /agentExtractDescriptionFromDocument\(document\)/);
+  assert.match(workerScript, /agentRunJdChild/);
+  assert.match(workerScript, /jobAgentJdRequest/);
+  assert.match(workerScript, /Rendered fallback:/);
+  assert.match(workerScript, /agentRunOnDemandJd/);
+  assert.match(workerScript, /jobAgentOnDemandJd/);
+  assert.match(workerScript, /agentContinueJdBatch/);
+  assert.match(workerScript, /jobAgentJdBatch/);
+  assert.match(workerScript, /DEFAULT_AGENT_TIMING/);
+  assert.match(workerScript, /agentTiming\.jdRequestTimeoutSeconds/);
+  assert.match(workerScript, /agentTiming\.jdPageTimeoutSeconds/);
+  assert.match(workerScript, /agentTiming\.accessLimit/);
+  assert.match(workerScript, /agentTiming\.cooldownMinutes/);
+  assert.match(workerScript, /agentRefreshTiming/);
+  assert.match(workerScript, /response\.stopRequested/);
+  assert.match(workerScript, /agentStopRequested/);
+  assert.match(workerScript, /agentBeforePlatformAccess/);
+  assert.match(workerScript, /cooldownUntil/);
+  assert.match(workerScript, /agentTask\.exclusionKeywords/);
+  assert.match(workerScript, /active: true/);
+  assert.doesNotMatch(workerScript, /45000|45 seconds/);
+  assert.match(workerScript, /\/api\/worker\/job-jd/);
   assert.match(workerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
   assert.match(workerScript, /@updateURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/seek\/seek-agent-worker\.user\.js/);
   assert.match(workerScript, /@downloadURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/seek\/seek-agent-worker\.user\.js/);
   assert.match(workerScript, /preflight\/pending/);
   assert.match(workerScript, /agentWaitAndClickText/);
   assert.match(workerScript, /agentSeekKeywordForSearch/);
+  assert.match(workerScript, /agentSearchKeyword/);
+  assert.match(workerScript, /agentIncludeKeywordText/);
   assert.match(workerScript, /agentNormalizeSeekKeyword/);
   assert.match(workerScript, /\^graduate\$/i);
   assert.match(workerScript, /agentWaitForSeekSearchMatch/);
@@ -115,6 +232,12 @@ try {
   assert.match(workerScript, /worker\/progress/);
   assert.match(workerScript, /taskAttempt/);
   assert.match(workerScript, /job-agent-operation-overlay/);
+  assert.match(workerScript, /background:transparent/);
+  assert.match(workerScript, /align-items:flex-end/);
+  assert.match(workerScript, /pointer-events:none/);
+  assert.match(workerScript, /脚本正在操作 · 请勿操作此窗口/);
+  assert.match(workerScript, /ja-operation-float/);
+  assert.doesNotMatch(workerScript, /backdrop-filter:blur/);
   assert.match(workerScript, /agentAssertSearchResults/);
   assert.match(workerScript, /jobAgentReset/);
   assert.match(workerScript, /agentRunHistoryReset/);
@@ -126,18 +249,64 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+2\.2\.1/);
+  assert.match(indeedWorkerScript, /@version\s+1\.0\.0/);
+  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.0\.0"/);
+  assert.match(indeedWorkerScript, /agentWaitForSearchResults/);
+  assert.match(indeedWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
+  assert.match(indeedWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
+  assert.match(indeedWorkerScript, /Job Agent 访问节奏/);
+  assert.match(indeedWorkerScript, /agentEnrichJobs/);
+  assert.match(indeedWorkerScript, /\/api\/worker\/title-plan/);
+  assert.match(indeedWorkerScript, /jobDescriptionText/);
+  assert.match(indeedWorkerScript, /agentRunJdChild/);
+  assert.match(indeedWorkerScript, /jobAgentJdRequest/);
+  assert.match(indeedWorkerScript, /agentExtractDescriptionFromDocument\(document\)/);
+  assert.match(indeedWorkerScript, /Description panel:/);
+  assert.match(indeedWorkerScript, /searchParams\.set\("vjk"/);
+  assert.match(indeedWorkerScript, /需要进行其他验证/);
+  assert.match(indeedWorkerScript, /agentRunOnDemandJd/);
+  assert.match(indeedWorkerScript, /jobAgentOnDemandJd/);
+  assert.match(indeedWorkerScript, /agentContinueJdBatch/);
+  assert.match(indeedWorkerScript, /jobAgentJdBatch/);
+  assert.match(indeedWorkerScript, /agentRequestJobPage\(detailUrl\.href\)/);
+  assert.match(indeedWorkerScript, /DEFAULT_AGENT_TIMING/);
+  assert.match(indeedWorkerScript, /agentTiming\.jdRequestTimeoutSeconds/);
+  assert.match(indeedWorkerScript, /agentTiming\.jdPageTimeoutSeconds/);
+  assert.match(indeedWorkerScript, /agentTiming\.accessLimit/);
+  assert.match(indeedWorkerScript, /agentTiming\.cooldownMinutes/);
+  assert.match(indeedWorkerScript, /agentRefreshTiming/);
+  assert.match(indeedWorkerScript, /response\.stopRequested/);
+  assert.match(indeedWorkerScript, /agentStopRequested/);
+  assert.match(indeedWorkerScript, /agentBeforePlatformAccess/);
+  assert.match(indeedWorkerScript, /cooldownUntil/);
+  assert.match(indeedWorkerScript, /agentTask\.exclusionKeywords/);
+  assert.match(indeedWorkerScript, /active: true/);
+  assert.doesNotMatch(indeedWorkerScript, /45000|45 seconds/);
+  assert.match(indeedWorkerScript, /\/api\/worker\/job-jd/);
   assert.match(indeedWorkerScript, /preflight\/next-launch/);
+  assert.match(indeedWorkerScript, /agentSearchKeyword/);
+  assert.match(indeedWorkerScript, /agentIncludeKeywordText/);
   assert.match(indeedWorkerScript, /worker\/next-platform-launch/);
   assert.match(indeedWorkerScript, /@updateURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/indeed\/indeed-agent-worker\.user\.js/);
   assert.match(indeedWorkerScript, /@downloadURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/indeed\/indeed-agent-worker\.user\.js/);
   assert.match(indeedWorkerScript, /agentWaitAndClickText\(\/\^update\$\/i/);
   assert.match(indeedWorkerScript, /agentWaitForIndeedDateOption/);
+  assert.match(indeedWorkerScript, /agentWaitForIndeedDateSelection/);
+  assert.match(indeedWorkerScript, /agentFindIndeedDateUpdateButton/);
+  assert.match(indeedWorkerScript, /agentWaitForIndeedDateParameter/);
   assert.match(indeedWorkerScript, /Date posted options/);
+  assert.match(indeedWorkerScript, /directUrl\.searchParams\.set\("fromage"/);
   assert.match(indeedWorkerScript, /window\.location\.assign\(searchUrl\.href\)/);
   assert.match(indeedWorkerScript, /current\.get\("fromage"\)/);
   assert.match(indeedWorkerScript, /worker\/progress/);
   assert.match(indeedWorkerScript, /job-agent-operation-overlay/);
+  assert.match(indeedWorkerScript, /background:transparent/);
+  assert.match(indeedWorkerScript, /align-items:flex-end/);
+  assert.match(indeedWorkerScript, /pointer-events:none/);
+  assert.match(indeedWorkerScript, /脚本正在操作 · 请勿操作此窗口/);
+  assert.match(indeedWorkerScript, /ja-operation-float/);
+  assert.match(indeedWorkerScript, /stage: "direct-verify"/);
+  assert.doesNotMatch(indeedWorkerScript, /backdrop-filter:blur/);
   assert.match(indeedWorkerScript, /agentAssertSearchResults/);
   assert.match(indeedWorkerScript, /agentRunHistoryReset/);
   assert.match(indeedWorkerScript, /https:\/\/www\.seek\.com\.au\/jobs\?jobAgentReset=1&jobAgentResetAll=1/);
@@ -148,7 +317,44 @@ try {
   assert.match(linkedInWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(linkedInWorkerScript, /@name\s+Job Agent Worker - LinkedIn/);
   assert.match(linkedInWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(linkedInWorkerScript, /@version\s+2\.2\.1/);
+  assert.match(linkedInWorkerScript, /@version\s+1\.0\.0/);
+  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.0\.0"/);
+  assert.match(linkedInWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
+  assert.match(linkedInWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
+  assert.match(linkedInWorkerScript, /Job Agent 访问节奏/);
+  assert.match(linkedInWorkerScript, /agentEnrichJobs/);
+  assert.match(linkedInWorkerScript, /\/api\/worker\/title-plan/);
+  assert.match(linkedInWorkerScript, /jobs-description-content__text/);
+  assert.match(linkedInWorkerScript, /@match\s+https:\/\/www\.linkedin\.com\/jobs\/view\/\*/);
+  assert.match(linkedInWorkerScript, /@match\s+https:\/\/www\.linkedin\.com\/authwall\*/);
+  assert.match(linkedInWorkerScript, /agentRunJdChild/);
+  assert.match(linkedInWorkerScript, /jobAgentJdRequest/);
+  assert.match(linkedInWorkerScript, /about the job/);
+  assert.match(linkedInWorkerScript, /agentExpandJobDescription/);
+  assert.match(linkedInWorkerScript, /agentExtractDescriptionFromDocument\(document\)/);
+  assert.match(linkedInWorkerScript, /More control:/);
+  assert.match(linkedInWorkerScript, /agentTiming\.jdPageTimeoutSeconds/);
+  assert.match(linkedInWorkerScript, /agentRunOnDemandJd/);
+  assert.match(linkedInWorkerScript, /jobAgentOnDemandJd/);
+  assert.match(linkedInWorkerScript, /agentContinueJdBatch/);
+  assert.match(linkedInWorkerScript, /jobAgentJdBatch/);
+  assert.match(linkedInWorkerScript, /agentRequestJobPage\(job\.jobUrl\)/);
+  assert.match(linkedInWorkerScript, /DEFAULT_AGENT_TIMING/);
+  assert.match(linkedInWorkerScript, /agentTiming\.jdRequestTimeoutSeconds/);
+  assert.match(linkedInWorkerScript, /agentTiming\.accessLimit/);
+  assert.match(linkedInWorkerScript, /agentTiming\.cooldownMinutes/);
+  assert.match(linkedInWorkerScript, /agentRefreshTiming/);
+  assert.match(linkedInWorkerScript, /response\.stopRequested/);
+  assert.match(linkedInWorkerScript, /agentStopRequested/);
+  assert.match(linkedInWorkerScript, /agentBeforePlatformAccess/);
+  assert.match(linkedInWorkerScript, /cooldownUntil/);
+  assert.match(linkedInWorkerScript, /agentTask\.exclusionKeywords/);
+  assert.match(linkedInWorkerScript, /active: true/);
+  assert.doesNotMatch(linkedInWorkerScript, /45000|45 seconds/);
+  assert.match(linkedInWorkerScript, /\/api\/worker\/job-jd/);
+  assert.match(linkedInWorkerScript, /location\.pathname\.startsWith\("\/jobs\/search\/"\)/);
+  assert.match(linkedInWorkerScript, /agentSearchKeyword/);
+  assert.match(linkedInWorkerScript, /agentIncludeKeywordText/);
   assert.match(linkedInWorkerScript, /preflight\/next-launch/);
   assert.match(linkedInWorkerScript, /worker\/next-platform-launch/);
   assert.match(linkedInWorkerScript, /@updateURL\s+http:\/\/127\.0\.0\.1:4317\/workers\/linkedin\/linkedin-agent-worker\.user\.js/);
@@ -161,6 +367,12 @@ try {
   assert.match(linkedInWorkerScript, /window\.location\.assign\(searchUrl\.href\)/);
   assert.match(linkedInWorkerScript, /worker\/progress/);
   assert.match(linkedInWorkerScript, /job-agent-operation-overlay/);
+  assert.match(linkedInWorkerScript, /background:transparent/);
+  assert.match(linkedInWorkerScript, /align-items:flex-end/);
+  assert.match(linkedInWorkerScript, /pointer-events:none/);
+  assert.match(linkedInWorkerScript, /脚本正在操作 · 请勿操作此窗口/);
+  assert.match(linkedInWorkerScript, /ja-operation-float/);
+  assert.doesNotMatch(linkedInWorkerScript, /backdrop-filter:blur/);
   assert.match(linkedInWorkerScript, /agentAssertSearchResults/);
   assert.match(linkedInWorkerScript, /agentRunHistoryReset/);
   assert.match(linkedInWorkerScript, /https:\/\/au\.indeed\.com\/jobs\?jobAgentReset=1&jobAgentResetAll=1/);
@@ -174,25 +386,72 @@ try {
   assert.match(dashboardHtml, /data-profile-pane="editor"/);
   assert.match(dashboardHtml, /data-jobs-pane="current"/);
   assert.match(dashboardHtml, /data-jobs-pane="history"/);
-  assert.match(dashboardHtml, /id="job-history-run"/);
+  assert.match(dashboardHtml, /id="history-task-index"/);
+  assert.match(dashboardHtml, /id="history-task-index-body"/);
+  assert.match(dashboardHtml, /id="back-history-tasks"/);
+  assert.match(dashboardHtml, /id="select-all-routine-tasks"/);
+  assert.match(dashboardHtml, /id="run-selected-routine-tasks"/);
+  assert.match(dashboardHtml, /id="retry-failed-jds"/);
+  assert.match(dashboardHtml, /id="delete-selected-history-run"/);
   assert.match(dashboardHtml, /id="job-run-stats"/);
+  assert.match(dashboardHtml, /未审阅完成任务/);
+  assert.match(dashboardHtml, /id="active-job-task-filter"/);
+  assert.match(dashboardHtml, /id="job-viewed"/);
+  assert.match(dashboardHtml, /value="priority"/);
   assert.match(dashboardHtml, /id="review-learning"/);
   assert.match(dashboardHtml, /id="complete-run-review"/);
+  assert.doesNotMatch(dashboardHtml, /id="review-learning-content"/);
+  assert.match(dashboardHtml, /id="settings-learning-content"/);
+  assert.match(dashboardHtml, /id="timing-access-limit"/);
+  assert.match(dashboardHtml, /id="timing-cooldown-minutes"/);
+  assert.match(dashboardHtml, /id="timing-jd-page-timeout"/);
   assert.match(dashboardHtml, /id="feedback-dialog"/);
+  assert.match(dashboardHtml, /id="score-dialog"/);
+  assert.match(dashboardHtml, /id="score-dialog-content"/);
+  assert.match(dashboardHtml, /value="ROLE_RELEVANT"/);
+  assert.match(dashboardHtml, /value="WOULD_APPLY"/);
   assert.match(dashboardHtml, /value="CLASSIFICATION_WRONG"/);
-  assert.match(dashboardHtml, /value="NOT_RELEVANT"/);
+  assert.match(dashboardHtml, /Rejected 判断不正确/);
+  assert.match(dashboardHtml, /value="ROLE_NOT_INTERESTED"/);
+  assert.match(dashboardHtml, /value="SKILL_MISMATCH"/);
+  assert.match(dashboardHtml, /value="WOULD_NOT_APPLY"/);
+  assert.match(dashboardHtml, /id="exclusion-suggestions"/);
+  assert.match(dashboardHtml, /id="run-confirmation-dialog"/);
   assert.match(dashboardHtml, /明确不符合/);
   assert.match(dashboardHtml, /id="open-clear-all-history"/);
   assert.match(dashboardHtml, /id="clear-all-history-dialog"/);
   assert.match(dashboardHtml, /id="confirm-clear-all-history"/);
+  assert.match(dashboardHtml, /内置预设、自定义任务类别/);
   assert.match(dashboardHtml, /id="task-category-list"/);
   assert.match(dashboardHtml, /id="preflight-selected-categories"/);
   assert.match(dashboardHtml, /id="import-selected-categories"/);
+  assert.match(dashboardHtml, /id="routine-platform-selectors"/);
+  assert.match(dashboardHtml, /id="select-visible-routine-tasks"/);
+  assert.match(dashboardHtml, /id="clear-routine-selection"/);
   assert.match(dashboardHtml, /id="task-category-dialog"/);
+  assert.match(dashboardHtml, /多个备选词用逗号分隔/);
   const dashboardScriptResponse = await fetch("http://127.0.0.1:" + port + "/app.js");
   const dashboardScript = await dashboardScriptResponse.text();
   assert.match(dashboardScript, /data-install-worker/);
+  assert.match(dashboardScript, /data-score-details/);
+  assert.match(dashboardScript, /function retryFailedJds/);
+  assert.match(dashboardScript, /\/api\/jobs\/retry-failed-jd/);
+  assert.match(dashboardScript, /setInterval\(autoReload, 2500\)/);
+  assert.match(dashboardScript, /function openScoreDetails/);
+  assert.match(dashboardScript, /AI 根据完整 JD 与职业画像进行语义综合评分/);
   assert.match(dashboardScript, /安装 \/ 更新/);
+  assert.match(dashboardScript, /name: "Indeed", version: "v1\.0\.0"/);
+  assert.match(dashboardScript, /name: "SEEK", version: "v1\.0\.0"/);
+  assert.match(dashboardScript, /function selectRoutineTaskRange/);
+  assert.match(dashboardScript, /data-routine-platform-select/);
+  assert.match(dashboardScript, /\/workers\/install\//);
+  assert.match(dashboardScript, /agent-worker-/);
+  const installerResponse = await fetch("http://127.0.0.1:" + port + "/workers/install/indeed-agent-worker-v1.0.0.user.js");
+  const installerScript = await installerResponse.text();
+  assert.equal(installerResponse.ok, true);
+  assert.match(installerResponse.headers.get("content-type") || "", /^text\/javascript/);
+  assert.match(installerScript, /@name\s+Job Agent Worker - Indeed/);
+  assert.match(installerScript, /@version\s+1\.0\.0/);
   assert.match(dashboardScript, /data-copy-worker/);
   assert.match(dashboardScript, /loadWorkerScripts/);
   assert.match(dashboardScript, /job-agent:view/);
@@ -202,17 +461,72 @@ try {
   assert.match(dashboardScript, /finishProfileChipPointerDrag/);
   assert.match(dashboardScript, /acceptSuggestedGroup/);
   assert.match(dashboardScript, /candidateItems/);
+  assert.match(dashboardScript, /basicInfo/);
+  assert.match(dashboardScript, /workExperience/);
+  assert.match(dashboardScript, /projectExperience/);
+  assert.match(dashboardScript, /extracurricular/);
+  assert.match(dashboardScript, /certifications/);
+  assert.match(dashboardScript, /languages/);
+  assert.match(dashboardScript, /honors/);
+  assert.match(dashboardScript, /customSections/);
+  assert.match(dashboardScript, /function profileEntryMarkup/);
+  assert.match(dashboardScript, /function addCustomProfileSection/);
   assert.match(dashboardScript, /function currentRunJobs\(\)/);
+  assert.match(dashboardScript, /function pendingReviewTaskEntries\(\)/);
+  assert.match(dashboardScript, /function markRunTaskViewed\(runId, id, button\)/);
+  assert.match(dashboardScript, /data-mark-task-viewed/);
+  assert.match(dashboardScript, /标记已全部看完/);
+  assert.match(dashboardScript, /selectedRoutineTaskIds: new Set\(\)/);
+  assert.match(dashboardScript, /data-routine-task-select/);
+  assert.match(dashboardScript, /function runSelectedRoutineTasks\(\)/);
+  assert.match(dashboardScript, /function screeningMethodBadge\(job\)/);
+  assert.match(dashboardScript, /data-filter-job-stat-task/);
+  assert.match(dashboardScript, /data-toggle-viewed/);
+  assert.match(dashboardScript, /STRONG_MATCH: 0/);
   assert.match(dashboardScript, /function historicalJobs\(\)/);
+  assert.match(dashboardScript, /function historicalTaskEntries\(\)/);
+  assert.match(dashboardScript, /latest\?\.reviewCompletedAt \? null : latest/);
+  assert.match(dashboardScript, /function runIsFinished\(run\)/);
+  assert.match(dashboardScript, /function todayRoutineTaskRun\(routineTaskId\)/);
+  assert.match(dashboardScript, /function todayRoutineTaskBadge\(runTask\)/);
+  assert.match(dashboardScript, /今日已运行/);
+  assert.match(dashboardScript, /today-run-badge/);
+  assert.match(dashboardScript, /terminalTaskStatuses/);
+  assert.match(dashboardScript, /archiveAfterReflection/);
+  assert.match(dashboardScript, /job-review-meta/);
+  assert.match(dashboardScript, /data-open-history-task/);
+  assert.match(dashboardScript, /executedAt: task\.startedAt/);
   assert.match(dashboardScript, /state\.jobsPane === "history"/);
   assert.match(dashboardScript, /data-run-routine-task/);
+  assert.match(dashboardScript, /data-stop-run-task/);
+  assert.match(dashboardScript, /function stopRunTask\(id\)/);
   assert.match(dashboardScript, /data-rerun-task/);
   assert.match(dashboardScript, /data-add-validation-task/);
   assert.match(dashboardScript, /ai-review-badge/);
+  assert.match(dashboardScript, /score-trigger/);
+  assert.match(dashboardScript, /AI_REVIEWING/);
+  assert.match(dashboardScript, /data-rereview/);
+  assert.match(dashboardScript, /function rereviewJob\(id, button\)/);
+  assert.match(dashboardScript, /使用已保存的完整 JD 重新 AI 审阅/);
+  assert.match(dashboardScript, /\/fetch-jd/);
+  assert.match(dashboardScript, /获取完整 JD/);
+  assert.doesNotMatch(dashboardHtml, /id="review-description"/);
   assert.match(dashboardScript, /job-agent-run-finished/);
-  assert.match(dashboardScript, /renderCurrentRunStats/);
+  assert.match(dashboardScript, /renderPendingReviewTasks/);
+  assert.match(dashboardScript, /data-delete-job-stat-task/);
+  assert.match(dashboardScript, /data-delete-run-history/);
+  assert.match(dashboardScript, /function deleteJobStatTask/);
+  assert.match(dashboardScript, /function deleteRunHistory/);
   assert.match(dashboardScript, /renderReviewLearning/);
+  assert.match(dashboardScript, /renderPreferenceLearningSettings/);
+  assert.match(dashboardScript, /model\.deprioritizeSignals/);
+  assert.doesNotMatch(dashboardScript, /learningChips\(\[\.\.\.\(model\.avoidSignals/);
   assert.match(dashboardScript, /saveJobFeedback/);
+  assert.match(dashboardScript, /REJECTION_INCORRECT/);
+  assert.match(dashboardScript, /REJECTION_CORRECT/);
+  assert.match(dashboardHtml, /value="REJECTION_CORRECT"/);
+  assert.match(dashboardScript, /function effectiveJobCategory/);
+  assert.match(dashboardScript, /data-feedback-mode="negative"/);
   assert.match(dashboardScript, /completeRunReview/);
   assert.match(dashboardScript, /const run = selectedReviewRun\(\)/);
   assert.match(dashboardScript, /\/api\/records/);
@@ -222,6 +536,22 @@ try {
   assert.match(dashboardScript, /prepareSelectedCategories/);
   assert.match(dashboardScript, /\/api\/task-categories\/prepare/);
   assert.match(dashboardScript, /data-category-select/);
+  assert.match(dashboardScript, /function requestRunConfirmation/);
+  assert.match(dashboardScript, /settings\/exclusion-keywords/);
+  assert.match(dashboardScript, /exclusion-suggestions/);
+
+  const normalizedKeywordValidation = await request("/api/task-validations", {
+    platform: "linkedin",
+    keyword: "intern OR internship",
+    location: "Melbourne, Victoria, Australia",
+    postedWithinDays: 7
+  });
+  assert.equal(normalizedKeywordValidation.validation.keyword, "intern, internship");
+  await request("/api/task-validations/" + normalizedKeywordValidation.validation.id, undefined, "DELETE");
+
+  const keywordBootstrap = await request("/api/bootstrap");
+  assert.ok(keywordBootstrap.taskCategories.flatMap((category) => category.tasks)
+    .every((task) => !/\sOR\s/i.test(task.keyword)));
 
   const savedAiConfig = await request("/api/ai-config", {
     baseUrl: "https://example.invalid/v1",
@@ -262,7 +592,9 @@ try {
   assert.equal(generated.profile.status, "draft");
   assert.equal(generated.profile.engine, "external-gpt");
   assert.equal(generated.profile.externalProfileUsed, true);
-  assert.deepEqual(generated.profile.profile.candidateItems, ["Backend API projects", "Cloud coursework"]);
+  assert.equal(generated.profile.profile.schemaVersion, 2);
+  assert.equal(generated.profile.profile.basicInfo.name, "Candidate");
+  assert.deepEqual(generated.profile.profile.customSections.at(-1).entries[0].highlights, ["Backend API projects", "Cloud coursework"]);
 
   await request("/api/profiles/" + generated.profile.id + "/activate", {});
   const replacement = await request("/api/profiles/generate", {
@@ -401,9 +733,17 @@ try {
   const afterDailyDelete = await request("/api/bootstrap");
   assert.equal(afterDailyDelete.routineTasks.length, 3);
 
+  const updatedExclusions = await request("/api/settings/exclusion-keywords", { keyword: "retail assistant" });
+  assert.ok(updatedExclusions.settings.exclusionKeywords.includes("retail assistant"));
   await validateRoutineTask("linkedin", 1);
   const run = await request("/api/runs", {});
   assert.equal(run.run.tasks.length, 4);
+  assert.deepEqual(run.run.tasks[0].workerTiming, run.run.settingsSnapshot.workerTiming);
+  const runTimingResponse = await request("/api/worker/settings?runId=" + run.run.id);
+  assert.deepEqual(runTimingResponse.workerTiming, run.run.settingsSnapshot.workerTiming);
+  assert.equal(runTimingResponse.source, "run-snapshot");
+  assert.equal(runTimingResponse.runId, run.run.id);
+  assert.ok(run.run.tasks.every((task) => task.exclusionKeywords.includes("retail assistant")));
   assert.equal(run.launchUrls.length, 3);
   assert.ok(run.launchUrls.every((launch) => new URL(launch.url).searchParams.get("jobAgentWorker") === "1"));
   const indeedLaunch = new URL(run.launchUrls.find((launch) => launch.platform === "indeed").url);
@@ -495,9 +835,45 @@ try {
   const resumedIndeed = await request("/api/worker/next?runId=" + run.run.id + "&platform=indeed&workerId=indeed-worker");
   assert.equal(resumedIndeed.task.id, indeedClaim.task.id);
 
+  const stopAndKeep = await request("/api/runs/" + run.run.id + "/tasks/" + resumedIndeed.task.id + "/stop", {});
+  assert.equal(stopAndKeep.stopRequested, true);
+  assert.ok(stopAndKeep.task.stopRequestedAt);
+  const stopProgress = await request("/api/worker/progress", {
+    runId: run.run.id,
+    taskId: resumedIndeed.task.id,
+    taskAttempt: resumedIndeed.task.attempt,
+    workerId: "indeed-worker",
+    phase: "scanning",
+    message: "Indeed is checking for a stop request.",
+    scanned: 8,
+    found: 2
+  });
+  assert.equal(stopProgress.stopRequested, true);
+  const keptPartialResult = await request("/api/worker/result", {
+    runId: run.run.id,
+    taskId: resumedIndeed.task.id,
+    taskAttempt: resumedIndeed.task.attempt,
+    workerId: "indeed-worker",
+    status: "completed",
+    reason: "Stopped early by user; partial results were kept.",
+    jobs: [{ source: "indeed", sourceJobId: "kept-partial-result", title: "Graduate Software Developer", location: "Melbourne VIC" }]
+  });
+  assert.equal(keptPartialResult.discarded, undefined);
+  assert.equal(keptPartialResult.jobs[0].sourceJobId, "kept-partial-result");
+  const markIndeedTaskViewed = await request("/api/runs/" + run.run.id + "/tasks/" + resumedIndeed.task.id + "/viewed", {}, "PUT");
+  assert.equal(markIndeedTaskViewed.total, 2);
+  assert.equal(markIndeedTaskViewed.updated, 2);
+  const afterMarkIndeedTaskViewed = await request("/api/bootstrap");
+  assert.ok(afterMarkIndeedTaskViewed.jobs
+    .filter((job) => job.runTaskId === resumedIndeed.task.id)
+    .every((job) => Boolean(job.viewedAt)));
+
   const clearedQueue = await request("/api/runs/" + run.run.id + "/tasks", undefined, "DELETE");
-  assert.equal(clearedQueue.cleared.removed, 1);
-  assert.equal(clearedQueue.cleared.cancelled, 1);
+  assert.equal(clearedQueue.cleared.removed, 2);
+  assert.equal(clearedQueue.cleared.cancelled, 0);
+  const finishedRunClaim = await request("/api/worker/next?runId=" + run.run.id + "&platform=indeed&workerId=indeed-worker");
+  assert.equal(finishedRunClaim.task, null);
+  assert.equal(finishedRunClaim.reason, undefined, "an empty sequential queue must finish instead of waiting forever");
 
   const retriedTask = await request("/api/runs/" + run.run.id + "/tasks/" + seekClaim.task.id + "/retry", {});
   assert.equal(retriedTask.task.status, "queued");
@@ -515,6 +891,22 @@ try {
   assert.equal(staleAttemptResult.staleAttempt, true);
   await request("/api/runs/" + run.run.id + "/tasks/" + seekClaim.task.id, undefined, "DELETE");
 
+  const titlePlan = await request("/api/worker/title-plan", {
+    runId: run.run.id,
+    jobs: [
+      { source: "indeed", sourceJobId: "plan-reject", title: "Senior Civil Engineer" },
+      { source: "indeed", sourceJobId: "plan-fetch", title: "Graduate Analyst" }
+    ]
+  });
+  assert.equal(titlePlan.plan[0].action, "reject");
+  assert.equal(titlePlan.plan[1].action, "fetch");
+
+  await request("/api/ai-config", {
+    baseUrl: "http://127.0.0.1:" + aiPort,
+    model: "fake-job-review-model",
+    wireApi: "responses",
+    apiKey: ""
+  }, "PUT");
   const imported = await request("/api/jobs/import", {
     runId: run.run.id,
     jobs: [{
@@ -523,27 +915,138 @@ try {
       title: "Graduate Analyst",
       company: "Example",
       location: "Melbourne VIC",
-      description: "Use Python and SQL for data analytics and cloud automation work."
+      description: "Use Python and SQL for data analytics and cloud automation work across production software systems, backend APIs, testing, deployment, stakeholder requirements, and monitored cloud services.",
+      descriptionSource: "detail-page",
+      descriptionFetchStatus: "fetched"
     }]
   });
-  assert.equal(imported.jobs[0].screening.screeningStatus, "NEEDS_JD_REVIEW");
+  assert.equal(imported.jobs[0].screening.screeningStatus, "AI_QUEUED");
+  const reviewDeadline = Date.now() + 5_000;
+  let reviewedJob;
+  while (Date.now() < reviewDeadline) {
+    const polled = await request("/api/bootstrap");
+    reviewedJob = polled.jobs.find((job) => job.id === imported.jobs[0].id);
+    if (reviewedJob?.screening.screeningStatus === "JD_SCREENED") break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(reviewedJob.screening.screeningStatus, "JD_SCREENED");
+  assert.equal(reviewedJob.screening.engine, "ai");
+  assert.equal(reviewedJob.screening.score, 88);
 
-  const reviewed = await request("/api/jobs/" + imported.jobs[0].id + "/review", {
-    description: imported.jobs[0].description
+  const rereviewed = await request("/api/jobs/" + imported.jobs[0].id + "/review", {}, "POST");
+  assert.equal(rereviewed.job.screening.screeningStatus, "JD_SCREENED");
+  assert.equal(rereviewed.job.screening.engine, "ai");
+  assert.equal(rereviewed.job.description, imported.jobs[0].description);
+  const afterRereview = await request("/api/bootstrap");
+  assert.equal(afterRereview.runs.find((item) => item.id === run.run.id).counters.ai.jdReviewed, 1);
+
+  const legacyImport = await request("/api/jobs/import", {
+    runId: run.run.id,
+    jobs: [{
+      source: "indeed",
+      sourceJobId: "legacy-jd-1",
+      title: "Technical Writer",
+      company: "Example Documentation",
+      location: "Australia",
+      jobUrl: "https://au.indeed.com/viewjob?jk=legacy-jd-1",
+      searchKeyword: "technical writer",
+      searchLocation: "Australia",
+      searchPostedWithinDays: 7
+    }]
   });
-  assert.equal(reviewed.job.screening.screeningStatus, "JD_SCREENED");
+  const legacyJob = legacyImport.jobs[0];
+  assert.equal(legacyJob.screening.screeningStatus, "JD_FETCH_FAILED");
+  const fetchLaunch = await request("/api/jobs/" + legacyJob.id + "/fetch-jd", {}, "POST");
+  assert.equal(fetchLaunch.job.screening.screeningStatus, "JD_FETCHING");
+  assert.match(fetchLaunch.launchUrl, /au\.indeed\.com\/jobs\?/);
+  assert.match(fetchLaunch.launchUrl, /vjk=legacy-jd-1/);
+  assert.match(fetchLaunch.launchUrl, /jobAgentOnDemandJd=/);
+  const jdCallback = await request("/api/worker/job-jd", {
+    jobId: legacyJob.id,
+    platform: "indeed",
+    description: "Create and maintain detailed software documentation for cloud APIs, Python automation services, SQL data workflows, testing procedures, deployment operations, and technical platform users across engineering teams."
+  });
+  assert.equal(jdCallback.autoReviewQueued, 1);
+  const legacyReviewDeadline = Date.now() + 5_000;
+  let legacyReviewedJob;
+  while (Date.now() < legacyReviewDeadline) {
+    const polled = await request("/api/bootstrap");
+    legacyReviewedJob = polled.jobs.find((job) => job.id === legacyJob.id);
+    if (legacyReviewedJob?.screening.screeningStatus === "JD_SCREENED") break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(legacyReviewedJob.descriptionSource, "detail-page");
+  assert.equal(legacyReviewedJob.screening.screeningStatus, "JD_SCREENED");
+  assert.equal(legacyReviewedJob.screening.engine, "ai");
+
+  const retryImports = await request("/api/jobs/import", {
+    runId: run.run.id,
+    jobs: [
+      {
+        source: "indeed",
+        sourceJobId: "retry-jd-1",
+        title: "Technology Operations Coordinator",
+        company: "Retry Example One",
+        location: "Australia",
+        jobUrl: "https://au.indeed.com/viewjob?jk=retry-jd-1"
+      },
+      {
+        source: "indeed",
+        sourceJobId: "retry-jd-2",
+        title: "Digital Systems Coordinator",
+        company: "Retry Example Two",
+        location: "Australia",
+        jobUrl: "https://au.indeed.com/viewjob?jk=retry-jd-2"
+      }
+    ]
+  });
+  assert.ok(retryImports.jobs.every((job) => job.screening.screeningStatus === "JD_FETCH_FAILED"));
+  const retryBatch = await request("/api/jobs/retry-failed-jd", {
+    jobIds: retryImports.jobs.map((job) => job.id)
+  });
+  assert.equal(retryBatch.total, 2);
+  assert.equal(retryBatch.completed, 0);
+  const firstRetryHash = new URLSearchParams(new URL(retryBatch.launchUrl).hash.slice(1));
+  assert.equal(firstRetryHash.get("jobAgentJdBatch"), retryBatch.batchId);
+  await request("/api/worker/job-jd", {
+    jobId: retryBatch.job.id,
+    platform: "indeed",
+    batchId: retryBatch.batchId,
+    error: "Synthetic JD timeout"
+  });
+  const nextRetry = await request("/api/worker/jd-retry/" + retryBatch.batchId + "/next", {});
+  assert.equal(nextRetry.done, false);
+  assert.equal(nextRetry.completed, 1);
+  assert.notEqual(nextRetry.job.id, retryBatch.job.id);
+  await request("/api/worker/job-jd", {
+    jobId: nextRetry.job.id,
+    platform: "indeed",
+    batchId: retryBatch.batchId,
+    error: "Synthetic JD timeout"
+  });
+  const finishedRetry = await request("/api/worker/jd-retry/" + retryBatch.batchId + "/next", {});
+  assert.equal(finishedRetry.done, true);
+  assert.equal(finishedRetry.completed, 2);
+
+  const viewed = await request("/api/jobs/" + imported.jobs[0].id + "/viewed", { viewed: true }, "PUT");
+  assert.ok(viewed.job.viewedAt);
+  const viewedBootstrap = await request("/api/bootstrap");
+  assert.ok(viewedBootstrap.jobs.find((job) => job.id === imported.jobs[0].id).viewedAt);
+  const restoredUnread = await request("/api/jobs/" + imported.jobs[0].id + "/viewed", { viewed: false }, "PUT");
+  assert.equal(restoredUnread.job.viewedAt, null);
 
   const feedback = await request("/api/jobs/" + imported.jobs[0].id + "/feedback", {
-    notHelpful: true,
-    reason: "CLASSIFICATION_WRONG",
-    note: "The analyst title is not the software role I need."
+    helpful: true,
+    reason: "ROLE_RELEVANT",
+    note: "The analyst role is relevant to my target direction."
   }, "PUT");
-  assert.equal(feedback.job.feedback.helpfulness, "NOT_HELPFUL");
-  assert.equal(feedback.job.feedback.reason, "CLASSIFICATION_WRONG");
+  assert.equal(feedback.job.feedback.helpfulness, "HELPFUL");
+  assert.equal(feedback.job.feedback.reason, "ROLE_RELEVANT");
+  assert.ok(feedback.job.viewedAt);
 
   const reflection = await request("/api/runs/" + run.run.id + "/reflection", {});
   assert.equal(reflection.reflection.feedbackCount, 1);
-  assert.equal(reflection.reflection.engine, "local-rules");
+  assert.equal(reflection.reflection.engine, "ai");
   assert.equal(reflection.preferenceModel.version, 1);
   assert.ok(reflection.preferenceModel.titleExclusions.includes("Graduate Analyst"));
 
@@ -559,22 +1062,94 @@ try {
   });
   assert.equal(learnedImport.jobs[0].screening.category, "REJECTED");
   assert.equal(learnedImport.jobs[0].screening.engine, "local-rules+feedback");
+  const correctedRejection = await request("/api/jobs/" + learnedImport.jobs[0].id + "/feedback", {
+    helpfulness: "REJECTION_INCORRECT",
+    reason: "CLASSIFICATION_WRONG",
+    note: "This role should remain available for human review."
+  }, "PUT");
+  assert.equal(correctedRejection.job.feedback.helpfulness, "REJECTION_INCORRECT");
+  assert.equal(correctedRejection.job.feedback.reason, "CLASSIFICATION_WRONG");
+  assert.ok(correctedRejection.job.viewedAt);
+  const dislikedRejection = await request("/api/jobs/" + learnedImport.jobs[0].id + "/feedback", {
+    helpfulness: "NOT_HELPFUL",
+    reason: "ROLE_NOT_INTERESTED",
+    note: "This role is outside my preferred direction."
+  }, "PUT");
+  assert.equal(dislikedRejection.job.feedback.helpfulness, "NOT_HELPFUL");
+  assert.equal(dislikedRejection.job.feedback.reason, "ROLE_NOT_INTERESTED");
+  assert.ok(dislikedRejection.job.viewedAt);
+
+  const rejectedImport = await request("/api/jobs/import", {
+    runId: run.run.id,
+    jobs: [{
+      source: "indeed",
+      sourceJobId: "rejected-correction-1",
+      title: "Retail Merchandising Graduate",
+      company: "Incorrect AI Example",
+      location: "Melbourne VIC",
+      description: "Support retail merchandising, store displays, product presentation, promotional campaigns, inventory coordination, customer research, reporting, and cross-functional planning across a national retail network.",
+      descriptionSource: "detail-page",
+      descriptionFetchStatus: "fetched"
+    }]
+  });
+  const rejectedReviewDeadline = Date.now() + 5_000;
+  let aiRejectedJob;
+  while (Date.now() < rejectedReviewDeadline) {
+    const polled = await request("/api/bootstrap");
+    aiRejectedJob = polled.jobs.find((job) => job.id === rejectedImport.jobs[0].id);
+    if (aiRejectedJob?.screening.screeningStatus === "JD_SCREENED") break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(aiRejectedJob.screening.category, "REJECTED");
+  const suggestionBootstrap = await request("/api/bootstrap");
+  assert.ok(suggestionBootstrap.exclusionSuggestions.some((item) => item.keyword === "merchandising"));
+  await request("/api/jobs/" + aiRejectedJob.id + "/feedback", {
+    helpfulness: "REJECTION_INCORRECT",
+    reason: "CLASSIFICATION_WRONG"
+  }, "PUT");
+  const correctedSuggestionBootstrap = await request("/api/bootstrap");
+  assert.ok(!correctedSuggestionBootstrap.exclusionSuggestions.some((item) => item.keyword === "merchandising"));
+  const confirmedRejection = await request("/api/jobs/" + aiRejectedJob.id + "/feedback", {
+    helpfulness: "HELPFUL",
+    reason: "REJECTION_CORRECT"
+  }, "PUT");
+  assert.equal(confirmedRejection.job.feedback.helpfulness, "HELPFUL");
+  assert.equal(confirmedRejection.job.feedback.reason, "REJECTION_CORRECT");
+  const confirmedSuggestionBootstrap = await request("/api/bootstrap");
+  assert.ok(confirmedSuggestionBootstrap.exclusionSuggestions.some((item) => item.keyword === "merchandising"));
+  const confirmedReflection = await request("/api/runs/" + run.run.id + "/reflection", {});
+  assert.equal(confirmedReflection.preferenceModel.version, 2);
+  assert.ok(confirmedReflection.preferenceModel.titleExclusions.includes("Retail Merchandising Graduate"));
+  const confirmedReflectionBootstrap = await request("/api/bootstrap");
+  assert.ok(confirmedReflectionBootstrap.exclusionSuggestions.some((item) => item.keyword === "merchandising"));
+  await request("/api/jobs/" + aiRejectedJob.id + "/feedback", {
+    helpfulness: "NOT_HELPFUL",
+    reason: "NOT_RELEVANT"
+  }, "PUT");
+  const dislikedSuggestionBootstrap = await request("/api/bootstrap");
+  assert.ok(dislikedSuggestionBootstrap.exclusionSuggestions.some((item) => item.keyword === "merchandising"));
+  const coveredExclusions = await request("/api/settings/exclusion-keywords", { keyword: "merchandising" });
+  assert.ok(coveredExclusions.settings.exclusionKeywords.includes("merchandising"));
+  const coveredSuggestionBootstrap = await request("/api/bootstrap");
+  assert.ok(!coveredSuggestionBootstrap.exclusionSuggestions.some((item) => item.status === "pending"
+    && item.keyword.toLowerCase() === "merchandising"));
+  await request("/api/settings/exclusion-keywords/merchandising", undefined, "DELETE");
 
   const bootstrap = await request("/api/bootstrap");
   assert.equal(bootstrap.activeProfile.id, replacement.profile.id);
   assert.equal(bootstrap.profiles.length, 1);
-  assert.equal(bootstrap.jobs.length, 3);
-  assert.equal(bootstrap.reviewReflections.length, 1);
-  assert.equal(bootstrap.preferenceModel.feedbackCount, 1);
+  assert.equal(bootstrap.jobs.length, 8);
+  assert.equal(bootstrap.reviewReflections.length, 2);
+  assert.equal(bootstrap.preferenceModel.feedbackCount, 3);
   assert.equal(bootstrap.routineTasks.length, 4);
 
-  const singleTaskId = bootstrap.routineTasks[0].id;
-  const nextRun = await request("/api/runs", { routineTaskIds: [singleTaskId] });
-  assert.equal(nextRun.run.tasks.length, 1);
-  assert.equal(nextRun.run.tasks[0].routineTaskId, singleTaskId);
+  const selectedTaskIds = bootstrap.routineTasks.slice(0, 2).map((task) => task.id);
+  const nextRun = await request("/api/runs", { routineTaskIds: selectedTaskIds });
+  assert.equal(nextRun.run.tasks.length, 2);
+  assert.deepEqual(nextRun.run.tasks.map((task) => task.routineTaskId), selectedTaskIds);
   const afterNextRun = await request("/api/bootstrap");
   assert.equal(afterNextRun.runs[0].id, nextRun.run.id);
-  assert.equal(afterNextRun.jobs.length, 3);
+  assert.equal(afterNextRun.jobs.length, 8);
   assert.ok(afterNextRun.jobs.every((job) => job.runId === run.run.id));
   assert.ok(afterNextRun.jobs.every((job) => job.runId !== afterNextRun.runs[0].id));
 
@@ -582,13 +1157,16 @@ try {
   assert.equal(clearedDailyTasks.cleared.count, 4);
   const afterDailyClear = await request("/api/bootstrap");
   assert.equal(afterDailyClear.routineTasks.length, 0);
-  assert.equal(afterDailyClear.runs.find((item) => item.id === run.run.id).tasks.filter((task) => task.status === "cancelled").length, 1);
+  assert.equal(afterDailyClear.runs.find((item) => item.id === run.run.id).tasks.filter((task) => task.status === "cancelled").length, 0);
 
   const clearedRecords = await request("/api/records", undefined, "DELETE");
-  assert.equal(clearedRecords.cleared.jobs, 3);
-  assert.equal(clearedRecords.cleared.reviewReflections, 1);
+  assert.equal(clearedRecords.cleared.jobs, 8);
+  assert.equal(clearedRecords.cleared.reviewReflections, 2);
   assert.ok(clearedRecords.cleared.runs >= 2);
   assert.ok(clearedRecords.cleared.validations > 0);
+  assert.equal(clearedRecords.preserved.taskCategories, 10);
+  assert.equal(clearedRecords.preserved.builtinTaskCategories, 10);
+  assert.equal(clearedRecords.preserved.customTaskCategories, 0);
   const afterRecordClear = await request("/api/bootstrap");
   assert.equal(afterRecordClear.jobs.length, 0);
   assert.equal(afterRecordClear.runs.length, 0);
@@ -601,6 +1179,34 @@ try {
   assert.ok(afterRecordClear.taskCategories.every((category) => category.builtin));
   assert.equal(afterRecordClear.reviewReflections.length, 0);
   assert.equal(afterRecordClear.preferenceModel, null);
+
+  const removableDailyTask = await validateRoutineTask("seek", 3);
+  const removableRun = await request("/api/runs", { routineTaskIds: [removableDailyTask.routineTask.id] });
+  const removableClaim = await request("/api/worker/next?runId=" + removableRun.run.id + "&platform=seek&workerId=remove-test-worker");
+  assert.equal(removableClaim.task.id, removableRun.run.tasks[0].id);
+  const removableResult = await request("/api/worker/result", {
+    runId: removableRun.run.id,
+    taskId: removableClaim.task.id,
+    taskAttempt: removableClaim.task.attempt,
+    workerId: "remove-test-worker",
+    status: "completed",
+    jobs: [{ source: "seek", sourceJobId: "remove-test-job", title: "Museum Digitisation Coordinator", location: "Melbourne VIC" }]
+  });
+  assert.equal(removableResult.jobs.length, 1);
+  const removedTaskResults = await request("/api/runs/" + removableRun.run.id + "/tasks/" + removableClaim.task.id + "/results", undefined, "DELETE");
+  assert.equal(removedTaskResults.removed.tasks, 1);
+  assert.equal(removedTaskResults.removed.jobs, 1);
+  assert.equal(removedTaskResults.removed.importBatches, 1);
+  assert.equal(removedTaskResults.run.tasks.length, 0);
+  const removedRunHistory = await request("/api/runs/" + removableRun.run.id, undefined, "DELETE");
+  assert.equal(removedRunHistory.removed.runs, 1);
+  assert.equal(removedRunHistory.removed.jobs, 0);
+  const afterTargetedDeletes = await request("/api/bootstrap");
+  assert.equal(afterTargetedDeletes.jobs.length, 0);
+  assert.equal(afterTargetedDeletes.runs.length, 0);
+  assert.equal(afterTargetedDeletes.routineTasks.length, 1);
+  await request("/api/routine-tasks", undefined, "DELETE");
+  await request("/api/records", undefined, "DELETE");
 
   const customCategory = await request("/api/task-categories", {
     name: "Custom technology searches",
@@ -654,13 +1260,36 @@ try {
   assert.equal(afterCategoryImport.routineTasks.length, 2);
   assert.ok(afterCategoryImport.routineTasks.every((task) => task.categoryId === customCategory.category.id));
   await request("/api/routine-tasks", undefined, "DELETE");
+  const clearedWithCustomCategory = await request("/api/records", undefined, "DELETE");
+  assert.equal(clearedWithCustomCategory.preserved.taskCategories, 11);
+  assert.equal(clearedWithCustomCategory.preserved.builtinTaskCategories, 10);
+  assert.equal(clearedWithCustomCategory.preserved.customTaskCategories, 1);
+  const afterCustomRecordClear = await request("/api/bootstrap");
+  assert.equal(afterCustomRecordClear.taskCategories.length, 11);
+  assert.ok(afterCustomRecordClear.taskCategories.some((category) => category.id === customCategory.category.id));
+  assert.ok(afterCustomRecordClear.taskCategories.find((category) => category.id === customCategory.category.id)
+    .tasks.every((task) => task.validationId === null));
   await request("/api/task-categories/" + customCategory.category.id, undefined, "DELETE");
-  await request("/api/records", undefined, "DELETE");
   const afterCategoryCleanup = await request("/api/bootstrap");
   assert.equal(afterCategoryCleanup.taskCategories.length, 10);
   assert.equal(afterCategoryCleanup.validations.length, 0);
   console.log("API smoke test passed.");
 } finally {
   child.kill();
+  await new Promise((resolve) => aiServer.close(resolve));
   await rm(directory, { recursive: true, force: true });
+}
+
+function extractNamedFunction(source, name) {
+  const start = source.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `${name} was not found`);
+  const bodyStart = source.indexOf("{", start);
+  let depth = 0;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] !== "}") continue;
+    depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`${name} is incomplete`);
 }
