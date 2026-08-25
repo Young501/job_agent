@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - SEEK
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.0.0
+// @version      1.0.1
 // @description  Job Agent worker for SEEK. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
@@ -29,7 +29,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.0.0";
+    const APP_VERSION = "1.0.1";
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
         cooldownMinutes: 5,
@@ -50,7 +50,8 @@
         workerKey: "job-agent:worker-id:seek",
         pauseKey: "job-agent:worker-pause:seek",
         preflightKey: "job-agent:worker-preflight:seek",
-        accessThrottleKey: "job-agent:access-throttle:seek:v1"
+        accessThrottleKey: "job-agent:access-throttle:seek:v1",
+        scanSessionKey: "job-agent:scan-session:seek:v1"
     };
     let agentTask = null;
     let agentScanFailure = null;
@@ -136,9 +137,80 @@
             duplicates: 0,
             results: new Map(),
             processed: new Set(),
+            visitedPages: new Set(),
+            rateLimitRetries: 0,
             startedAt: null,
             endedAt: null
         };
+    }
+
+    function agentPageKey(urlValue = location.href) {
+        try {
+            const url = new URL(urlValue, location.href);
+            ["jobAgentWorker", "jobAgentRun", "jobAgentTask"].forEach((name) => url.searchParams.delete(name));
+            url.hash = "";
+            return url.href;
+        } catch {
+            return String(urlValue || "");
+        }
+    }
+
+    function agentClearScanSession() {
+        gmSet(AGENT.scanSessionKey, null);
+    }
+
+    function agentSaveScanSession() {
+        if (!agentTask) return;
+        gmSet(AGENT.scanSessionKey, {
+            runId: agentTask.runId,
+            taskId: agentTask.id,
+            taskAttempt: agentTask.attempt || 1,
+            page: state.page,
+            scanned: state.scanned,
+            matched: state.matched,
+            skippedSeen: state.skippedSeen,
+            excluded: state.excluded,
+            duplicates: state.duplicates,
+            results: [...state.results.entries()],
+            processed: [...state.processed],
+            visitedPages: [...state.visitedPages],
+            rateLimitRetries: state.rateLimitRetries || 0,
+            startedAt: state.startedAt,
+            updatedAt: new Date().toISOString()
+        });
+    }
+
+    function agentLoadScanSession() {
+        if (!agentTask) return null;
+        const stored = gmGet(AGENT.scanSessionKey, null);
+        if (!stored
+            || stored.runId !== agentTask.runId
+            || stored.taskId !== agentTask.id
+            || Number(stored.taskAttempt || 1) !== Number(agentTask.attempt || 1)) {
+            if (stored) agentClearScanSession();
+            return null;
+        }
+        const restored = createState();
+        restored.page = Math.max(0, Number(stored.page) || 0);
+        restored.scanned = Math.max(0, Number(stored.scanned) || 0);
+        restored.matched = Math.max(0, Number(stored.matched) || 0);
+        restored.skippedSeen = Math.max(0, Number(stored.skippedSeen) || 0);
+        restored.excluded = Math.max(0, Number(stored.excluded) || 0);
+        restored.duplicates = Math.max(0, Number(stored.duplicates) || 0);
+        restored.results = new Map(Array.isArray(stored.results) ? stored.results : []);
+        restored.processed = new Set(Array.isArray(stored.processed) ? stored.processed : []);
+        restored.visitedPages = new Set(Array.isArray(stored.visitedPages) ? stored.visitedPages : []);
+        restored.rateLimitRetries = Math.max(0, Number(stored.rateLimitRetries) || 0);
+        restored.startedAt = stored.startedAt || new Date().toISOString();
+        return restored;
+    }
+
+    function agentContinuationUrl(urlValue) {
+        const url = new URL(urlValue, location.href);
+        url.searchParams.set("jobAgentWorker", "1");
+        url.searchParams.set("jobAgentRun", agentTask.runId);
+        url.searchParams.set("jobAgentTask", agentTask.id);
+        return url.href;
     }
 
     function init() {
@@ -289,25 +361,34 @@
         agentScanFailure = null;
         settings = readSettingsFromUI();
         if (!agentTask) gmSet(KEYS.settings, settings);
-        state = createState();
+        const resumedState = agentLoadScanSession();
+        state = resumedState || createState();
         state.running = true;
-        state.startedAt = new Date().toISOString();
+        state.startedAt ||= new Date().toISOString();
         const includeRules = parseRules(settings.include);
         const excludeRules = parseRules(settings.exclude);
         setRunningUI(true);
         setStatus("正在读取职位列表...");
         clearLog();
-        log(`开始扫描 ${SITE.label}，包含：${includeRules.join("、") || "全部职位"}`);
+        log(resumedState
+            ? `继续扫描 ${SITE.label} 第 ${state.page + 1} 页，已保留前 ${state.page} 页的 ${state.results.size} 个职位。`
+            : `开始扫描 ${SITE.label}，包含：${includeRules.join("、") || "全部职位"}`);
+        let navigationPending = false;
         try {
-            await scanPages(includeRules, excludeRules);
+            navigationPending = await scanPages(includeRules, excludeRules);
         } catch (error) {
             agentScanFailure = error;
             console.error("SEEK Job Helper scan error", error);
             log(`扫描中断：${error.message || String(error)}`, "error");
         } finally {
             state.running = false;
+            if (navigationPending) {
+                setRunningUI(false);
+                return;
+            }
             state.endedAt = new Date().toISOString();
             setRunningUI(false);
+            agentClearScanSession();
             finishWithSummary(includeRules, excludeRules);
         }
     }
@@ -321,17 +402,16 @@
 
     async function scanPages(includeRules, excludeRules) {
         let currentUrl = location.href;
-        const visitedPages = new Set();
-        while (!state.stopRequested && currentUrl && !visitedPages.has(currentUrl)) {
+        while (!state.stopRequested && currentUrl && !state.visitedPages.has(agentPageKey(currentUrl))) {
             if (settings.maxPages > 0 && state.page >= settings.maxPages) {
                 log(`已达到最大页数 ${settings.maxPages}。`);
                 break;
             }
-            visitedPages.add(currentUrl);
+            state.visitedPages.add(agentPageKey(currentUrl));
             state.page += 1;
             setStatus(`正在扫描第 ${state.page} 页...`);
             let pageDocument = document;
-            if (state.page > 1) {
+            if (!agentTask && state.page > 1) {
                 pageDocument = await fetchPage(currentUrl);
             }
             const cards = SITE.findCards(pageDocument);
@@ -345,8 +425,22 @@
             currentUrl = SITE.findNextUrl(pageDocument, currentUrl);
             if (!currentUrl || state.stopRequested) break;
             setStatus(`等待后读取第 ${state.page + 1} 页...`);
+            if (agentTask) {
+                agentSaveScanSession();
+                const delaySeconds = Math.max(1, Number(settings.pageDelaySeconds) || agentTiming.pageDelaySeconds);
+                const message = `第 ${state.page} 页已完成，等待约 ${delaySeconds} 秒后由浏览器正常打开第 ${state.page + 1} 页。`;
+                agentShowOverlay("SEEK 正在准备下一页", `${message} 请勿操作此窗口。`);
+                await agentProgress("page_wait", message, { ...agentProgressStats(), page: state.page });
+                await sleep(jitterMs(delaySeconds));
+                if (state.stopRequested || agentStopRequested) break;
+                await agentBeforePlatformAccess(`打开 SEEK 第 ${state.page + 1} 页`);
+                if (state.stopRequested || agentStopRequested) break;
+                location.assign(agentContinuationUrl(currentUrl));
+                return true;
+            }
             await sleep(jitterMs(settings.pageDelaySeconds));
         }
+        return false;
     }
 
     async function fetchPage(url) {
@@ -381,7 +475,7 @@
             }
             if (!classification.matchedKeywords.length && includeRules.length) continue;
             state.matched += 1;
-            if (isSeen(job)) {
+            if (!agentTask && isSeen(job)) {
                 state.skippedSeen += 1;
                 continue;
             }
@@ -422,7 +516,7 @@
 
     function finishWithSummary(includeRules, excludeRules) {
         const results = Array.from(state.results.values()).sort(compareJobs);
-        if (settings.autoMarkSeen) {
+        if (!agentTask && settings.autoMarkSeen) {
             results.forEach((job) => markSeen(job, "summary-generated"));
             saveHistory();
         }
@@ -602,6 +696,30 @@
         updateCounters();
         setStatus("已清空历史记录");
         log("已清空已看记录。", "warn");
+    }
+
+    function localDateKey(value) {
+        const date = new Date(value || "");
+        if (!Number.isFinite(date.getTime())) return "";
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
+    }
+
+    function clearHistoryForDate(dateKey) {
+        const removedJobs = new Set();
+        let removedEntries = 0;
+        for (const [key, record] of Object.entries(historyStore.entries)) {
+            const recordDate = localDateKey(record?.firstSeenAt || record?.lastSeenAt);
+            if (recordDate !== dateKey) continue;
+            removedJobs.add(record?.id ? `id:${record.id}` : record?.link ? `link:${record.link}` : key);
+            delete historyStore.entries[key];
+            removedEntries += 1;
+        }
+        saveHistory();
+        updateCounters();
+        return { jobs: removedJobs.size, entries: removedEntries };
     }
 
     function showTextModal(title, initialText, onConfirm) {
@@ -888,6 +1006,7 @@
         gmSet(AGENT.taskKey, null);
         gmSet(AGENT.pauseKey, "");
         gmSet(AGENT.preflightKey, null);
+        agentClearScanSession();
         gmSet(AGENT.accessThrottleKey, { count: 0, cooldownUntil: 0, updatedAt: Date.now() });
         setStatus("Worker 历史记录已清空");
         log("Job Agent 已清空 SEEK Worker 历史记录。", "warn");
@@ -941,6 +1060,28 @@
         agentHideOverlay();
     }
 
+    function agentRunDatedHistoryClear(params, dateKey) {
+        const result = clearHistoryForDate(dateKey);
+        const detail = `已删除 ${dateKey} 首次记录的 ${result.jobs} 个 SEEK 职位（${result.entries} 个历史键）。Agent 记录和其他平台未受影响。`;
+        agentShowOverlay("SEEK 指定日期历史已清理", detail);
+        setStatus(detail);
+        log(detail, "warn");
+        try {
+            window.opener?.postMessage({ type: "job-agent-seek-history-day-cleared", platform: AGENT.platform, date: dateKey, ...result }, AGENT.apiBase);
+            window.opener?.focus();
+        } catch (error) {
+            console.warn("Job Agent could not report dated history cleanup", error);
+        }
+        params.delete("jobAgentClearHistoryDate");
+        history.replaceState(null, "", `${location.pathname}${params.size ? `?${params}` : ""}`);
+        setTimeout(() => {
+            window.close();
+            setTimeout(() => {
+                if (!window.closed) agentHideOverlay();
+            }, 250);
+        }, 1600);
+    }
+
     function agentWorkerId() {
         let workerId = String(gmGet(AGENT.workerKey, "") || "");
         if (!workerId) {
@@ -957,12 +1098,57 @@
 
     function agentHumanBlockReason() {
         const path = location.pathname.toLowerCase();
-        if (/(captcha|challenge|checkpoint|authwall|login)/.test(path)) return "The site requires sign-in or a security check in this worker tab.";
-        const text = (document.body?.innerText || "").slice(0, 16000);
-        if (/captcha|verify you are human|unusual traffic|security check|robot check/i.test(text)) {
-            return "The site requested a manual security verification in this worker tab.";
+        if (/(captcha|challenge|checkpoint|authwall|login)/.test(path)) return "检测到登录页或安全验证页。请在 Worker 标签页完成登录或验证，然后点击“继续”。";
+        const challengePattern = /verify (?:that )?you(?:'re| are) (?:a )?human|confirm (?:that )?you(?:'re| are) human|are you (?:a )?robot|unusual traffic|complete (?:the )?security (?:check|verification)|security verification required|checking (?:your )?browser|access (?:has been )?blocked/i;
+        const visibleChallenge = Array.from(document.querySelectorAll("iframe[src*='captcha' i], iframe[src*='challenge' i], iframe[title*='captcha' i], [id*='captcha' i], [data-testid*='captcha' i], [data-automation*='captcha' i], form[action*='challenge' i]"))
+            .some(agentVisible);
+        if (visibleChallenge) {
+            return "检测到可见的安全验证。请在 Worker 标签页完成验证，然后点击“继续”。";
         }
+        const prominentText = Array.from(document.querySelectorAll("h1, h2, [role='alert'], [role='dialog']"))
+            .filter(agentVisible)
+            .slice(0, 30)
+            .map((element) => element.innerText || element.textContent || "")
+            .join("\n");
+        if (challengePattern.test(prominentText)) {
+            return "检测到可见的安全验证。请在 Worker 标签页完成验证，然后点击“继续”。";
+        }
+        if (SITE.findCards(document).some(agentVisible)) return null;
+        const text = `${document.title || ""}\n${(document.body?.innerText || "").slice(0, 16000)}`;
+        if (challengePattern.test(text)) return "检测到可见的安全验证。请在 Worker 标签页完成验证，然后点击“继续”。";
         return null;
+    }
+
+    function agentRateLimitPageDetected() {
+        const text = `${document.title || ""}\n${(document.body?.innerText || "").slice(0, 20000)}`;
+        return /too many requests|rate limit|temporarily blocked|request blocked|http\s*429|error\s*429|status\s*429|429\s+(?:too many|request)/i.test(text);
+    }
+
+    async function agentRecoverRateLimitedPage() {
+        const restored = agentLoadScanSession();
+        if (restored) state = restored;
+        if (state.rateLimitRetries >= 2) {
+            const reason = "SEEK 连续返回 429，自动冷却重试两次后仍未恢复。请稍后重新运行该任务。";
+            agentClearScanSession();
+            return agentPause(reason, { results: [...state.results.values()] });
+        }
+        state.rateLimitRetries += 1;
+        agentSaveScanSession();
+        const cooldownMs = Math.max(60_000, agentTiming.cooldownMinutes * 60_000);
+        gmSet(AGENT.accessThrottleKey, {
+            count: agentTiming.accessLimit,
+            cooldownUntil: Date.now() + cooldownMs,
+            updatedAt: Date.now()
+        });
+        const message = `SEEK 返回 429，正在按访问设置休息 ${agentTiming.cooldownMinutes} 分钟后自动重试当前页（${state.rateLimitRetries}/2）。`;
+        agentShowOverlay("SEEK 访问频率受限", `${message} 请勿操作此窗口。`);
+        setStatus(message);
+        log(message, "warn");
+        agentStartHeartbeat();
+        await agentBeforePlatformAccess("重新打开当前 SEEK 页面");
+        agentStopHeartbeat();
+        if (agentStopRequested) return;
+        location.reload();
     }
 
     function agentTaskUrl(task) {
@@ -976,9 +1162,13 @@
         return url.href;
     }
 
+    function agentParam(params, name) {
+        return params.get(name) ?? params.get(name.toLowerCase());
+    }
+
     function agentOnTaskPage(task) {
         const params = new URL(location.href).searchParams;
-        return params.get("jobAgentTask") === task.id && params.get("jobAgentRun") === task.runId;
+        return agentParam(params, "jobAgentTask") === task.id && agentParam(params, "jobAgentRun") === task.runId;
     }
 
     function agentRequest(method, path, payload) {
@@ -1000,6 +1190,40 @@
                 ontimeout() { reject(new Error("The local Job Agent request timed out.")); }
             });
         });
+    }
+
+    async function agentMigrateWorkerHistory(reportEmpty = false) {
+        const records = Object.entries(historyStore.entries || {}).map(([key, record]) => ({ ...(record || {}), key: record?.key || key }));
+        if (!records.length && !reportEmpty) return { ok: true, received: 0, skipped: true };
+        try {
+            const response = await agentRequest("POST", "/api/worker/history/import", { platform: AGENT.platform, records });
+            if (response.clearLocalHistory) {
+                historyStore = { schema: "seek-helper-history", version: 1, entries: {} };
+                saveHistory();
+                log(`已把 ${records.length} 条 SEEK Worker 历史迁移到 Job Agent；后续 Agent 任务统一在本地平台判重。`);
+            }
+            return { ok: true, received: records.length, ...response };
+        } catch (error) {
+            log(`Worker 历史暂未迁移，已保留本地副本：${error.message || String(error)}`, "warn");
+            return { ok: false, received: records.length, error: error.message || String(error) };
+        }
+    }
+
+    async function agentRunHistoryMigration(params) {
+        agentShowOverlay("正在迁移 SEEK 历史", "只整理已看记录，不会搜索、领取或运行任何任务。");
+        const result = await agentMigrateWorkerHistory(true);
+        if (!result?.ok) {
+            agentShowOverlay("SEEK 历史迁移失败", `${result?.error || "未知错误"}。原 Worker 历史已保留。`);
+            window.opener?.postMessage({ type: "job-agent-history-migration-failed", platform: AGENT.platform, error: result?.error || "未知错误" }, AGENT.apiBase);
+            return;
+        }
+        const migration = result.migration || {};
+        agentShowOverlay("SEEK 历史迁移完成", `收到 ${migration.received || 0} 条；新增 ${migration.imported || 0} 条，已有 ${migration.covered || 0} 条。`);
+        window.opener?.postMessage({ type: "job-agent-history-migration-progress", platform: AGENT.platform, migration, cleanup: result.cleanup }, AGENT.apiBase);
+        const next = agentParam(params, "jobAgentMigrationNext");
+        if (next) return setTimeout(() => window.location.replace(next), 900);
+        window.opener?.postMessage({ type: "job-agent-history-migration-finished", platform: AGENT.platform, migration, cleanup: result.cleanup }, AGENT.apiBase);
+        setTimeout(() => window.close(), 1200);
     }
 
     function agentScheduleClaim(runId, delay = 7000) {
@@ -1081,6 +1305,7 @@
 
     async function agentStartTask() {
         if (!agentTask || agentStartedTaskId === agentTask.id || state.running) return;
+        const continuingScan = Boolean(agentLoadScanSession());
         const humanReason = agentHumanBlockReason();
         if (humanReason) return agentPause(humanReason);
         const deadline = Date.now() + 16000;
@@ -1092,9 +1317,10 @@
         const excludeKeywords = Array.isArray(agentTask.exclusionKeywords) ? agentTask.exclusionKeywords.join("\n") : "";
         ui.exclude.value = excludeKeywords;
         settings = { ...settings, include: includeKeywords, exclude: excludeKeywords, pageDelaySeconds: agentTiming.pageDelaySeconds };
+        ui.pageDelaySeconds.value = String(agentTiming.pageDelaySeconds);
         log(`Job Agent 访问节奏：连续访问 ${agentTiming.accessLimit} 次后休息 ${agentTiming.cooldownMinutes} 分钟；翻页 ${agentTiming.pageDelaySeconds} 秒，每份 JD ${agentTiming.jdIntervalSeconds} 秒。`);
         agentShowOverlay("SEEK 正在运行", `平台搜索“${agentSearchKeyword(agentTask.keyword)}” · 包含 ${parseRules(agentTask.keyword).join("、")} · ${agentTask.location}。请勿操作此窗口。`);
-        await agentBeforePlatformAccess("搜索结果页");
+        if (!continuingScan) await agentBeforePlatformAccess("搜索结果页");
         agentStartHeartbeat();
         const resultsReady = await agentWaitForSearchResults();
         if (!resultsReady) log("等待后仍未发现职位卡；将按当前页面结果生成空汇总。", "warn");
@@ -1352,7 +1578,7 @@
                 jobs
             });
             plan = response.plan;
-            log(`Job Agent 标题初筛：需获取 ${response.counts.fetch} 份 JD，复用 ${response.counts.reuse} 份，标题拒绝 ${response.counts.rejected} 份。`);
+            log(`Job Agent 中央预筛：发现 ${response.counts.total} 个，历史跳过 ${response.counts.seen} 个，复用 ${response.counts.reuse} 个，本地拒绝 ${response.counts.rejected} 个，需获取 ${response.counts.fetch} 份 JD。`);
         } catch (error) {
             log(`标题初筛计划暂不可用，将为全部职位尝试获取 JD：${error.message}`, "warn");
             plan = jobs.map((_, index) => ({ index, action: "fetch" }));
@@ -1364,9 +1590,15 @@
         for (let index = 0; index < jobs.length; index += 1) {
             if (agentStopRequested) break;
             const job = jobs[index];
-            const action = planByIndex.get(index)?.action || "fetch";
+            const planItem = planByIndex.get(index);
+            const action = planItem?.action || "fetch";
+            if (planItem?.jobId) job.agentJobId = planItem.jobId;
             if (action === "reject") {
                 job.descriptionFetchStatus = "skipped-rejected";
+                continue;
+            }
+            if (action === "skip_seen") {
+                job.descriptionFetchStatus = "skipped-history";
                 continue;
             }
             if (action === "reuse") {
@@ -1455,6 +1687,7 @@
             }
             gmSet(AGENT.taskKey, null);
             gmSet(AGENT.pauseKey, "");
+            agentClearScanSession();
             agentTask = null;
             agentStartedTaskId = null;
             agentShowOverlay("本项任务已完成", "正在检查队列中的下一项任务。");
@@ -1474,7 +1707,7 @@
     function agentReportSummary(payload) {
         if (!agentTask) return;
         const failureMessage = String(agentScanFailure?.message || agentScanFailure || "");
-        if (/captcha|verify|human|unusual traffic|security|sign.?in/i.test(failureMessage)) {
+        if (/captcha|verify|human|unusual traffic|security|sign.?in|\b429\b|rate limit|too many requests/i.test(failureMessage)) {
             void agentPause(failureMessage, payload);
         } else {
             void agentSubmit(failureMessage ? "failed" : "completed", failureMessage || null, payload);
@@ -1639,24 +1872,34 @@
     }
 
     function agentSeekKeywordForSearch(value) {
-        const keyword = String(value || "").trim();
-        // SEEK rewrites a direct bare `graduate` URL into a broad location route.
-        // Keep the stable exact query internally, then clean only the visible field.
+        const keyword = String(value || "").trim().replace(/^["']+|["']+$/g, "");
+        // SEEK currently treats bare `graduate` as a role refinement, which
+        // broadens the result set and can omit normal keyword matches.
         return /^graduate$/i.test(keyword) ? `"${keyword}"` : keyword;
     }
 
     function agentShowNaturalSeekKeyword(value) {
         const cleanKeyword = String(value || "").trim().replace(/^["']+|["']+$/g, "");
         if (!cleanKeyword) return;
+        const quotedKeyword = new RegExp(`["']${cleanKeyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`, "gi");
         const apply = () => {
             const keyword = agentFirst(["input[data-automation='search-keyword']", "input[name='keywords']", "input[placeholder*='looking for' i]", "input[placeholder*='keywords' i]"]);
-            if (!keyword || agentNormalizeSeekKeyword(keyword.value) !== cleanKeyword.toLowerCase()) return;
-            // Do not dispatch an input event: SEEK must retain the exact internal query.
-            keyword.value = cleanKeyword;
+            if (keyword && agentNormalizeSeekKeyword(keyword.value) === cleanKeyword.toLowerCase()) {
+                // Do not dispatch an input event: SEEK must retain the exact internal query.
+                keyword.value = cleanKeyword;
+            }
+            if (typeof document === "undefined") return;
+            document.title = document.title.replace(quotedKeyword, cleanKeyword);
+            document.querySelectorAll("h1").forEach((heading) => {
+                const walker = document.createTreeWalker(heading, NodeFilter.SHOW_TEXT);
+                let textNode;
+                while ((textNode = walker.nextNode())) {
+                    textNode.nodeValue = textNode.nodeValue.replace(quotedKeyword, cleanKeyword);
+                }
+            });
         };
         apply();
-        setTimeout(apply, 150);
-        setTimeout(apply, 600);
+        [150, 600, 1800, 4000].forEach((delay) => setTimeout(apply, delay));
     }
 
     function agentSeekSearchState() {
@@ -1830,12 +2073,22 @@
 
     async function agentBoot() {
         const params = new URL(location.href).searchParams;
+        const migrationParams = new URLSearchParams(location.hash.replace(/^#/, ""));
+        if (window.name === "job-agent-history-migration" || agentParam(migrationParams, "jobAgentHistoryMigration") === "1" || agentParam(params, "jobAgentHistoryMigration") === "1") {
+            await agentRunHistoryMigration(agentParam(migrationParams, "jobAgentHistoryMigration") === "1" ? migrationParams : params);
+            return;
+        }
+        const clearHistoryDate = params.get("jobAgentClearHistoryDate");
+        if (/^\d{4}-\d{2}-\d{2}$/.test(clearHistoryDate || "")) {
+            agentRunDatedHistoryClear(params, clearHistoryDate);
+            return;
+        }
         if (params.get("jobAgentReset") === "1") {
             agentRunHistoryReset(params);
             return;
         }
-        const preflightMode = params.get("jobAgentPreflight") === "1" || params.get("jobagentpreflight") === "1" || agentIsManagedPreflightWindow();
-        const workerMode = params.get("jobAgentWorker") === "1" || agentIsManagedWorkerWindow();
+        const preflightMode = agentParam(params, "jobAgentPreflight") === "1" || agentIsManagedPreflightWindow();
+        const workerMode = agentParam(params, "jobAgentWorker") === "1" || agentIsManagedWorkerWindow();
         if (!preflightMode && !workerMode) return;
         if (preflightMode) {
             agentShowOverlay("正在验证 SEEK 搜索条件", "Job Agent 正在填写关键词、地点和时间范围。请勿操作此窗口。");
@@ -1843,11 +2096,27 @@
             if (agentIsManagedPreflightWindow()) await agentRunPendingPreflight();
             return;
         }
-        let runId = params.get("jobAgentRun") || agentStoredTask()?.runId;
+        await agentMigrateWorkerHistory();
+        let runId = agentParam(params, "jobAgentRun") || agentStoredTask()?.runId;
         agentTask = agentStoredTask();
+        // A managed landing page has a run id but no task id. It must claim the
+        // current attempt instead of resuming a cached copy of an earlier retry.
+        if (runId && !agentParam(params, "jobAgentTask")) {
+            gmSet(AGENT.taskKey, null);
+            agentClearScanSession();
+            agentTask = null;
+        }
         if (agentTask && runId && agentTask.runId !== runId) {
             gmSet(AGENT.taskKey, null);
+            agentClearScanSession();
             agentTask = null;
+        }
+        if (agentTask && agentRateLimitPageDetected()) {
+            agentApplyTiming(agentTask.workerTiming);
+            await agentRefreshTiming(agentTask.runId);
+            agentTask.workerTiming = { ...agentTiming };
+            gmSet(AGENT.taskKey, agentTask);
+            return agentRecoverRateLimitedPage();
         }
         const humanReason = agentHumanBlockReason();
         if (agentTask && humanReason) return agentPause(humanReason);
@@ -1857,6 +2126,7 @@
             await agentRefreshTiming(agentTask.runId);
             agentTask.workerTiming = { ...agentTiming };
             gmSet(AGENT.taskKey, agentTask);
+            agentShowNaturalSeekKeyword(agentSearchKeyword(agentTask.keyword));
             return agentStartTask();
         }
         if (!runId && agentIsManagedWorkerWindow()) runId = await agentFindActiveRun();
@@ -1871,6 +2141,8 @@
         void agentRunOnDemandJd(agentOnDemandJd, agentJdBatch);
     } else if (agentJdChildRequest) {
         void agentRunJdChild(agentJdChildRequest);
+    } else if (agentParam(agentHashParams, "jobAgentHistoryMigration") === "1" || agentParam(new URL(location.href).searchParams, "jobAgentHistoryMigration") === "1") {
+        void agentBoot();
     } else if (!location.pathname.startsWith("/job/")) {
         init();
         void agentBoot();

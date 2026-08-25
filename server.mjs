@@ -9,6 +9,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   aiPrivateConfig,
   aiStatus,
+  answerJobQuestions,
   configureAi,
   evaluateJdWithAi,
   generateProfile,
@@ -18,7 +19,6 @@ import {
 import {
   localJdScreen,
   normalizeJob,
-  strongSourceKey,
   validateProfileDraft
 } from "./src/screening.mjs";
 import {
@@ -29,6 +29,7 @@ import {
 } from "./src/learning.mjs";
 import { normalizeKeywordAlternatives, primarySearchKeyword } from "./src/task-keywords.mjs";
 import { createStorage, newId } from "./src/storage.mjs";
+import { findDuplicate, strongIdentityKeys } from "./src/job-identity.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -61,6 +62,9 @@ await storage.update((state) => {
   backfillPreferenceExclusionSuggestions(state);
   compactPendingExclusionSuggestions(state);
   removeCoveredPendingExclusionSuggestions(state);
+  state.legacyWorkerHistory ??= [];
+  state.workerHistoryMigrations ??= [];
+  normalizeUnifiedHistory(state);
 });
 
 const maxBodyBytes = 7 * 1024 * 1024;
@@ -150,6 +154,12 @@ function buildBootstrap(state) {
     reviewReflections: state.reviewReflections,
     preferenceModel: state.preferenceModel,
     exclusionSuggestions: state.exclusionSuggestions,
+    unifiedHistory: {
+      agentJobs: state.jobs.length,
+      migratedWorkerRecords: (state.legacyWorkerHistory ?? []).length,
+      totalKnownJobs: state.jobs.filter((job) => !job.duplicateOf).length + (state.legacyWorkerHistory ?? []).length,
+      migrations: (state.workerHistoryMigrations ?? []).slice(0, 10)
+    },
     jdRetryBatches: [...jdRetryBatches.values()].map((batch) => ({
       id: batch.id,
       total: batch.jobIds.length,
@@ -619,23 +629,36 @@ function isAiRoleRejectedSignal(job) {
       && job.learningSignals?.exclusionKeywords?.length));
 }
 
-function safeTaskCategoryInput(input, existing = null) {
+function safeTaskCategoryInput(input, existing = null, state = null) {
   const name = String(input.name ?? "").trim().slice(0, 80);
   const incomingTasks = Array.isArray(input.tasks) ? input.tasks.slice(0, 80) : [];
   if (!name) throw new Error("Enter a category name.");
   if (!incomingTasks.length) throw new Error("Add at least one task to the category.");
   const existingTasks = new Map((existing?.tasks ?? []).map((task) => [task.id, task]));
   const usedIds = new Set();
+  const usedTaskKeys = new Set();
   const tasks = incomingTasks.map((task) => {
     const taskInput = safeRoutineTaskInput(task);
+    const taskKey = [taskInput.platform, taskInput.keyword, taskInput.location.toLowerCase(), taskInput.postedWithinDays].join("\u0000");
+    if (usedTaskKeys.has(taskKey)) throw new Error("The same task cannot be added to a combination twice.");
+    usedTaskKeys.add(taskKey);
     const requestedId = String(task.id ?? "");
     const previous = existingTasks.get(requestedId);
     const id = previous && !usedIds.has(requestedId) ? requestedId : newId("category_task");
+    const sourceValidationId = String(task.sourceValidationId ?? "");
+    const sourceValidation = sourceValidationId
+      ? state?.validations.find((validation) => validation.id === sourceValidationId)
+      : null;
+    if (sourceValidationId && (!sourceValidation || sourceValidation.status !== "VALID" || !sameRoutineTask(sourceValidation, taskInput))) {
+      throw new Error("The selected preflighted task is no longer valid. Refresh and select it again.");
+    }
     usedIds.add(id);
     return {
       id,
       ...taskInput,
-      validationId: previous && sameRoutineTask(previous, taskInput) ? previous.validationId ?? null : null
+      validationId: previous && sameRoutineTask(previous, taskInput)
+        ? previous.validationId ?? sourceValidation?.id ?? null
+        : sourceValidation?.id ?? null
     };
   });
   return { name, tasks };
@@ -699,7 +722,8 @@ function resetValidationForPreflight(state, validation, taskInput = {}) {
 function categoryTaskValidation(state, category, task) {
   const candidates = [
     state.validations.find((record) => record.id === task.validationId),
-    state.validations.find((record) => record.categoryId === category.id && record.categoryTaskId === task.id)
+    state.validations.find((record) => record.categoryId === category.id && record.categoryTaskId === task.id),
+    state.validations.find((record) => record.status === "VALID" && sameRoutineTask(record, task))
   ].filter(Boolean);
   return candidates.find((record) => sameRoutineTask(record, task)) ?? null;
 }
@@ -804,8 +828,9 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
   const run = runId ? state.runs.find((item) => item.id === runId) : null;
   if (runId && !run) throw new Error("Run was not found.");
   if (run) ensureRunCounterShape(run);
-  const existingByKey = new Map(state.jobs.map((job) => [strongSourceKey(job), job]).filter(([key]) => key));
+  const existingPool = [...(state.legacyWorkerHistory ?? []), ...state.jobs];
   const jobs = [];
+  let addedCount = 0;
 
   for (const rawJob of rawJobs) {
     const candidate = normalizeJob(task ? {
@@ -816,10 +841,26 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
       searchLocation: task.location,
       searchPostedWithinDays: task.postedWithinDays
     } : rawJob, { thresholds: state.settings.thresholds, runId, preferenceModel: state.preferenceModel });
-    const key = strongSourceKey(candidate);
-    const existing = key ? existingByKey.get(key) : null;
+    const candidateKeys = strongIdentityKeys(candidate);
+    const existingInTask = task && candidateKeys.length
+      ? state.jobs.find((job) => job.runId === runId && job.runTaskId === task.id
+        && strongIdentityKeys(job).some((key) => candidateKeys.includes(key)))
+      : null;
+    if (existingInTask) {
+      jobs.push(existingInTask);
+      continue;
+    }
+    const duplicate = findDuplicate(candidate, existingPool);
+    const existing = duplicate?.existing ?? null;
     if (existing) {
       candidate.duplicateOf = existing.id;
+      candidate.deduplication = {
+        type: duplicate.type,
+        confidence: duplicate.confidence,
+        matchedJobId: existing.id,
+        matchedSource: existing.source,
+        decidedAt: new Date().toISOString()
+      };
       if (!candidate.description && existing.description) {
         candidate.description = existing.description;
         candidate.descriptionSource = existing.descriptionSource;
@@ -844,9 +885,10 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
         };
       }
     }
-    if (key) existingByKey.set(key, candidate);
     state.jobs.push(candidate);
+    existingPool.push(candidate);
     jobs.push(candidate);
+    addedCount += 1;
     if (run) {
       const counters = run.counters[candidate.source];
       if (counters) {
@@ -857,16 +899,51 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
     }
   }
 
-  state.importBatches.unshift({
-    id: newId("import"),
-    label: String(label).slice(0, 120),
-    runId,
-    taskId: task?.id ?? null,
-    importedAt: new Date().toISOString(),
-    count: jobs.length
-  });
-  state.importBatches = state.importBatches.slice(0, 100);
+  if (addedCount) {
+    state.importBatches.unshift({
+      id: newId("import"),
+      label: String(label).slice(0, 120),
+      runId,
+      taskId: task?.id ?? null,
+      importedAt: new Date().toISOString(),
+      count: addedCount
+    });
+    state.importBatches = state.importBatches.slice(0, 100);
+  }
   return jobs;
+}
+
+function mergeWorkerResultJobs(state, rawJobs, { run, task }) {
+  const merged = [];
+  const missing = [];
+  for (const rawJob of rawJobs) {
+    const agentJobId = String(rawJob?.agentJobId || "").trim();
+    const existing = agentJobId
+      ? state.jobs.find((job) => job.id === agentJobId && job.runId === run.id && job.runTaskId === task.id)
+      : null;
+    if (!existing) {
+      missing.push(rawJob);
+      continue;
+    }
+    const fetched = rawJob.descriptionFetchStatus === "fetched" || rawJob.descriptionSource === "detail-page";
+    if (fetched) {
+      existing.description = String(rawJob.description || "").replace(/\s+/g, " ").trim() || existing.description;
+      existing.descriptionSource = "detail-page";
+      existing.descriptionFetchStatus = "fetched";
+      existing.descriptionFetchError = null;
+      existing.descriptionFetchedAt = rawJob.descriptionFetchedAt || new Date().toISOString();
+    } else if (!existing.aiReview || existing.aiReview.status !== "reused") {
+      existing.descriptionFetchStatus = rawJob.descriptionFetchStatus || existing.descriptionFetchStatus;
+      existing.descriptionFetchError = rawJob.descriptionFetchError || null;
+    }
+    merged.push(existing);
+  }
+  if (missing.length) merged.push(...addJobsToState(state, missing, {
+    runId: run.id,
+    label: `${task.platform} worker result fallback`,
+    task
+  }));
+  return merged;
 }
 
 function isRejectedBeforeJd(job) {
@@ -891,6 +968,13 @@ function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
   const profile = state.profiles.find((item) => item.id === state.activeProfileId);
   const aiConfigured = aiStatus().configured;
   for (const job of jobs) {
+    if (job.duplicateOf) {
+      if (!hasAiJdReview(job)) {
+        job.screening = { ...job.screening, screeningStatus: "DUPLICATE_SKIPPED" };
+        job.aiReview = { status: "skipped", reason: "unified_history_duplicate", duplicateOf: job.duplicateOf };
+      }
+      continue;
+    }
     if (isRejectedBeforeJd(job)) {
       job.aiReview = { status: "skipped", reason: "title_rejected" };
       continue;
@@ -968,6 +1052,14 @@ function retryableFailedJd(job) {
     && (job.descriptionFetchStatus === "failed" || job.screening?.screeningStatus === "JD_FETCH_FAILED" || staleFetch));
 }
 
+function retryableFailedAiReview(job) {
+  return Boolean(job
+    && job.screening?.screeningStatus === "AI_ERROR"
+    && !isRejectedBeforeJd(job)
+    && hasCompleteDescription(job)
+    && !queuedAutoReviewIds.has(job.id));
+}
+
 async function advanceJdRetryBatch(batchId) {
   const batch = jdRetryBatches.get(batchId);
   if (!batch) return { done: true, batchId, total: 0, completed: 0, remaining: 0 };
@@ -1031,6 +1123,7 @@ async function prepareAutoReview(jobId) {
   return storage.update((state) => {
     const job = state.jobs.find((item) => item.id === jobId);
     if (!job || hasAiJdReview(job) || isRejectedBeforeJd(job)) return null;
+    const retryRequested = job.aiReview?.retryRequested === true;
     const profile = state.profiles.find((item) => item.id === state.activeProfileId);
     const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
     if (run) ensureRunCounterShape(run);
@@ -1049,7 +1142,7 @@ async function prepareAutoReview(jobId) {
       job.aiReview = { status: "blocked", reason: "AI is not configured." };
       return null;
     }
-    if (!canUseAiForRun(run)) {
+    if (!canUseAiForRun(run) && !retryRequested) {
       if (run) run.counters.ai.budgetSkipped += 1;
       job.screening.screeningStatus = "AI_BUDGET_SKIPPED";
       job.aiReview = { status: "blocked", reason: "The automatic AI review limit for this run was reached." };
@@ -1058,12 +1151,13 @@ async function prepareAutoReview(jobId) {
     if (run) run.counters.ai.calls += 1;
     const startedAt = new Date().toISOString();
     job.screening = { ...job.screening, screeningStatus: "AI_REVIEWING", engine: "ai-pending" };
-    job.aiReview = { status: "reviewing", startedAt };
+    job.aiReview = { status: "reviewing", startedAt, retryRequested };
     return {
       job: JSON.parse(JSON.stringify(job)),
       profile: JSON.parse(JSON.stringify(profile.profile)),
       thresholds: JSON.parse(JSON.stringify(state.settings.thresholds)),
-      preferenceModel: state.preferenceModel ? JSON.parse(JSON.stringify(state.preferenceModel)) : null
+      preferenceModel: state.preferenceModel ? JSON.parse(JSON.stringify(state.preferenceModel)) : null,
+      retryRequested
     };
   });
 }
@@ -1099,6 +1193,7 @@ async function processAutoReview(jobId) {
         ensureRunCounterShape(run);
         run.counters.ai.jdReviewed += 1;
         recordAiUsage(run, evaluated.usage);
+        if (prepared.retryRequested) recalculateRunCounters(state, run);
       }
     });
   } catch (error) {
@@ -1117,7 +1212,8 @@ async function processAutoReview(jobId) {
       const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
       if (run) {
         ensureRunCounterShape(run);
-        run.counters.ai.errors += 1;
+        if (prepared.retryRequested) recalculateRunCounters(state, run);
+        else run.counters.ai.errors += 1;
       }
     });
   }
@@ -1207,14 +1303,143 @@ function reconcileLearningAfterJobDeletion(state, removedJobs) {
   });
 }
 
+function applyDuplicate(candidate, duplicate) {
+  candidate.duplicateOf = duplicate?.existing?.id ?? null;
+  candidate.deduplication = duplicate ? {
+    type: duplicate.type,
+    confidence: duplicate.confidence,
+    matchedJobId: duplicate.existing.id,
+    matchedSource: duplicate.existing.source,
+    decidedAt: new Date().toISOString()
+  } : null;
+  return candidate;
+}
+
+function rebuildDuplicateLinks(state) {
+  const previous = [...(state.legacyWorkerHistory ?? [])];
+  for (const job of state.jobs) {
+    applyDuplicate(job, findDuplicate(job, previous));
+    previous.push(job);
+  }
+}
+
+function legacyHistoryRecord(platform, input) {
+  const raw = input && typeof input === "object" ? input : { key: input };
+  const source = String(platform || raw.source || raw.site || "").toLowerCase();
+  if (!allowedPlatforms.has(source)) return null;
+  const key = String(raw.key || raw.legacyKey || "").replace(/\s+/g, " ").trim();
+  const keyJobId = key.match(/^(?:job|(?:linkedin|indeed|seek):job):(.+)$/i)?.[1] || "";
+  const inputId = /^(?:job|legacy_history)_/i.test(String(raw.id || "")) ? "" : raw.id;
+  const sourceJobId = String(raw.sourceJobId || raw.jobId || inputId || keyJobId).trim() || null;
+  const keyUrl = key.match(/^(?:url|(?:linkedin|indeed|seek):url):(.+)$/i)?.[1] || "";
+  const jobUrl = String(raw.jobUrl || raw.link || keyUrl).trim() || null;
+  const fpParts = key.match(/^fp:(.+?)\|(.+)$/i);
+  const explicitTitle = String(raw.title || "").replace(/\s+/g, " ").trim();
+  const explicitCompany = String(raw.company || "").replace(/\s+/g, " ").trim();
+  const title = explicitTitle || (fpParts?.[2] ? String(fpParts[2]).trim() : "");
+  const company = explicitCompany || (fpParts?.[1] ? String(fpParts[1]).trim() : "");
+  const opaque = !sourceJobId && !jobUrl;
+  if (!sourceJobId && !jobUrl && !title && !key) return null;
+  const identity = [source, sourceJobId, jobUrl, key, title, company, raw.location].map((value) => String(value || "")).join("|");
+  return {
+    id: `legacy_history_${createHash("sha256").update(identity).digest("hex").slice(0, 24)}`,
+    source,
+    sourceJobId,
+    jobUrl,
+    title,
+    company: company || null,
+    location: String(raw.location || "").replace(/\s+/g, " ").trim() || null,
+    firstSeenAt: String(raw.firstSeenAt || raw.firstSeen || raw.createdAt || "").trim() || null,
+    lastSeenAt: String(raw.lastSeenAt || raw.lastSeen || raw.updatedAt || "").trim() || null,
+    legacyKey: key || null,
+    opaque,
+    importedAt: new Date().toISOString(),
+    origin: "tampermonkey-history-migration"
+  };
+}
+
+function normalizeUnifiedHistory(state) {
+  state.legacyWorkerHistory ??= [];
+  const before = state.legacyWorkerHistory.length;
+  const compacted = [];
+  let mergedAliases = 0;
+  let ignored = 0;
+  for (const input of state.legacyWorkerHistory) {
+    const record = legacyHistoryRecord(input?.source, input);
+    if (!record) {
+      ignored += 1;
+      continue;
+    }
+    record.id = input.id || record.id;
+    record.importedAt = input.importedAt || record.importedAt;
+    const duplicate = findDuplicate(record, compacted);
+    if (duplicate) {
+      mergedAliases += 1;
+      continue;
+    }
+    compacted.push(record);
+  }
+  state.legacyWorkerHistory = compacted;
+  rebuildDuplicateLinks(state);
+  for (const run of state.runs) recalculateRunCounters(state, run);
+  return {
+    before,
+    after: compacted.length,
+    mergedAliases,
+    ignored,
+    opaque: compacted.filter((record) => record.opaque).length,
+    agentOccurrences: state.jobs.length,
+    duplicateOccurrences: state.jobs.filter((job) => job.duplicateOf).length,
+    totalKnownJobs: state.jobs.filter((job) => !job.duplicateOf).length + compacted.length
+  };
+}
+
+function importLegacyWorkerHistory(state, platform, records) {
+  state.legacyWorkerHistory ??= [];
+  state.workerHistoryMigrations ??= [];
+  const pool = [...state.legacyWorkerHistory, ...state.jobs];
+  let imported = 0;
+  let covered = 0;
+  let ignored = 0;
+  let preservedOpaque = 0;
+  for (const input of records.slice(0, 20_000)) {
+    const record = legacyHistoryRecord(platform, input);
+    if (!record) {
+      ignored += 1;
+      continue;
+    }
+    if (findDuplicate(record, pool)) {
+      covered += 1;
+      continue;
+    }
+    state.legacyWorkerHistory.push(record);
+    pool.push(record);
+    imported += 1;
+    if (record.opaque) preservedOpaque += 1;
+  }
+  const migration = {
+    id: newId("history_migration"),
+    platform,
+    received: records.length,
+    imported,
+    covered,
+    ignored,
+    preservedOpaque,
+    importedAt: new Date().toISOString()
+  };
+  state.workerHistoryMigrations.unshift(migration);
+  state.workerHistoryMigrations = state.workerHistoryMigrations.slice(0, 30);
+  const cleanup = normalizeUnifiedHistory(state);
+  return { migration, cleanup };
+}
+
 function removeJobs(state, predicate) {
   const removedJobs = state.jobs.filter(predicate);
   if (!removedJobs.length) return [];
   const removedIds = new Set(removedJobs.map((job) => job.id));
   state.jobs = state.jobs.filter((job) => !removedIds.has(job.id));
-  for (const job of state.jobs) {
-    if (removedIds.has(job.duplicateOf)) job.duplicateOf = null;
-  }
+  rebuildDuplicateLinks(state);
+  for (const run of state.runs) recalculateRunCounters(state, run);
   reconcileLearningAfterJobDeletion(state, removedJobs);
   return removedJobs;
 }
@@ -1293,6 +1518,12 @@ function updateRunState(run) {
   run.completedAt ??= new Date().toISOString();
 }
 
+function runTaskWorkerIsStale(task, timeoutMs = 30_000) {
+  if (task?.status !== "running") return false;
+  const heartbeat = Date.parse(task.workerHeartbeatAt || task.progress?.updatedAt || task.startedAt || "");
+  return Number.isFinite(heartbeat) && Date.now() - heartbeat > timeoutMs;
+}
+
 function workerLandingUrl(platform, runId) {
   const landing = {
     linkedin: "https://www.linkedin.com/jobs/search/",
@@ -1348,6 +1579,27 @@ async function handleApi(request, response, url) {
   if (request.method === "GET" && path === "/api/bootstrap") {
     return sendJson(response, 200, buildBootstrap(await storage.ensureState()));
   }
+  if (request.method === "POST" && path === "/api/jobs/assistant") {
+    const body = await readJson(request);
+    if (!aiStatus().configured) throw new Error("Configure AI before using the job review assistant.");
+    const question = String(body.question || "").trim();
+    if (question.length < 2) throw new Error("Enter a question about the current jobs.");
+    const requestedIds = [...new Set((Array.isArray(body.jobIds) ? body.jobIds : [])
+      .map((id) => String(id || "").trim()).filter(Boolean))].slice(0, 2_000);
+    const state = await storage.ensureState();
+    const jobsById = new Map(state.jobs.map((job) => [job.id, job]));
+    const jobs = requestedIds.map((id) => jobsById.get(id)).filter(Boolean);
+    if (!jobs.length) throw new Error("The current review view does not contain any jobs for the assistant.");
+    const profile = state.profiles.find((item) => item.id === state.activeProfileId)?.profile ?? null;
+    const result = await answerJobQuestions({
+      question,
+      conversation: body.conversation,
+      profile,
+      jobs,
+      context: body.context
+    });
+    return sendJson(response, 200, result);
+  }
   if (request.method === "PUT" && path === "/api/ai-config") {
     const body = await readJson(request);
     const ai = await saveAiConfig(mergedAiConfig(body));
@@ -1378,7 +1630,9 @@ async function handleApi(request, response, url) {
         importBatches: state.importBatches.length,
         reviewReflections: state.reviewReflections.length,
         preferenceModel: state.preferenceModel ? 1 : 0,
-        exclusionSuggestions: state.exclusionSuggestions.length
+        exclusionSuggestions: state.exclusionSuggestions.length,
+        legacyWorkerHistory: (state.legacyWorkerHistory ?? []).length,
+        workerHistoryMigrations: (state.workerHistoryMigrations ?? []).length
       };
       state.jobs = [];
       state.runs = [];
@@ -1391,6 +1645,8 @@ async function handleApi(request, response, url) {
       state.reviewReflections = [];
       state.preferenceModel = null;
       state.exclusionSuggestions = [];
+      state.legacyWorkerHistory = [];
+      state.workerHistoryMigrations = [];
       return {
         cleared: counts,
         preserved: {
@@ -1599,8 +1855,8 @@ async function handleApi(request, response, url) {
 
   if (request.method === "POST" && path === "/api/task-categories") {
     const body = await readJson(request);
-    const input = safeTaskCategoryInput(body);
     const category = await storage.update((state) => {
+      const input = safeTaskCategoryInput(body, null, state);
       const now = new Date().toISOString();
       const record = {
         id: newId("task_category"),
@@ -1623,7 +1879,7 @@ async function handleApi(request, response, url) {
       const record = state.taskCategories.find((item) => item.id === taskCategoryMatch[1]);
       if (!record) throw new Error("Task category was not found.");
       if (record.builtin) throw new Error("Built-in task categories cannot be edited.");
-      const input = safeTaskCategoryInput(body, record);
+      const input = safeTaskCategoryInput(body, record, state);
       record.name = input.name;
       record.tasks = input.tasks;
       record.updatedAt = new Date().toISOString();
@@ -1990,39 +2246,65 @@ async function handleApi(request, response, url) {
     });
     return sendJson(response, 200, result);
   }
+  if (request.method === "POST" && path === "/api/worker/history/import") {
+    const body = await readJson(request);
+    const platform = String(body.platform || "").toLowerCase();
+    if (!allowedPlatforms.has(platform)) return apiError(response, 400, "A valid Worker platform is required.");
+    if (!Array.isArray(body.records)) return apiError(response, 400, "Worker history records must be an array.");
+    if (body.records.length > 20_000) return apiError(response, 400, "Import at most 20,000 Worker history records at a time.");
+    const result = await storage.update((state) => importLegacyWorkerHistory(state, platform, body.records));
+    return sendJson(response, 200, {
+      ...result,
+      clearLocalHistory: result.migration.ignored === 0
+    });
+  }
+  if (request.method === "POST" && path === "/api/history/normalize") {
+    const cleanup = await storage.update((state) => normalizeUnifiedHistory(state));
+    return sendJson(response, 200, { cleanup });
+  }
   if (request.method === "POST" && path === "/api/worker/title-plan") {
     const body = await readJson(request);
     const rawJobs = Array.isArray(body.jobs) ? body.jobs.slice(0, 1000) : [];
-    const state = await storage.ensureState();
-    const existingByKey = new Map(state.jobs.map((job) => [strongSourceKey(job), job]).filter(([key]) => key));
-    const plan = rawJobs.map((rawJob, index) => {
-      try {
-        const job = normalizeJob(rawJob, {
-          thresholds: state.settings.thresholds,
-          runId: body.runId || null,
-          preferenceModel: state.preferenceModel
-        });
-        const existing = existingByKey.get(strongSourceKey(job));
+    const result = await storage.update((state) => {
+      const run = state.runs.find((item) => item.id === body.runId);
+      const task = run?.tasks.find((item) => item.id === body.taskId);
+      if (!run || !task) throw new Error("Run task was not found.");
+      if (task.status !== "running") throw new Error("Only a running task can submit discovered jobs.");
+      const jobs = rawJobs.length ? addJobsToState(state, rawJobs, {
+        runId: run.id,
+        label: `${task.platform} discovered candidates`,
+        task
+      }) : [];
+      const plan = jobs.map((job, index) => {
+        if (job.duplicateOf) {
+          return hasAiJdReview(job) && job.description
+            ? { index, jobId: job.id, action: "reuse", existingJobId: job.duplicateOf, reason: "Unified Agent history already has a completed AI review." }
+            : { index, jobId: job.id, action: "skip_seen", existingJobId: job.duplicateOf, reason: "Unified Agent history already contains this job." };
+        }
         if (isRejectedBeforeJd(job)) {
-          return { index, action: "reject", reason: job.screening.reason };
+          return { index, jobId: job.id, action: "reject", reason: job.screening.reason };
         }
-        if (existing && hasAiJdReview(existing) && existing.description) {
-          return { index, action: "reuse", existingJobId: existing.id };
-        }
-        return { index, action: "fetch" };
-      } catch (error) {
-        return { index, action: "fetch", warning: error.message };
-      }
-    });
-    return sendJson(response, 200, {
-      plan,
-      counts: {
+        return { index, jobId: job.id, action: "fetch" };
+      });
+      const counts = {
         total: plan.length,
         fetch: plan.filter((item) => item.action === "fetch").length,
         reuse: plan.filter((item) => item.action === "reuse").length,
+        seen: plan.filter((item) => item.action === "skip_seen").length,
         rejected: plan.filter((item) => item.action === "reject").length
-      }
+      };
+      task.pipelineStats = {
+        discovered: counts.total,
+        duplicateHistory: counts.seen + counts.reuse,
+        reusedReviews: counts.reuse,
+        localRejected: counts.rejected,
+        jdPlanned: counts.fetch,
+        updatedAt: new Date().toISOString()
+      };
+      recalculateRunCounters(state, run);
+      return { plan, counts };
     });
+    return sendJson(response, 200, result);
   }
   if (request.method === "POST" && path === "/api/worker/job-jd") {
     const body = await readJson(request);
@@ -2098,9 +2380,14 @@ async function handleApi(request, response, url) {
       // Persist partial discoveries even when the worker needs help or fails.
       // Retrying can create marked duplicates, but it must never silently lose jobs.
       const jobs = Array.isArray(body.jobs) && body.jobs.length
-        ? addJobsToState(state, body.jobs, { runId: run.id, label: `${task.platform} worker result`, task })
+        ? mergeWorkerResultJobs(state, body.jobs, { run, task })
         : [];
       const autoReviewJobIds = prepareAutoReviewJobs(state, jobs);
+      task.pipelineStats = {
+        ...(task.pipelineStats || {}),
+        aiQueued: autoReviewJobIds.length,
+        completedAt: new Date().toISOString()
+      };
       if (autoReviewJobIds.length) {
         task.progress = {
           phase: "ai_queued",
@@ -2140,6 +2427,40 @@ async function handleApi(request, response, url) {
       run.completedAt = null;
       updateRunState(run);
       return { run, task, launchUrl: workerLandingUrl(task.platform, run.id) };
+    });
+    return sendJson(response, 200, result);
+  }
+
+  const launchRunTaskMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/launch$/.exec(path);
+  if (request.method === "POST" && launchRunTaskMatch) {
+    const result = await storage.update((state) => {
+      const run = state.runs.find((item) => item.id === launchRunTaskMatch[1]);
+      const task = run?.tasks.find((item) => item.id === launchRunTaskMatch[2]);
+      if (!run || !task) throw new Error("Run task was not found.");
+      ensureRunCounterShape(run);
+      const nextInSequence = run.tasks.find((item) => ["queued", "running", "needs_user_action"].includes(item.status));
+      if (run.settingsSnapshot.executionMode === "sequential" && nextInSequence?.id !== task.id) {
+        throw new Error("An earlier task must finish before this worker can be opened.");
+      }
+      let recovered = false;
+      if (task.status === "running") {
+        if (!runTaskWorkerIsStale(task)) throw new Error("This task still has an active worker.");
+        task.attempt += 1;
+        task.status = "queued";
+        task.reason = null;
+        task.workerId = null;
+        task.workerHeartbeatAt = null;
+        task.stopRequestedAt = null;
+        task.startedAt = null;
+        task.completedAt = null;
+        task.progress = { phase: "queued", message: "Worker 窗口已重新打开，等待领取任务。", updatedAt: new Date().toISOString() };
+        run.completedAt = null;
+        recovered = true;
+      } else if (task.status !== "queued") {
+        throw new Error("Only a queued or disconnected running task can reopen its worker.");
+      }
+      updateRunState(run);
+      return { run, task, recovered, launchUrl: workerLandingUrl(task.platform, run.id) };
     });
     return sendJson(response, 200, result);
   }
@@ -2248,7 +2569,7 @@ async function handleApi(request, response, url) {
       task.startedAt = null;
       task.completedAt = null;
       updateRunState(run);
-      return { run, task };
+      return { run, task, launchUrl: workerLandingUrl(task.platform, run.id) };
     });
     return sendJson(response, 200, task);
   }
@@ -2510,6 +2831,37 @@ async function handleApi(request, response, url) {
     jdRetryBatches.set(batch.id, batch);
     const first = await advanceJdRetryBatch(batch.id);
     return sendJson(response, 201, first);
+  }
+
+  if (request.method === "POST" && path === "/api/jobs/retry-failed-ai") {
+    const body = await readJson(request);
+    const requestedIds = [...new Set((Array.isArray(body.jobIds) ? body.jobIds : [])
+      .map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 100);
+    if (!requestedIds.length) throw new Error("Choose at least one failed AI review to retry.");
+    if (!aiStatus().configured) throw new Error("Configure AI before retrying failed reviews.");
+    const result = await storage.update((state) => {
+      if (!state.profiles.find((profile) => profile.id === state.activeProfileId)) {
+        throw new Error("Activate a career profile before retrying failed reviews.");
+      }
+      const queuedAt = new Date().toISOString();
+      const jobIds = requestedIds.filter((id) => retryableFailedAiReview(
+        state.jobs.find((job) => job.id === id)
+      ));
+      for (const id of jobIds) {
+        const job = state.jobs.find((item) => item.id === id);
+        job.screening = { ...job.screening, screeningStatus: "AI_QUEUED", engine: "ai-pending" };
+        job.aiReview = {
+          status: "queued",
+          queuedAt,
+          retryRequested: true,
+          previousError: job.aiReview?.reason || job.screening?.reason || null
+        };
+      }
+      return { jobIds };
+    });
+    if (!result.jobIds.length) throw new Error("None of the selected jobs still have a retryable AI review failure.");
+    enqueueAutoReviews(result.jobIds);
+    return sendJson(response, 202, { queued: result.jobIds.length, jobIds: result.jobIds });
   }
 
   if (request.method === "POST" && fetchJdMatch) {

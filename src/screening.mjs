@@ -13,13 +13,26 @@ const DIRECT_MATCHES = [
 ];
 
 const DIRECT_REJECTS = [
-  ["医疗或护理岗位", /\b(nurs(e|ing)|midwi(f|v)ery|medical|dentist|pharmacist|physiotherapist)\b/i],
-  ["教学或教育岗位", /\b(teacher|teaching|educator|education|school principal)\b/i],
-  ["建筑或非软件工程岗位", /\b(civil|mechanical|structural|electrical|construction|mining) engineer\b/i],
+  ["医疗、护理或治疗岗位", /\b(nurs(e|ing)|midwi(?:fery|ves?)|medical practitioner|dentist|pharmacist|physio(?:therapist|therapy)|therapist|pathologist|psychologist|radiographer|optometrist|paramedic|clinician|veterinar(?:y|ian)|chiropractor)\b/i],
+  ["教学或教育岗位", /\b(teacher|teaching|educator|education officer|school principal|tutor|learning support)\b/i],
+  ["建筑或非软件工程岗位", /\b(civil|mechanical|structural|electrical|construction|mining|chemical|geotechnical|hydrographic|environmental)\b.*\b(engineer|survey(?:or|ing))\b|\b(architect|architecture|quantity surveyor)\b/i],
   ["会计或金融岗位", /\b(accountant|accounting|taxation|auditor|financial adviser)\b/i],
   ["法律岗位", /\b(lawyer|legal counsel|solicitor|paralegal)\b/i],
+  ["销售、零售或市场岗位", /\b(retail|sales (?:assistant|consultant|executive|representative)|business development|marketing|merchandis(?:e|er|ing)|brand coordinator)\b/i],
+  ["招聘或人力资源岗位", /\b(recruit(?:er|ment)|human resources?|people (?:and|&) culture|talent acquisition|career mentor)\b/i],
+  ["客户服务或行政岗位", /\b(customer service|customer success|receptionist|administrative? assistant|office administrator|personal assistant)\b/i],
+  ["酒店、餐饮或服务岗位", /\b(hospitality|barista|chef|cook|waiter|waitress|food service|housekeeper)\b/i],
   ["资深管理岗位", /\b(head of|director|senior manager|general manager|vice president|principal)\b/i]
 ];
+
+const PREVIEW_REJECTS = [
+  /\b(registered nurse|allied health|patient care|clinical practice|occupational therapy|speech pathology)\b/i,
+  /\b(classroom teacher|teaching registration|early childhood education)\b/i,
+  /\b(civil construction|structural design|mine site|quantity surveying)\b/i,
+  /\b(retail sales|store presentation|customer service counter|hospitality venue)\b/i
+];
+
+const PREVIEW_TECH = /\b(software|developer|programming|python|java(?:script)?|typescript|react|node\.?js|sql|data analytics?|machine learning|artificial intelligence|cloud|devops|automation|api|database)\b/i;
 
 const AREA_TERMS = {
   "软件工程": ["software engineer", "software development", "programming", "application development"],
@@ -126,6 +139,23 @@ export function screenTitle(title, { thresholds, preferenceModel = null }) {
   };
 }
 
+function applyPreviewScreen(screening, preview) {
+  const text = normalizeText(preview);
+  if (!text || screening.titleClassification !== "AMBIGUOUS" || screening.screeningStatus !== "NEEDS_JD_REVIEW") return screening;
+  const unrelated = PREVIEW_REJECTS.some((expression) => expression.test(text));
+  if (!unrelated || PREVIEW_TECH.test(text)) return screening;
+  return {
+    ...screening,
+    titleClassification: "CLEAR_REJECT",
+    score: 8,
+    category: "REJECTED",
+    reason: "职位卡摘要明确属于非目标专业方向，本地预筛已拦截，无需获取完整 JD 或调用 AI。",
+    concerns: unique([...(screening.concerns || []), "职位卡摘要明确属于非目标专业方向"]),
+    screeningStatus: "PREVIEW_SCREENED",
+    engine: screening.engine.includes("feedback") ? "local-preview+feedback" : "local-preview"
+  };
+}
+
 export function normalizeJob(input, { thresholds, runId = null, duplicateOf = null, preferenceModel = null } = {}) {
   const source = ["linkedin", "indeed", "seek", "manual"].includes(String(input.source).toLowerCase())
     ? String(input.source).toLowerCase()
@@ -158,7 +188,7 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
     routineTaskId: normalizeText(input.routineTaskId) || null,
     runId,
     duplicateOf,
-    screening: screenTitle(title, { thresholds, preferenceModel }),
+    screening: applyPreviewScreen(screenTitle(title, { thresholds, preferenceModel }), input.description),
     feedback: null,
     viewedAt: null,
     reviewedAt: null,
