@@ -120,6 +120,8 @@ const screeningStatusLabels = {
   JD_FETCH_FAILED: "JD 获取失败",
   AI_QUEUED: "等待 AI 审阅",
   AI_REVIEWING: "AI 审阅中",
+  AI_RETRY_WAIT: "AI 暂停后重试",
+  AI_ERROR: "AI 审阅失败",
   JD_SCREENED: "完整 JD 已审阅",
   PROFILE_REQUIRED: "需要职业画像",
   AI_NOT_CONFIGURED: "AI 未配置",
@@ -251,9 +253,16 @@ function badge(value, type = "") {
 function screeningMethodBadge(job) {
   const screening = job.screening || {};
   const ai = /^ai(?:$|-)/i.test(screening.engine || "");
+  const rawAiError = String(job.aiReview?.reason || screening.reason || "");
+  const aiErrorMessage = /upstream_error|api_error|temporar(?:y|ily)|\b50[234]\b/i.test(rawAiError)
+    ? "AI 服务上游暂时不可用，完整 JD 已保留，可稍后重新审阅"
+    : /fetch failed|network|connection|socket/i.test(rawAiError)
+      ? "连接 AI 服务失败，完整 JD 已保留，请检查网络后重试"
+      : rawAiError.replace(/^AI JD review failed:\s*/i, "").slice(0, 360) || "AI 审阅发生错误，结果未确认";
   const pendingPresentation = {
     AI_QUEUED: ["clock-3", "AI 排队中", "完整 JD 已获取，正在等待自动 AI 审阅"],
     AI_REVIEWING: ["loader-circle", "AI 审阅中", "AI 正在结合职业画像评估完整 JD"],
+    AI_RETRY_WAIT: ["timer-reset", "AI 稍后重试", aiErrorMessage + (job.aiReview?.retryAt ? `；预计 ${dateTime(job.aiReview.retryAt)} 自动重试` : "")],
     JD_FETCHING: ["file-search", "正在获取 JD", "Worker 正在原职位页面读取完整 JD"],
     JD_FETCH_FAILED: ["file-warning", "JD 获取失败", job.descriptionFetchError || "未能自动获取完整 JD，可稍后单独重跑任务"],
     AI_NOT_CONFIGURED: ["key-round", "等待 AI 配置", "完整 JD 已获取；配置 AI 后会自动继续审阅"],
@@ -264,7 +273,7 @@ function screeningMethodBadge(job) {
     return '<span class="badge screening-method-badge is-pending" title="' + escapeHtml(pendingPresentation[2]) + '"><i data-lucide="' + pendingPresentation[0] + '"></i>' + pendingPresentation[1] + '</span>';
   }
   if (screening.screeningStatus === "AI_ERROR") {
-    return '<span class="badge screening-method-badge is-error" title="AI 审阅发生错误，结果未确认"><i data-lucide="triangle-alert"></i>AI 审阅失败</span>';
+    return '<span class="badge screening-method-badge is-error" title="' + escapeHtml(aiErrorMessage) + '"><i data-lucide="triangle-alert"></i>AI 审阅失败</span>';
   }
   if (screening.jdReviewed) {
     return ai
@@ -796,7 +805,7 @@ function actionButtons(job) {
   const viewed = Boolean(job.viewedAt);
   const jdFetching = job.screening?.screeningStatus === "JD_FETCHING";
   const jdFetchStale = jdFetching && Date.now() - new Date(job.aiReview?.startedAt || 0).getTime() > 45_000;
-  const aiBusy = ["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus) || (jdFetching && !jdFetchStale);
+  const aiBusy = ["AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus) || (jdFetching && !jdFetchStale);
   const titleRejected = !job.screening?.jdReviewed
     && rejected
     && !correctionActive;
@@ -954,7 +963,7 @@ function renderReviewLearning() {
   const evidenceJobs = uniqueJobsById([...helpfulJobs, ...rejectedJobs, ...legacyJobs]);
   const reflection = run ? (state.data.reviewReflections || []).find((item) => item.runId === run.id) : null;
   const runFinished = run && ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state);
-  const pendingAiReviews = jobs.filter((job) => ["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus)).length;
+  const pendingAiReviews = jobs.filter((job) => ["AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus)).length;
   const reflected = reflectionHasCurrentFeedback(reflection, evidenceJobs);
   const button = el("#complete-run-review");
   const label = button.querySelector("span");
@@ -4033,7 +4042,7 @@ let lastAutoReloadAt = 0;
 
 function agentDataIsChanging() {
   const latestRunIsActive = state.data?.runs?.[0]?.tasks?.some((task) => ["queued", "running"].includes(task.status));
-  const aiIsWorking = state.data?.jobs?.some((job) => ["JD_FETCHING", "AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus));
+  const aiIsWorking = state.data?.jobs?.some((job) => ["JD_FETCHING", "AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus));
   return Boolean(latestRunIsActive || aiIsWorking || state.data?.jdRetryBatches?.length);
 }
 

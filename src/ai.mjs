@@ -55,6 +55,8 @@ export function aiBudget() {
     maxReflectionOutputTokens: positiveInteger(process.env.JOB_AGENT_AI_MAX_REFLECTION_OUTPUT_TOKENS, 600, 150, 1_500),
     maxAssistantInputChars: positiveInteger(process.env.JOB_AGENT_AI_MAX_ASSISTANT_INPUT_CHARS, 24_000, 4_000, 60_000),
     maxAssistantOutputTokens: positiveInteger(process.env.JOB_AGENT_AI_MAX_ASSISTANT_OUTPUT_TOKENS, 550, 120, 1_200),
+    maxRequestAttempts: positiveInteger(process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS, 3, 1, 6),
+    retryBaseDelayMs: positiveInteger(process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS, 1_500, 10, 30_000),
     maxJdReviewsPerRun: positiveInteger(process.env.JOB_AGENT_AI_MAX_JD_REVIEWS_PER_RUN, 500, 1, 1_000),
     maxAiCallsPerRun: positiveInteger(process.env.JOB_AGENT_AI_MAX_CALLS_PER_RUN, 500, 1, 1_000)
   };
@@ -99,13 +101,31 @@ function normalizeUsage(usage) {
   };
 }
 
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function retryAfterMilliseconds(value) {
+  const text = String(value || "").trim();
+  if (!text) return 0;
+  const seconds = Number(text);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+  const date = Date.parse(text);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+export function isTransientAiError(error) {
+  if (error?.retryable === true) return true;
+  const status = Number(error?.status || 0);
+  const message = String(error?.message || error || "");
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(status)
+    || /\b(?:upstream_error|api_error|overloaded|temporar(?:y|ily)|timeout|timed out|fetch failed|network error|connection reset|socket hang up)\b/i.test(message)
+    || error?.name === "AbortError";
+}
+
 async function requestJson({ system, payload, maxOutputTokens, config: configInput = null }) {
   const config = configInput ? normalizeAiConfig(configInput, currentAiConfig()) : currentAiConfig();
   if (!configured(config)) throw new Error("AI endpoint is not configured.");
   const baseUrl = config.baseUrl;
   const budget = { ...aiBudget(), wireApi: config.wireApi };
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs());
   const headers = {
     "content-type": "application/json",
     ...(config.apiKey
@@ -113,45 +133,63 @@ async function requestJson({ system, payload, maxOutputTokens, config: configInp
       : {})
   };
 
-  try {
-    const isResponses = budget.wireApi === "responses";
-    const response = await fetch(baseUrl + "/" + (isResponses ? "responses" : "chat/completions"), {
-      method: "POST",
-      signal: controller.signal,
-      headers,
-      body: JSON.stringify(isResponses
-        ? {
-            model: config.model,
-            instructions: system,
-            input: JSON.stringify(payload),
-            store: false,
-            reasoning: { effort: budget.reasoningEffort },
-            max_output_tokens: maxOutputTokens,
-            text: { format: { type: "json_object" } }
-          }
-        : {
-            model: config.model,
-            temperature: 0.1,
-            max_tokens: maxOutputTokens,
-            response_format: { type: "json_object" },
-            messages: [
-              { role: "system", content: system },
-              { role: "user", content: JSON.stringify(payload) }
-            ]
-          })
-    });
-    if (!response.ok) {
-      const message = (await response.text()).slice(0, 500);
-      throw new Error("AI request failed (" + response.status + "): " + message);
+  const isResponses = budget.wireApi === "responses";
+  const requestBody = JSON.stringify(isResponses
+    ? {
+        model: config.model,
+        instructions: system,
+        input: JSON.stringify(payload),
+        store: false,
+        reasoning: { effort: budget.reasoningEffort },
+        max_output_tokens: maxOutputTokens,
+        text: { format: { type: "json_object" } }
+      }
+    : {
+        model: config.model,
+        temperature: 0.1,
+        max_tokens: maxOutputTokens,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: JSON.stringify(payload) }
+        ]
+      });
+
+  for (let attempt = 1; attempt <= budget.maxRequestAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), requestTimeoutMs());
+    try {
+      const response = await fetch(baseUrl + "/" + (isResponses ? "responses" : "chat/completions"), {
+        method: "POST",
+        signal: controller.signal,
+        headers,
+        body: requestBody
+      });
+      if (!response.ok) {
+        const message = (await response.text()).slice(0, 500);
+        const error = new Error("AI request failed (" + response.status + "): " + message);
+        error.status = response.status;
+        error.retryAfterMs = retryAfterMilliseconds(response.headers.get("retry-after"));
+        error.retryable = isTransientAiError(error);
+        throw error;
+      }
+      const data = await response.json();
+      return {
+        output: extractJson(isResponses ? responseOutputText(data) : data?.choices?.[0]?.message?.content),
+        usage: normalizeUsage(data?.usage)
+      };
+    } catch (error) {
+      error.retryable = isTransientAiError(error);
+      error.attempts = attempt;
+      if (!error.retryable || attempt >= budget.maxRequestAttempts) throw error;
+      const exponentialDelay = budget.retryBaseDelayMs * (2 ** (attempt - 1));
+      await wait(Math.min(30_000, Math.max(exponentialDelay, Number(error.retryAfterMs || 0))));
+    } finally {
+      clearTimeout(timeout);
     }
-    const data = await response.json();
-    return {
-      output: extractJson(isResponses ? responseOutputText(data) : data?.choices?.[0]?.message?.content),
-      usage: normalizeUsage(data?.usage)
-    };
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw new Error("AI request failed without a response.");
 }
 
 const PROFILE_SYSTEM = [
@@ -542,6 +580,8 @@ export function aiStatus() {
       maxReflectionOutputTokens: budget.maxReflectionOutputTokens,
       maxAssistantInputChars: budget.maxAssistantInputChars,
       maxAssistantOutputTokens: budget.maxAssistantOutputTokens,
+      maxRequestAttempts: budget.maxRequestAttempts,
+      retryBaseDelayMs: budget.retryBaseDelayMs,
       maxJdReviewsPerRun: budget.maxJdReviewsPerRun,
       maxAiCallsPerRun: budget.maxAiCallsPerRun
     }

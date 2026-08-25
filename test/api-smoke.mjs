@@ -11,6 +11,7 @@ const port = await availablePort();
 const aiPort = await availablePort();
 let serverOutput = "";
 let transientReviewFailures = 0;
+let manualReviewFailures = 0;
 const aiServer = createHttpServer(async (request, response) => {
   let body = "";
   for await (const chunk of request) body += chunk;
@@ -19,6 +20,12 @@ const aiServer = createHttpServer(async (request, response) => {
     transientReviewFailures += 1;
     response.writeHead(503, { "content-type": "text/plain" });
     response.end("Synthetic transient AI failure");
+    return;
+  }
+  if (String(payload.input || "").includes("Manual AI Review Failure") && manualReviewFailures === 0) {
+    manualReviewFailures += 1;
+    response.writeHead(422, { "content-type": "text/plain" });
+    response.end("Synthetic non-transient AI failure");
     return;
   }
   const isReflection = /Consolidate a candidate's job-screening preferences/i.test(payload.instructions || "");
@@ -89,7 +96,10 @@ const child = spawn(process.execPath, ["server.mjs"], {
     JOB_AGENT_DATA_DIRECTORY: directory,
     JOB_AGENT_AI_BASE_URL: "",
     JOB_AGENT_AI_MODEL: "",
-    JOB_AGENT_AI_API_KEY: ""
+    JOB_AGENT_AI_API_KEY: "",
+    JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS: "1",
+    JOB_AGENT_AI_AUTO_RETRY_LIMIT: "1",
+    JOB_AGENT_AI_AUTO_RETRY_COOLDOWN_MS: "1000"
   },
   stdio: ["ignore", "pipe", "pipe"],
   windowsHide: true
@@ -614,6 +624,7 @@ try {
   assert.match(dashboardScript, /ai-review-badge/);
   assert.match(dashboardScript, /score-trigger/);
   assert.match(dashboardScript, /AI_REVIEWING/);
+  assert.match(dashboardScript, /AI_RETRY_WAIT/);
   assert.match(dashboardScript, /data-rereview/);
   assert.match(dashboardScript, /function rereviewJob\(id, button\)/);
   assert.match(dashboardScript, /使用已保存的完整 JD 重新 AI 审阅/);
@@ -1090,19 +1101,18 @@ try {
     }]
   });
   const transientJobId = transientFailureImport.jobs[0].id;
-  const failureDeadline = Date.now() + 5_000;
+  const retryWaitDeadline = Date.now() + 5_000;
   let transientJob;
-  while (Date.now() < failureDeadline) {
+  while (Date.now() < retryWaitDeadline) {
     const polled = await request("/api/bootstrap");
     transientJob = polled.jobs.find((job) => job.id === transientJobId);
-    if (transientJob?.screening.screeningStatus === "AI_ERROR") break;
+    if (transientJob?.screening.screeningStatus === "AI_RETRY_WAIT") break;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  assert.equal(transientJob.screening.screeningStatus, "AI_ERROR");
-  const retriedAiReviews = await request("/api/jobs/retry-failed-ai", { jobIds: [transientJobId] });
-  assert.equal(retriedAiReviews.queued, 1);
-  const retryReviewDeadline = Date.now() + 5_000;
-  while (Date.now() < retryReviewDeadline) {
+  assert.equal(transientJob.screening.screeningStatus, "AI_RETRY_WAIT");
+  assert.equal(transientJob.aiReview.status, "retry_wait");
+  const automaticRetryDeadline = Date.now() + 7_000;
+  while (Date.now() < automaticRetryDeadline) {
     const polled = await request("/api/bootstrap");
     transientJob = polled.jobs.find((job) => job.id === transientJobId);
     if (transientJob?.screening.screeningStatus === "JD_SCREENED") break;
@@ -1111,6 +1121,42 @@ try {
   assert.equal(transientJob.screening.screeningStatus, "JD_SCREENED");
   assert.equal(transientJob.aiReview.status, "completed");
   assert.equal(transientReviewFailures, 1);
+
+  const manualFailureImport = await request("/api/jobs/import", {
+    runId: run.run.id,
+    jobs: [{
+      source: "indeed",
+      sourceJobId: "manual-ai-failure",
+      title: "Manual AI Review Failure",
+      company: "Retry Example",
+      location: "Melbourne VIC",
+      description: "Build Python and SQL software automation services with cloud APIs, testing, deployment, and production monitoring.",
+      descriptionSource: "detail-page",
+      descriptionFetchStatus: "fetched"
+    }]
+  });
+  const manualFailureJobId = manualFailureImport.jobs[0].id;
+  const failureDeadline = Date.now() + 5_000;
+  let manualFailureJob;
+  while (Date.now() < failureDeadline) {
+    const polled = await request("/api/bootstrap");
+    manualFailureJob = polled.jobs.find((job) => job.id === manualFailureJobId);
+    if (manualFailureJob?.screening.screeningStatus === "AI_ERROR") break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(manualFailureJob.screening.screeningStatus, "AI_ERROR");
+  const retriedAiReviews = await request("/api/jobs/retry-failed-ai", { jobIds: [manualFailureJobId] });
+  assert.equal(retriedAiReviews.queued, 1);
+  const retryReviewDeadline = Date.now() + 5_000;
+  while (Date.now() < retryReviewDeadline) {
+    const polled = await request("/api/bootstrap");
+    manualFailureJob = polled.jobs.find((job) => job.id === manualFailureJobId);
+    if (manualFailureJob?.screening.screeningStatus === "JD_SCREENED") break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(manualFailureJob.screening.screeningStatus, "JD_SCREENED");
+  assert.equal(manualFailureJob.aiReview.status, "completed");
+  assert.equal(manualReviewFailures, 1);
   const imported = await request("/api/jobs/import", {
     runId: run.run.id,
     jobs: [{
@@ -1153,7 +1199,7 @@ try {
   assert.equal(rereviewed.job.screening.engine, "ai");
   assert.equal(rereviewed.job.description, imported.jobs[0].description);
   const afterRereview = await request("/api/bootstrap");
-  assert.equal(afterRereview.runs.find((item) => item.id === run.run.id).counters.ai.jdReviewed, 2);
+  assert.equal(afterRereview.runs.find((item) => item.id === run.run.id).counters.ai.jdReviewed, 3);
 
   const legacyImport = await request("/api/jobs/import", {
     runId: run.run.id,
@@ -1353,7 +1399,7 @@ try {
   const bootstrap = await request("/api/bootstrap");
   assert.equal(bootstrap.activeProfile.id, replacement.profile.id);
   assert.equal(bootstrap.profiles.length, 1);
-  assert.equal(bootstrap.jobs.length, 12);
+  assert.equal(bootstrap.jobs.length, 13);
   assert.equal(bootstrap.reviewReflections.length, 2);
   assert.equal(bootstrap.preferenceModel.feedbackCount, 3);
   assert.equal(bootstrap.routineTasks.length, 4);
@@ -1364,7 +1410,7 @@ try {
   assert.deepEqual(nextRun.run.tasks.map((task) => task.routineTaskId), selectedTaskIds);
   const afterNextRun = await request("/api/bootstrap");
   assert.equal(afterNextRun.runs[0].id, nextRun.run.id);
-  assert.equal(afterNextRun.jobs.length, 12);
+  assert.equal(afterNextRun.jobs.length, 13);
   assert.ok(afterNextRun.jobs.every((job) => job.runId === run.run.id));
   assert.ok(afterNextRun.jobs.every((job) => job.runId !== afterNextRun.runs[0].id));
 
@@ -1375,7 +1421,7 @@ try {
   assert.equal(afterDailyClear.runs.find((item) => item.id === run.run.id).tasks.filter((task) => task.status === "cancelled").length, 0);
 
   const clearedRecords = await request("/api/records", undefined, "DELETE");
-  assert.equal(clearedRecords.cleared.jobs, 12);
+  assert.equal(clearedRecords.cleared.jobs, 13);
   assert.equal(clearedRecords.cleared.legacyWorkerHistory, 2);
   assert.equal(clearedRecords.cleared.workerHistoryMigrations, 3);
   assert.equal(clearedRecords.cleared.reviewReflections, 2);

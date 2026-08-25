@@ -200,6 +200,51 @@ test("AI connection test uses the supplied unsaved configuration", async () => {
   }
 });
 
+test("AI requests retry transient provider and proxy upstream failures", async () => {
+  let attempts = 0;
+  const server = createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    attempts += 1;
+    if (attempts === 1) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Service temporarily unavailable", type: "api_error" } }));
+      return;
+    }
+    if (attempts === 2) {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Upstream request failed", type: "upstream_error" } }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      output_text: JSON.stringify({ ok: true }),
+      usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 }
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const originalAttempts = process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS;
+  const originalDelay = process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+  try {
+    process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS = "3";
+    process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = "10";
+    const result = await testAiConnection({
+      baseUrl: "http://127.0.0.1:" + server.address().port,
+      model: "retry-test-model",
+      wireApi: "responses",
+      apiKey: ""
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.usage.totalTokens, 12);
+    assert.equal(attempts, 3);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    if (originalAttempts === undefined) delete process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS;
+    else process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS = originalAttempts;
+    if (originalDelay === undefined) delete process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+    else process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = originalDelay;
+  }
+});
+
 test("job review assistant uses bounded current-job context and preserves valid citations", async () => {
   let received = null;
   const server = createServer(async (request, response) => {

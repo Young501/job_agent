@@ -13,6 +13,7 @@ import {
   configureAi,
   evaluateJdWithAi,
   generateProfile,
+  isTransientAiError,
   reflectOnJobFeedback,
   testAiConnection
 } from "./src/ai.mjs";
@@ -52,6 +53,7 @@ const autoReviewQueue = [];
 const queuedAutoReviewIds = new Set();
 const jdRetryBatches = new Map();
 let autoReviewRunning = false;
+let autoReviewCooldownTimer = null;
 await storage.ensureState();
 await storage.update((state) => {
   state.settings = safeSettings(state.settings);
@@ -1010,6 +1012,16 @@ function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
   return jobIds;
 }
 
+function automaticAiRetryLimit() {
+  const parsed = Number.parseInt(process.env.JOB_AGENT_AI_AUTO_RETRY_LIMIT || "1", 10);
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= 5 ? parsed : 1;
+}
+
+function automaticAiCooldownMs() {
+  const parsed = Number.parseInt(process.env.JOB_AGENT_AI_AUTO_RETRY_COOLDOWN_MS || "60000", 10);
+  return Number.isInteger(parsed) && parsed >= 1_000 && parsed <= 10 * 60_000 ? parsed : 60_000;
+}
+
 function buildOnDemandJdUrl(job, batchId = null) {
   const marker = new URLSearchParams({ jobAgentOnDemandJd: job.id });
   if (batchId) marker.set("jobAgentJdBatch", batchId);
@@ -1116,13 +1128,22 @@ function enqueueAutoReviews(jobIds) {
     queuedAutoReviewIds.add(jobId);
     autoReviewQueue.push(jobId);
   }
-  if (!autoReviewRunning && autoReviewQueue.length) void drainAutoReviewQueue();
+  if (!autoReviewRunning && !autoReviewCooldownTimer && autoReviewQueue.length) void drainAutoReviewQueue();
+}
+
+function scheduleAutoReviewDrain(delayMs) {
+  if (autoReviewCooldownTimer || !autoReviewQueue.length) return;
+  autoReviewCooldownTimer = setTimeout(() => {
+    autoReviewCooldownTimer = null;
+    if (!autoReviewRunning && autoReviewQueue.length) void drainAutoReviewQueue();
+  }, delayMs);
 }
 
 async function prepareAutoReview(jobId) {
   return storage.update((state) => {
     const job = state.jobs.find((item) => item.id === jobId);
     if (!job || hasAiJdReview(job) || isRejectedBeforeJd(job)) return null;
+    const transientAttempts = Math.max(0, Number(job.aiReview?.transientAttempts || 0));
     const retryRequested = job.aiReview?.retryRequested === true;
     const profile = state.profiles.find((item) => item.id === state.activeProfileId);
     const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
@@ -1151,13 +1172,14 @@ async function prepareAutoReview(jobId) {
     if (run) run.counters.ai.calls += 1;
     const startedAt = new Date().toISOString();
     job.screening = { ...job.screening, screeningStatus: "AI_REVIEWING", engine: "ai-pending" };
-    job.aiReview = { status: "reviewing", startedAt, retryRequested };
+    job.aiReview = { status: "reviewing", startedAt, retryRequested, transientAttempts };
     return {
       job: JSON.parse(JSON.stringify(job)),
       profile: JSON.parse(JSON.stringify(profile.profile)),
       thresholds: JSON.parse(JSON.stringify(state.settings.thresholds)),
       preferenceModel: state.preferenceModel ? JSON.parse(JSON.stringify(state.preferenceModel)) : null,
-      retryRequested
+      retryRequested,
+      transientAttempts
     };
   });
 }
@@ -1196,41 +1218,74 @@ async function processAutoReview(jobId) {
         if (prepared.retryRequested) recalculateRunCounters(state, run);
       }
     });
+    return { completed: true };
   } catch (error) {
+    const transientError = isTransientAiError(error);
+    const transientAttempts = prepared.transientAttempts + 1;
+    const retryAt = new Date(Date.now() + automaticAiCooldownMs()).toISOString();
+    const willRetry = transientError && transientAttempts <= automaticAiRetryLimit();
     await storage.update((state) => {
       const job = state.jobs.find((item) => item.id === jobId);
       if (!job) return;
       job.screening = {
         ...job.screening,
         jdReviewed: false,
-        screeningStatus: "AI_ERROR",
-        engine: "ai-error",
-        reason: `AI JD review failed: ${error.message}`,
+        screeningStatus: willRetry ? "AI_RETRY_WAIT" : "AI_ERROR",
+        engine: willRetry ? "ai-pending" : "ai-error",
+        reason: willRetry
+          ? `AI service is temporarily unavailable. Automatic retry scheduled after ${retryAt}.`
+          : `AI JD review failed: ${error.message}`,
         concerns: [...(job.screening?.concerns ?? []), "automatic AI review needs another attempt"]
       };
-      job.aiReview = { status: "failed", failedAt: new Date().toISOString(), reason: error.message };
+      job.aiReview = willRetry
+        ? {
+            status: "retry_wait",
+            retryAt,
+            transientAttempts,
+            retryRequested: true,
+            reason: error.message
+          }
+        : {
+            status: "failed",
+            failedAt: new Date().toISOString(),
+            transientAttempts,
+            reason: error.message
+          };
       const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
       if (run) {
         ensureRunCounterShape(run);
         if (prepared.retryRequested) recalculateRunCounters(state, run);
-        else run.counters.ai.errors += 1;
+        else if (!willRetry) run.counters.ai.errors += 1;
       }
     });
+    return { transientError, willRetry, retryAt };
   }
 }
 
 async function drainAutoReviewQueue() {
   if (autoReviewRunning) return;
   autoReviewRunning = true;
+  let cooldownMs = 0;
   try {
     while (autoReviewQueue.length) {
       const jobId = autoReviewQueue.shift();
       queuedAutoReviewIds.delete(jobId);
-      await processAutoReview(jobId);
+      const result = await processAutoReview(jobId);
+      if (result?.transientError) {
+        if (result.willRetry) {
+          queuedAutoReviewIds.add(jobId);
+          autoReviewQueue.unshift(jobId);
+        }
+        cooldownMs = automaticAiCooldownMs();
+        break;
+      }
     }
   } finally {
     autoReviewRunning = false;
-    if (autoReviewQueue.length) void drainAutoReviewQueue();
+    if (autoReviewQueue.length) {
+      if (cooldownMs) scheduleAutoReviewDrain(cooldownMs);
+      else void drainAutoReviewQueue();
+    }
   }
 }
 
@@ -1238,10 +1293,11 @@ async function resumeAutoReviews() {
   const ids = await storage.update((state) => {
     const pending = [];
     for (const job of state.jobs) {
-      if (!["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus)) continue;
+      if (!["AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus)) continue;
+      const transientAttempts = Math.max(0, Number(job.aiReview?.transientAttempts || 0));
       job.screening.screeningStatus = "AI_QUEUED";
       job.screening.engine = "ai-pending";
-      job.aiReview = { status: "queued", queuedAt: new Date().toISOString(), resumed: true };
+      job.aiReview = { status: "queued", queuedAt: new Date().toISOString(), resumed: true, transientAttempts };
       pending.push(job.id);
     }
     return pending;
