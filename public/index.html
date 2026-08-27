@@ -15,7 +15,7 @@
           <div class="brand-mark" aria-hidden="true">JA</div>
           <div>
             <strong>Job Agent</strong>
-            <span>LOCAL / v1.0.0</span>
+            <span>LOCAL / v1.1.0</span>
           </div>
         </div>
         <nav class="navigation" aria-label="工作区导航">
@@ -186,7 +186,7 @@
               <summary><span><i data-lucide="shield-check"></i>预检记录</span><small id="validation-summary">暂无记录</small></summary>
               <div class="data-table-wrap">
                 <table class="data-table">
-                  <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>时间</th><th>结果</th><th>说明</th><th>操作</th></tr></thead>
+                  <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>时间 / 类型</th><th>结果</th><th>说明</th><th>操作</th></tr></thead>
                   <tbody id="validations-table"></tbody>
                 </table>
               </div>
@@ -198,7 +198,7 @@
             <div class="section-heading routine-heading"><div><h2>本次运行队列</h2><p>每个平台始终只执行一项任务</p></div><button class="button button-danger" id="clear-run-queue"><i data-lucide="trash-2"></i><span>清空队列</span></button></div>
             <div class="data-table-wrap">
               <table class="data-table">
-                <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>时间</th><th>状态</th><th>说明</th><th>操作</th></tr></thead>
+                <thead><tr><th>平台</th><th>关键词</th><th>地点</th><th>时间 / 类型</th><th>状态</th><th>说明</th><th>操作</th></tr></thead>
                 <tbody id="tasks-table"></tbody>
               </table>
             </div>
@@ -222,6 +222,7 @@
           <div class="profile-pane" id="profile-upload-pane" role="tabpanel" hidden>
             <section class="form-panel upload-panel">
               <h3>简历来源</h3>
+              <label class="field full"><span>新画像名称</span><input id="generated-profile-name" maxlength="80" placeholder="例如：Software 求职、周末兼职"></label>
               <label class="file-control"><span>上传简历</span><input id="profile-file" type="file" accept=".txt,.md,.docx,.pdf"></label>
               <div class="inline-actions">
                 <button class="button button-secondary" id="extract-resume"><i data-lucide="file-text"></i><span>读取简历</span></button>
@@ -236,7 +237,7 @@
             </section>
           </div>
           <div class="profile-pane" id="profile-editor-pane" role="tabpanel">
-            <div class="editor-heading"><h3>画像版本</h3><div class="profile-version-list" id="profile-versions"></div></div>
+            <div class="editor-heading"><div><h3>画像列表</h3><p>每套画像分别保存内容、评分偏好和排除词。</p></div><div class="profile-list-toolbar"><button class="button button-primary" id="open-new-profile" type="button"><i data-lucide="plus"></i><span>新建画像</span></button><div class="profile-version-list" id="profile-versions"></div></div></div>
             <div id="profile-fields" class="profile-fields"></div>
           </div>
         </section>
@@ -247,7 +248,7 @@
               <h2>运行与匹配</h2>
               <p>运行方式、AI 服务和匹配阈值</p>
             </div>
-            <div class="topbar-actions"><button class="button button-secondary" id="install-workers"><i data-lucide="wrench"></i><span>Worker 安装</span></button><button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button></div>
+            <div class="topbar-actions"><label class="compact-select"><span>画像</span><select id="settings-profile-select" aria-label="设置对应画像"></select></label><button class="button button-secondary" id="install-workers"><i data-lucide="wrench"></i><span>Worker 安装</span></button><button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button></div>
           </div>
           <section class="settings-section">
             <div class="setting-label"><h3>执行方式</h3><p>同一平台始终只执行一项任务</p></div>
@@ -271,6 +272,13 @@
           <section class="settings-section">
             <div class="setting-label"><h3>匹配阈值</h3><p>分数只用于排序</p></div>
             <div class="threshold-row" id="threshold-row"></div>
+          </section>
+          <section class="settings-section">
+            <div class="setting-label"><h3>Cover Letter</h3><p>作为每次生成时的默认页数和写作要求</p></div>
+            <div class="cover-letter-settings">
+              <label class="field"><span>最多页数</span><select id="cover-letter-max-pages"><option value="1">1 页</option><option value="2">2 页</option><option value="3">3 页</option></select></label>
+              <label class="field full"><span>默认 Prompt</span><textarea id="cover-letter-prompt" rows="4" maxlength="2000"></textarea></label>
+            </div>
           </section>
           <section class="settings-section">
             <div class="setting-label"><h3>统一职位历史</h3><p>Agent 本地统一管理三平台历史；删除运行批次即可回退该轮记录</p></div>
@@ -321,7 +329,7 @@
               <h2>浏览器 Worker 安装</h2>
               <p>将三份独立 Worker 安装到 Tampermonkey，供预检与每日任务调用。</p>
             </div>
-            <span class="setup-version"><i data-lucide="shield-check"></i><span>Worker 补丁 v1.0.1</span></span>
+            <span class="setup-version"><i data-lucide="shield-check"></i><span>Worker v1.1.x</span></span>
           </div>
 
           <section class="setup-guide" aria-labelledby="setup-guide-title">
@@ -403,8 +411,9 @@
     <dialog id="routine-task-dialog" class="dialog task-dialog">
       <form id="routine-task-form">
         <div class="dialog-heading"><div><p class="eyebrow">每日任务</p><h2 id="routine-task-dialog-title">添加待预检任务</h2></div><button class="icon-button" type="button" data-close-dialog="routine-task-dialog" title="关闭"><i data-lucide="x"></i></button></div>
-        <div class="two-fields">
+        <div class="three-fields">
           <label class="field"><span>平台</span><select id="routine-task-platform"><option value="linkedin">LinkedIn</option><option value="indeed">Indeed</option><option value="seek">SEEK</option></select></label>
+          <label class="field"><span>职位类型</span><select id="routine-task-job-type"></select></label>
           <label class="field"><span>时间范围</span><select id="routine-task-time"><option value="0">不限</option><option value="1">过去 24 小时</option><option value="3">过去 3 天</option><option value="7">过去 7 天</option><option value="14">过去 14 天</option><option value="30">过去 30 天</option></select></label>
         </div>
         <label class="field full"><span>职位关键词</span><input id="routine-task-keyword" required maxlength="160" placeholder="例如：intern, internship"><small>多个备选词用逗号分隔。平台搜索第一个词，Worker 按任一备选词筛选。</small></label>
@@ -457,11 +466,47 @@
 
     <dialog id="run-confirmation-dialog" class="dialog run-confirmation-dialog">
       <form id="run-confirmation-form">
-        <div class="dialog-heading"><div><p class="eyebrow">启动前检查</p><h2>确认本次排除关键词</h2></div><button class="icon-button" type="button" data-close-dialog="run-confirmation-dialog" title="关闭"><i data-lucide="x"></i></button></div>
-        <p class="confirm-copy">这些词会在平台脚本阶段直接跳过命中的职位。请确认它们不会影响本次搜索中的有效岗位。</p>
+        <div class="dialog-heading"><div><p class="eyebrow">启动前检查</p><h2>确认本次画像与排除词</h2></div><button class="icon-button" type="button" data-close-dialog="run-confirmation-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+        <p class="confirm-copy">本次任务的 AI 评分、偏好学习和排除词都会固定在所选画像下。请确认排除词不会影响当前搜索中的有效岗位。</p>
+        <label class="field full"><span>本次使用的画像</span><select id="run-profile-select"></select></label>
         <div class="run-exclusion-review" id="run-exclusion-review"></div>
         <label class="run-confirm-checkbox"><input id="run-exclusion-confirmed" type="checkbox"><span>我已检查本次生效的排除关键词</span></label>
         <div class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="run-confirmation-dialog">取消</button><button class="button button-primary" id="confirm-start-run" type="submit" disabled><i data-lucide="play"></i><span>确认并开始</span></button></div>
+      </form>
+    </dialog>
+
+    <dialog id="cover-letter-dialog" class="dialog cover-letter-dialog">
+      <form id="cover-letter-form">
+        <div class="dialog-heading"><div><p class="eyebrow">Application document</p><h2 id="cover-letter-title">Cover Letter</h2></div><button class="icon-button" type="button" data-close-dialog="cover-letter-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+        <p class="feedback-copy" id="cover-letter-job-meta"></p>
+        <div class="cover-letter-controls">
+          <label class="field"><span>画像</span><select id="cover-letter-profile"></select></label>
+          <label class="field"><span>最多页数</span><select id="cover-letter-pages"><option value="1">1 页</option><option value="2">2 页</option><option value="3">3 页</option></select></label>
+        </div>
+        <label class="field full"><span>生成 Prompt</span><textarea id="cover-letter-instructions" rows="3" maxlength="2000"></textarea></label>
+        <div class="cover-letter-generate-row"><button class="button button-primary" id="generate-cover-letter" type="button"><i data-lucide="sparkles"></i><span>生成 Cover Letter</span></button><span id="cover-letter-version"></span></div>
+        <div class="cover-letter-result" id="cover-letter-result" hidden>
+          <p class="cover-letter-overview" id="cover-letter-overview"></p>
+          <label class="field full"><span>Subject</span><input id="cover-letter-subject" maxlength="220"></label>
+          <div class="cover-letter-letter-grid">
+            <label class="field full"><span>Salutation</span><input id="cover-letter-salutation" maxlength="120"></label>
+            <label class="field full"><span>Letter</span><textarea id="cover-letter-body" rows="16" maxlength="24000"></textarea></label>
+            <label class="field"><span>Closing</span><input id="cover-letter-closing" maxlength="120"></label>
+            <label class="field"><span>Name</span><input id="cover-letter-applicant" maxlength="120"></label>
+          </div>
+          <label class="field full"><span>修改建议</span><textarea id="cover-letter-revision" rows="3" maxlength="1500" placeholder="例如：第二段更具体地写项目经验，并缩短结尾。"></textarea></label>
+          <div class="dialog-actions"><button class="button button-secondary" id="revise-cover-letter" type="button"><i data-lucide="refresh-cw"></i><span>按建议修改</span></button><span class="dialog-action-spacer"></span><button class="button button-secondary" id="save-cover-letter" type="button"><i data-lucide="save"></i><span>保存编辑</span></button><button class="button button-primary" id="export-cover-letter" type="button"><i data-lucide="file-down"></i><span>导出 PDF</span></button></div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="new-profile-dialog" class="dialog confirm-dialog">
+      <form id="new-profile-form">
+        <div class="dialog-heading"><div><p class="eyebrow">职业画像</p><h2>新建画像</h2></div><button class="icon-button" type="button" data-close-dialog="new-profile-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+        <label class="field full"><span>画像名称</span><input id="new-profile-name" maxlength="80" required placeholder="例如：Software 求职、Cafe 兼职"></label>
+        <label class="profile-copy-option"><input id="new-profile-copy-current" type="checkbox"><span><strong>复制当前画像内容</strong><small id="new-profile-copy-note">仅复制画像字段，不复制学习偏好、排除词或待审核建议。</small></span></label>
+        <p class="form-note">不勾选时会创建一个所有板块均为空的画像，可稍后手动填写。</p>
+        <div class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="new-profile-dialog">取消</button><button class="button button-primary" type="submit"><i data-lucide="plus"></i><span>创建画像</span></button></div>
       </form>
     </dialog>
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - LinkedIn
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.0.1
+// @version      1.1.0
 // @description  Job Agent worker for LinkedIn. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
@@ -25,7 +25,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.0.1";
+    const APP_VERSION = "1.1.0";
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
         cooldownMinutes: 5,

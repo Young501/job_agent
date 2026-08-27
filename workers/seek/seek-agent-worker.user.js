@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - SEEK
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.0.1
+// @version      1.1.0
 // @description  Job Agent worker for SEEK. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
@@ -29,7 +29,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.0.1";
+    const APP_VERSION = "1.1.0";
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
         cooldownMinutes: 5,
@@ -1311,6 +1311,11 @@
         const deadline = Date.now() + 16000;
         while (!ui && Date.now() < deadline) await sleep(300);
         if (!ui) return agentSubmit("failed", "Job results did not load in the worker tab.", { results: [] });
+        try {
+            if (!await agentApplySeekJobTypeFilter(agentTask, "task")) return;
+        } catch (error) {
+            return agentSubmit("failed", `Job type filter failed: ${error.message || String(error)}`, { results: [] });
+        }
         agentStartedTaskId = agentTask.id;
         const includeKeywords = agentIncludeKeywordText(agentTask.keyword);
         ui.include.value = includeKeywords;
@@ -1778,6 +1783,82 @@
         return false;
     }
 
+    const SEEK_JOB_TYPE_LABELS = {
+        "full-time": "Full time",
+        "part-time": "Part time",
+        contract: "Contract/Temp",
+        casual: "Casual/Vacation"
+    };
+
+    async function agentFindSeekJobTypeOption(label, timeout = 8000) {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+            const candidates = Array.from(document.querySelectorAll("input[type='checkbox'], [role='checkbox'], label"));
+            const found = candidates.find((node) => {
+                const target = node.matches("input") ? node.closest("label, [role='checkbox']") || node : node;
+                const text = (node.getAttribute("aria-label") || target.innerText || target.textContent || "").replace(/\s+/g, " ").trim();
+                const normalized = text.toLowerCase();
+                const expected = label.toLowerCase();
+                return agentVisible(target) && (normalized === expected || normalized.startsWith(expected + " "));
+            });
+            if (found) return found;
+            await sleep(180);
+        }
+        return null;
+    }
+
+    function agentSeekJobTypeChecked(option) {
+        const input = option?.matches("input") ? option : option?.querySelector("input[type='checkbox']");
+        return Boolean(input?.checked || option?.getAttribute("aria-checked") === "true");
+    }
+
+    async function agentApplySeekJobTypeFilter(subject, mode = "task", attempt = 0) {
+        const jobType = String(subject.jobType || "any");
+        if (jobType === "any") return true;
+        const label = SEEK_JOB_TYPE_LABELS[jobType];
+        if (!label) throw new Error(`SEEK does not support job type ${jobType}.`);
+        if (attempt > 2) throw new Error(`SEEK did not retain Type “${label}”.`);
+        setStatus(`Job Agent: 正在选择 Type = ${label}...`);
+        log(`正在选择 Type = ${label}`);
+        let option = await agentFindSeekJobTypeOption(label, 300);
+        const trigger = await agentWaitFor([
+            "button[aria-label='refine by work type']",
+            "button[aria-label*='work type' i]",
+            "label[data-automation='toggleWorkTypePanel']"
+        ], 6000);
+        if (!option) {
+            if (trigger) trigger.click();
+            else if (!agentClickText(/^type$/i)) throw new Error("未找到 SEEK 的 Type 筛选器。");
+            option = await agentFindSeekJobTypeOption(label);
+        }
+        if (!option) throw new Error(`Type 已打开，但未找到“${label}”选项。`);
+        if (agentSeekJobTypeChecked(option)) {
+            if (mode === "task") {
+                agentTask.jobTypeApplied = true;
+                gmSet(AGENT.taskKey, agentTask);
+            }
+            log(`Type 已确认：${label}`);
+            if (trigger?.getAttribute("aria-expanded") === "true") {
+                trigger.click();
+                await sleep(200);
+            }
+            return true;
+        }
+        if (mode === "preflight") {
+            gmSet(AGENT.preflightKey, {
+                validationId: subject.id,
+                preflightAttempt: Number(subject.preflightAttempt || 1),
+                stage: "jobtype-verify"
+            });
+        }
+        const clickable = option.matches("input") ? option.closest("label, [role='checkbox']") || option : option;
+        clickable.scrollIntoView({ block: "nearest" });
+        clickable.click();
+        await sleep(900);
+        if (agentSeekJobTypeChecked(option)) return true;
+        return agentApplySeekJobTypeFilter(subject, mode, attempt + 1);
+    }
+
     function agentPreflightState(validation) {
         const stored = gmGet(AGENT.preflightKey, null);
         const preflightAttempt = Number(validation.preflightAttempt || 1);
@@ -2037,10 +2118,11 @@
             if (appliedDays && Number(current.get("daterange")) !== expectedDateRange) {
                 throw new Error("Listing time 未确认生效。SEEK 没有写入对应时间筛选条件。");
             }
+            if (!await agentApplySeekJobTypeFilter(validation, "preflight")) return true;
             await agentAssertSearchResults(validation);
             agentShowNaturalSeekKeyword(agentSearchKeyword(validation.keyword));
             setStatus("Job Agent: 预检通过。");
-            log("预检通过：搜索条件与 Listing time 均已确认。");
+            log("预检通过：搜索条件、Listing time 与 Type 均已确认。");
             await agentSubmitPreflight(validation, "valid");
         } catch (error) {
             const reason = `预检失败：${error.message || String(error)}`;
@@ -2097,11 +2179,12 @@
             return;
         }
         await agentMigrateWorkerHistory();
-        let runId = agentParam(params, "jobAgentRun") || agentStoredTask()?.runId;
+        const explicitRunId = agentParam(params, "jobAgentRun");
+        let runId = explicitRunId || agentStoredTask()?.runId;
         agentTask = agentStoredTask();
         // A managed landing page has a run id but no task id. It must claim the
         // current attempt instead of resuming a cached copy of an earlier retry.
-        if (runId && !agentParam(params, "jobAgentTask")) {
+        if (explicitRunId && !agentParam(params, "jobAgentTask")) {
             gmSet(AGENT.taskKey, null);
             agentClearScanSession();
             agentTask = null;

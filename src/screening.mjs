@@ -184,6 +184,8 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
     searchKeyword: normalizeText(input.searchKeyword || input.keyword) || null,
     searchLocation: normalizeText(input.searchLocation) || null,
     searchPostedWithinDays: Number.isFinite(postedWithinDays) && postedWithinDays >= 0 ? postedWithinDays : null,
+    searchJobType: normalizeText(input.searchJobType || input.jobType) || "any",
+    profileId: normalizeText(input.profileId) || null,
     runTaskId: normalizeText(input.runTaskId || input.taskId) || null,
     routineTaskId: normalizeText(input.routineTaskId) || null,
     runId,

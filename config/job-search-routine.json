@@ -14,6 +14,10 @@
     "jdRequestTimeoutSeconds": 5,
     "jdPageTimeoutSeconds": 10
   },
+  "coverLetter": {
+    "maxPages": 1,
+    "prompt": "Write a tailored professional cover letter from this profile and job description. Use a natural, low-AI tone, concrete evidence, and STAR logic without labeling STAR sections. Never invent experience or qualifications."
+  },
   "locations": [
     { "id": "melbourne-vic", "name": "Melbourne VIC", "enabled": true },
     { "id": "australia", "name": "Australia", "enabled": false },

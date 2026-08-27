@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 
-import { answerJobQuestions, evaluateJdWithAi, generateProfile, reflectOnJobFeedback, testAiConnection } from "../src/ai.mjs";
+import { answerJobQuestions, evaluateJdWithAi, generateCoverLetter, generateProfile, reflectOnJobFeedback, testAiConnection } from "../src/ai.mjs";
 
 const externalProfile = {
   schemaVersion: 2,
@@ -319,6 +319,71 @@ test("job review assistant uses bounded current-job context and preserves valid 
     for (const [key, environmentKey] of Object.entries(mapping)) {
       if (original[key] === undefined) delete process.env[environmentKey];
       else process.env[environmentKey] = original[key];
+    }
+  }
+});
+
+test("cover letter generation uses the selected profile, JD, page limit, and revision context", async () => {
+  let received = null;
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    received = JSON.parse(body);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      output_text: JSON.stringify({
+        overview: "这封信以 Python 项目和岗位的自动化需求为主线。",
+        subject: "Application for Graduate Software Engineer",
+        salutation: "Dear Hiring Manager,",
+        body: "I am applying for the Graduate Software Engineer position because its focus on practical automation aligns with my recent work.\n\nIn a university project, I used Python to build a reliable processing workflow, tested the result, and documented the implementation for other contributors. This experience gave me a concrete foundation for the engineering work described in the role.\n\nI would welcome the opportunity to discuss how I could contribute to the team while continuing to grow as an engineer.",
+        closing: "Kind regards,",
+        applicantName: "Candidate"
+      }),
+      usage: { input_tokens: 120, output_tokens: 140, total_tokens: 260 }
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const original = {
+    baseUrl: process.env.JOB_AGENT_AI_BASE_URL,
+    model: process.env.JOB_AGENT_AI_MODEL,
+    wireApi: process.env.JOB_AGENT_AI_WIRE_API,
+    output: process.env.JOB_AGENT_AI_MAX_COVER_LETTER_OUTPUT_TOKENS
+  };
+  try {
+    process.env.JOB_AGENT_AI_BASE_URL = "http://127.0.0.1:" + server.address().port;
+    process.env.JOB_AGENT_AI_MODEL = "cover-letter-test-model";
+    process.env.JOB_AGENT_AI_WIRE_API = "responses";
+    process.env.JOB_AGENT_AI_MAX_COVER_LETTER_OUTPUT_TOKENS = "900";
+    const result = await generateCoverLetter({
+      job: { title: "Graduate Software Engineer", company: "Example", location: "Melbourne VIC", description: "Build tested Python automation services and collaborate with engineers." },
+      profile: externalProfile,
+      maxPages: 1,
+      customInstructions: "Use a direct Australian English tone.",
+      previousDraft: { body: "Previous draft text." },
+      revisionRequest: "Make the project evidence more concrete."
+    });
+    const input = JSON.parse(received.input);
+    assert.match(received.instructions, /Never invent/i);
+    assert.match(received.instructions, /STAR reasoning/i);
+    assert.equal(input.maxPages, 1);
+    assert.equal(input.maxWords, 500);
+    assert.equal(input.candidateProfile.basicInfo.name, "Candidate");
+    assert.equal(input.job.company, "Example");
+    assert.equal(input.revisionRequest, "Make the project evidence more concrete.");
+    assert.equal(received.max_output_tokens, 900);
+    assert.equal(result.coverLetter.applicantName, "Candidate");
+    assert.equal(result.usage.totalTokens, 260);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    const keys = {
+      baseUrl: "JOB_AGENT_AI_BASE_URL",
+      model: "JOB_AGENT_AI_MODEL",
+      wireApi: "JOB_AGENT_AI_WIRE_API",
+      output: "JOB_AGENT_AI_MAX_COVER_LETTER_OUTPUT_TOKENS"
+    };
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[keys[key]];
+      else process.env[keys[key]] = value;
     }
   }
 });

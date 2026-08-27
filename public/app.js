@@ -17,6 +17,7 @@ const state = {
   feedbackJobId: null,
   feedbackMode: "positive",
   pendingRunTaskIds: null,
+  pendingRunProfileId: null,
   resumeSource: "",
   editingValidationId: null,
   notifiedTaskIds: new Set(),
@@ -45,12 +46,35 @@ const state = {
   jobAssistantMessages: [],
   jobAssistantContextKey: "",
   profilePointerDrag: null,
-  suppressProfileChipClick: false
+  suppressProfileChipClick: false,
+  settingsProfileId: null,
+  coverLetterJobId: null,
+  coverLetterCurrent: null
 };
 
 const names = { linkedin: "LinkedIn", indeed: "Indeed", seek: "SEEK", manual: "手动" };
 const routinePlatformOrder = ["linkedin", "seek", "indeed"];
 const postedWithinLabels = { 0: "不限", 1: "过去 24 小时", 3: "过去 3 天", 7: "过去 7 天", 14: "过去 14 天", 30: "过去 30 天" };
+const jobTypeLabels = {
+  any: "不限",
+  "full-time": "Full-time",
+  "part-time": "Part-time",
+  casual: "Casual",
+  contract: "Contract / Temp",
+  permanent: "Permanent",
+  temporary: "Temporary",
+  "temp-to-perm": "Temp to perm",
+  "fixed-term": "Fixed term",
+  graduate: "Graduate",
+  seasonal: "Seasonal",
+  subcontract: "Subcontract",
+  "student-job": "Student Job"
+};
+const platformJobTypes = {
+  linkedin: ["any"],
+  seek: ["any", "full-time", "part-time", "contract", "casual"],
+  indeed: ["any", "casual", "part-time", "full-time", "permanent", "temporary", "temp-to-perm", "fixed-term", "graduate", "seasonal", "contract", "subcontract", "student-job"]
+};
 const validationStatusLabels = {
   WAITING_FOR_WORKER: "等待预检",
   VALID: "已验证",
@@ -143,9 +167,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v1.0.1", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v1.0.1", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v1.0.1", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v1.1.0", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v1.1.1", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v1.1.0", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -193,7 +217,9 @@ const profileEngineLabel = (engine) => ({
   ai: "AI 合成",
   "ai-with-external": "AI + 外部 GPT",
   "external-gpt": "外部 GPT",
-  "local-rules": "本地规则"
+  "local-rules": "本地规则",
+  manual: "手动创建",
+  copied: "复制创建"
 }[engine] || "画像草稿");
 
 function persistView() {
@@ -353,6 +379,38 @@ function activeProfile() {
 
 function selectedProfile() {
   return state.data.profiles.find((profile) => profile.id === state.profileId) || null;
+}
+
+function profileLabel(profile) {
+  return profile?.name || profile?.profile?.basicInfo?.name || `Profile ${profile?.version || ""}`;
+}
+
+function selectedSettingsProfile() {
+  return state.data.profiles.find((profile) => profile.id === state.settingsProfileId)
+    || activeProfile()
+    || state.data.profiles[0]
+    || null;
+}
+
+function contextForProfile(profileId) {
+  return state.data.profileContexts?.[profileId] || { exclusionKeywords: [], exclusionSuggestions: [], preferenceModel: null };
+}
+
+function profileSelectOptions(selectedId) {
+  return (state.data.profiles || []).map((profile) => '<option value="' + profile.id + '"' + (profile.id === selectedId ? " selected" : "") + '>'
+    + escapeHtml(profileLabel(profile)) + (profile.id === state.data.activeProfile?.id ? " · 默认" : "") + "</option>").join("");
+}
+
+function jobTypeOptions(platform, selected = "any") {
+  return (platformJobTypes[platform] || ["any"]).map((value) => '<option value="' + value + '"' + (value === selected ? " selected" : "") + '>'
+    + escapeHtml(jobTypeLabels[value] || value) + "</option>").join("");
+}
+
+function syncRoutineJobTypeOptions(selected = null) {
+  const platform = el("#routine-task-platform").value || "linkedin";
+  const current = selected || el("#routine-task-job-type").value || "any";
+  const allowed = platformJobTypes[platform] || ["any"];
+  el("#routine-task-job-type").innerHTML = jobTypeOptions(platform, allowed.includes(current) ? current : "any");
 }
 
 function currentRun() {
@@ -810,14 +868,15 @@ function actionButtons(job) {
     && rejected
     && !correctionActive;
   const hasCompleteJd = hasCompleteJobJd(job);
+  const canCoverLetter = hasCompleteJd && Boolean(state.data?.ai?.configured && state.data?.profiles?.length);
   const canFetchJd = Boolean(job.jobUrl && ["linkedin", "indeed", "seek"].includes(job.source));
-  const canRereview = (hasCompleteJd || canFetchJd) && !titleRejected && !aiBusy && state.data?.ai?.configured && state.data?.activeProfile;
+  const canRereview = (hasCompleteJd || canFetchJd) && !titleRejected && !aiBusy && state.data?.ai?.configured && Boolean(state.data?.profiles?.length);
   const rereviewTitle = aiBusy
     ? (job.screening?.screeningStatus === "JD_FETCHING" ? "正在原职位页面获取完整 JD" : "AI 正在审阅此职位")
     : titleRejected
       ? "标题已明确排除，无需获取 JD 或重新审阅"
-      : !state.data?.activeProfile
-        ? "请先激活职业画像"
+      : !state.data?.profiles?.length
+        ? "请先创建职业画像"
         : !state.data?.ai?.configured
           ? "请先配置 AI 服务"
           : jdFetchStale
@@ -829,6 +888,7 @@ function actionButtons(job) {
               : "使用已保存的完整 JD 重新 AI 审阅";
   return open
     + '<button class="icon-button" data-rereview="' + job.id + '" type="button" title="' + rereviewTitle + '" aria-label="' + (hasCompleteJd ? "重新 AI 审阅" : "获取 JD 并 AI 审阅") + '"' + (canRereview ? "" : " disabled") + '><i data-lucide="' + (aiBusy ? "loader-circle" : hasCompleteJd ? "refresh-cw" : "file-search") + '"></i></button>'
+    + '<button class="icon-button" data-cover-letter="' + job.id + '" type="button" title="' + (canCoverLetter ? "生成 Cover Letter" : "需要完整 JD、画像与 AI 配置") + '" aria-label="生成 Cover Letter"' + (canCoverLetter ? "" : " disabled") + '><i data-lucide="file-pen-line"></i></button>'
     + '<button class="viewed-action' + (viewed ? " is-active" : "") + '" data-toggle-viewed="' + job.id + '" data-viewed="' + String(viewed) + '" type="button" title="' + (viewed ? "点击恢复为未看" : "标记为已看") + '"><i data-lucide="' + (viewed ? "check" : "eye") + '"></i><span>' + (viewed ? "已看" : "看过了") + "</span></button>"
     + '<button class="feedback-action is-compact' + (positiveActive ? " is-active" : "") + '" data-feedback="' + job.id + '" data-feedback-mode="positive" type="button" aria-label="有用" aria-pressed="' + String(positiveActive) + '" title="' + (feedbackAllowed ? (rejected ? "有用：Rejected 判断正确" : positiveActive ? "修改有用反馈" : "有用：告诉 Agent 你喜欢这个职位") : "AI 完成完整 JD 审阅后才能评价") + '"' + (feedbackAllowed ? "" : " disabled") + '><i data-lucide="thumbs-up"></i></button>'
     + '<button class="feedback-action is-compact is-negative' + (negativeActive ? " is-active" : "") + '" data-feedback="' + job.id + '" data-feedback-mode="negative" type="button" aria-label="没用" aria-pressed="' + String(negativeActive) + '" title="' + (feedbackAllowed ? (rejected ? "没用：Rejected 判断不正确" : negativeActive ? "修改没用反馈" : "没用：告诉 Agent 你不喜欢的原因") : "AI 完成完整 JD 审阅后才能评价") + '"' + (feedbackAllowed ? "" : " disabled") + '><i data-lucide="thumbs-down"></i></button>';
@@ -1127,7 +1187,7 @@ function unifiedRoutineTaskRow(task, validation = null) {
     + '<td>' + badge(names[source.platform], "source-" + source.platform) + '</td>'
     + '<td><strong>' + escapeHtml(source.keyword) + '</strong></td>'
     + '<td>' + escapeHtml(source.location) + '</td>'
-    + '<td>' + escapeHtml(postedWithinLabels[Number(source.postedWithinDays)] || "不限") + '</td>'
+    + '<td><span>' + escapeHtml(postedWithinLabels[Number(source.postedWithinDays)] || "不限") + '</span><small>' + escapeHtml(jobTypeLabels[source.jobType || "any"] || source.jobType || "不限") + '</small></td>'
     + '<td><div class="routine-task-status">' + status + todayRoutineTaskBadge(todayRun) + '</div></td>'
     + '<td class="action-cell unified-task-actions">' + actions + '</td></tr>';
 }
@@ -1165,7 +1225,7 @@ function renderTaskCategories() {
       + '<div class="task-category-actions"><button class="icon-button" type="button" data-toggle-category="' + category.id + '" title="' + (expanded ? "收起子任务" : "查看子任务") + '"><i data-lucide="chevron-' + (expanded ? "up" : "down") + '"></i></button>'
       + (category.builtin ? "" : '<button class="icon-button" type="button" data-edit-category="' + category.id + '" title="编辑类别"><i data-lucide="pencil"></i></button><button class="icon-button destructive" type="button" data-delete-category="' + category.id + '" title="删除类别"><i data-lucide="trash-2"></i></button>')
       + '</div></div>'
-      + '<div class="task-category-children"' + (expanded ? "" : " hidden") + '><div class="data-table-wrap"><table class="data-table unified-task-table"><thead><tr><th class="selection-column"></th><th>平台</th><th>关键词</th><th>地点</th><th>时间</th><th>状态</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
+      + '<div class="task-category-children"' + (expanded ? "" : " hidden") + '><div class="data-table-wrap"><table class="data-table unified-task-table"><thead><tr><th class="selection-column"></th><th>平台</th><th>关键词</th><th>地点</th><th>时间 / 类型</th><th>状态</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div></div>'
       + '</article>';
   }).join("");
   const standaloneTasks = routineTasks.filter((task) => !linkedRoutineTaskIds.has(task.id));
@@ -1176,7 +1236,7 @@ function renderTaskCategories() {
     + '<div class="task-category-identity"><div><strong>单独任务</strong>' + badge("自动归类", "category-preset-badge") + '</div><small>不属于现有组合的已启用任务</small></div>'
     + '<div class="task-category-progress"><strong>' + standaloneTasks.length + '</strong><span>可运行</span></div>'
     + '<div class="task-category-actions"><button class="icon-button" type="button" data-toggle-category="standalone" title="' + (standaloneExpanded ? "收起任务" : "查看任务") + '"><i data-lucide="chevron-' + (standaloneExpanded ? "up" : "down") + '"></i></button></div></div>'
-    + '<div class="task-category-children"' + (standaloneExpanded ? "" : " hidden") + '><div class="data-table-wrap"><table class="data-table unified-task-table"><thead><tr><th class="selection-column"></th><th>平台</th><th>关键词</th><th>地点</th><th>时间</th><th>状态</th><th>操作</th></tr></thead><tbody>'
+    + '<div class="task-category-children"' + (standaloneExpanded ? "" : " hidden") + '><div class="data-table-wrap"><table class="data-table unified-task-table"><thead><tr><th class="selection-column"></th><th>平台</th><th>关键词</th><th>地点</th><th>时间 / 类型</th><th>状态</th><th>操作</th></tr></thead><tbody>'
     + standaloneTasks.map((task) => unifiedRoutineTaskRow(task, (state.data.validations || []).find((validation) => validation.id === task.validationId))).join("")
     + '</tbody></table></div></div></article>' : "";
   el("#task-category-list").innerHTML = categoryMarkup + standaloneMarkup
@@ -1282,7 +1342,7 @@ function renderRoutine() {
     + "<td>" + badge(names[validation.platform], "source-" + validation.platform) + "</td>"
     + "<td><strong>" + escapeHtml(validation.keyword) + "</strong></td>"
     + "<td>" + escapeHtml(validation.location) + "</td>"
-    + "<td>" + escapeHtml(timeLabel(validation.postedWithinDays)) + "</td>"
+    + "<td><span>" + escapeHtml(timeLabel(validation.postedWithinDays)) + "</span><small>" + escapeHtml(jobTypeLabels[validation.jobType || "any"] || validation.jobType || "不限") + "</small></td>"
     + "<td>" + badge(presentation.label, "status-badge") + "</td>"
     + '<td class="muted">' + escapeHtml(presentation.reason) + "</td>"
     + '<td class="action-cell validation-actions">' + addButton + '<button class="icon-button" data-retry-validation="' + validation.id + '" title="重新尝试预检"><i data-lucide="rotate-cw"></i></button>'
@@ -1315,7 +1375,7 @@ function renderRoutine() {
       return '<tr>'
       + "<td>" + badge(names[task.platform], "source-" + task.platform) + "</td>"
       + "<td><strong>" + escapeHtml(task.keyword) + "</strong></td>"
-      + "<td>" + escapeHtml(task.location) + "</td><td>" + escapeHtml(timeLabel(task.postedWithinDays)) + "</td>"
+      + "<td>" + escapeHtml(task.location) + "</td><td><span>" + escapeHtml(timeLabel(task.postedWithinDays)) + "</span><small>" + escapeHtml(jobTypeLabels[task.jobType || "any"] || task.jobType || "不限") + "</small></td>"
       + "<td>" + badge(task.status, "status-badge") + "</td>"
       + '<td class="muted">' + escapeHtml(progressText) + "</td>"
       + '<td class="action-cell">' + (task.status === "needs_user_action"
@@ -1554,14 +1614,14 @@ function renderProfile() {
   setProfilePane(state.profilePane);
   el("#profile-draft-count").textContent = String(state.data.profiles.length);
   el("#profile-current").innerHTML = active
-    ? '<i data-lucide="circle-check"></i><span>当前：' + escapeHtml(active.profile.basicInfo?.name || "未填写姓名") + "</span>"
+    ? '<i data-lucide="circle-check"></i><span>默认：' + escapeHtml(profileLabel(active)) + "</span>"
     : '<i data-lucide="circle-alert"></i><span>尚未激活画像</span>';
   el("#profile-status").textContent = state.data.ai.configured
     ? "AI 已配置：" + state.data.ai.model
     : "本地规则模式；配置 AI 后可获得语义画像与 JD 审阅。";
   el("#profile-versions").innerHTML = state.data.profiles.map((record) =>
-    '<button class="profile-version ' + (record.id === state.profileId ? "is-selected" : "") + '" data-profile="' + record.id + '"><span>v'
-    + record.version + "</span><small>" + (record.status === "approved" ? "当前/已确认" : "草稿") + "</small></button>").join("")
+    '<button class="profile-version ' + (record.id === state.profileId ? "is-selected" : "") + '" data-profile="' + record.id + '"><span>'
+    + escapeHtml(profileLabel(record)) + "</span><small>" + (record.id === active?.id ? "默认" : record.status === "approved" ? "已确认" : "草稿") + "</small></button>").join("")
     || '<span class="muted">暂无版本</span>';
   if (!selected) {
     el("#profile-fields").innerHTML = '<div class="profile-empty"><i data-lucide="contact-round"></i><p>尚未生成画像草稿。</p><button class="button button-primary" type="button" data-profile-pane="upload"><i data-lucide="file-up"></i><span>上传简历</span></button></div>';
@@ -1569,10 +1629,10 @@ function renderProfile() {
   }
   const p = selected.profile;
   const activeButton = selected.id === active?.id
-    ? '<button class="button button-quiet" disabled><i data-lucide="circle-check"></i><span>当前画像</span></button>'
-    : '<button class="button button-primary" data-activate="' + selected.id + '"><i data-lucide="circle-check"></i><span>确认并仅保留</span></button>';
-  const clearOtherButton = selected.id === active?.id && state.data.profiles.length > 1
-    ? '<button class="button button-danger" data-clear-other-profiles><i data-lucide="trash-2"></i><span>清理其他版本</span></button>'
+    ? '<button class="button button-quiet" disabled><i data-lucide="circle-check"></i><span>默认画像</span></button>'
+    : '<button class="button button-primary" data-activate="' + selected.id + '"><i data-lucide="circle-check"></i><span>设为默认</span></button>';
+  const deleteButton = state.data.profiles.length > 1
+    ? '<button class="button button-danger" data-delete-profile="' + selected.id + '"><i data-lucide="trash-2"></i><span>删除画像</span></button>'
     : "";
   const sectionExists = structuredProfileSections.some((item) => item.key === state.profileSection) || state.profileSection === "customSections";
   if (!sectionExists) state.profileSection = "basicInfo";
@@ -1584,10 +1644,10 @@ function renderProfile() {
   const editorTitle = activeDefinition?.label || "自定义板块";
   el("#profile-fields").innerHTML = '<section class="profile-record-header"><div class="profile-badges">' + badge("v" + selected.version, "version-badge")
     + badge(selected.status, selected.id === active?.id ? "active-badge" : "status-badge")
-    + badge(profileEngineLabel(selected.engine), "status-badge") + '</div><p>简历提取结果可逐项修改；空白板块不会影响保存。</p></section><div class="profile-record-workspace"><nav class="profile-section-nav" aria-label="画像板块">'
+    + badge(profileEngineLabel(selected.engine), "status-badge") + '</div><label class="field profile-name-field"><span>画像名称</span><input id="profile-record-name" maxlength="80" value="' + escapeHtml(profileLabel(selected)) + '"></label><p>每个画像拥有独立的评分偏好和排除词；空白板块不会影响保存。</p></section><div class="profile-record-workspace"><nav class="profile-section-nav" aria-label="画像板块">'
     + sectionTabs + '</nav><section class="profile-section-editor"><div class="profile-section-heading"><div><p>当前板块</p><h3>' + editorTitle + '</h3></div></div>'
     + profileSectionEditor(p) + '</section></div><div class="editor-actions"><button class="button button-secondary" data-save-profile="' + selected.id
-    + '"><i data-lucide="save"></i><span>保存画像</span></button>' + activeButton + clearOtherButton + "</div>";
+    + '"><i data-lucide="save"></i><span>保存画像</span></button>' + activeButton + deleteButton + "</div>";
 }
 
 function settingsRow(kind, item) {
@@ -1604,6 +1664,9 @@ function settingsRow(kind, item) {
 
 function renderSettings() {
   const settings = state.data.settings;
+  const settingsProfile = selectedSettingsProfile();
+  if (settingsProfile && state.settingsProfileId !== settingsProfile.id) state.settingsProfileId = settingsProfile.id;
+  el("#settings-profile-select").innerHTML = profileSelectOptions(settingsProfile?.id);
   el("#execution-mode").value = "sequential";
   const timing = settings.workerTiming || {};
   el("#timing-access-limit").value = timing.accessLimit ?? 20;
@@ -1614,6 +1677,8 @@ function renderSettings() {
   el("#timing-jd-interval").value = timing.jdIntervalSeconds ?? 1;
   el("#timing-jd-request-timeout").value = timing.jdRequestTimeoutSeconds ?? 5;
   el("#timing-jd-page-timeout").value = timing.jdPageTimeoutSeconds ?? 10;
+  el("#cover-letter-max-pages").value = String(settings.coverLetter?.maxPages ?? 1);
+  el("#cover-letter-prompt").value = settings.coverLetter?.prompt || "";
   const thresholds = [["strongMatch", "强匹配"], ["goodMatch", "好匹配"], ["maybe", "可考虑"], ["lowMatch", "低匹配"]];
   el("#threshold-row").innerHTML = thresholds.map((item) => '<label class="threshold"><span>' + item[1]
     + '</span><input type="number" min="0" max="100" data-threshold="' + item[0] + '" value="' + settings.thresholds[item[0]] + '"></label>').join("");
@@ -1623,8 +1688,9 @@ function renderSettings() {
     + '<div><strong>' + Number(history.migratedWorkerRecords || 0).toLocaleString() + '</strong><span>旧 Worker 已迁移</span></div>'
     + '<p><i data-lucide="shield-check"></i>同平台按 ID / 规范链接精确判重；跨平台仅在公司、完整职位名和地点同时一致时跳过。</p>';
   renderPreferenceLearningSettings();
-  const activeExclusions = settings.exclusionKeywords || [];
-  const pendingSuggestions = (state.data.exclusionSuggestions || []).filter((suggestion) => suggestion.status === "pending"
+  const profileLearning = contextForProfile(settingsProfile?.id);
+  const activeExclusions = profileLearning.exclusionKeywords || [];
+  const pendingSuggestions = (profileLearning.exclusionSuggestions || []).filter((suggestion) => suggestion.status === "pending"
     && !exclusionKeywordCovered(suggestion.keyword, activeExclusions));
   el("#active-exclusion-count").textContent = activeExclusions.length + " 项";
   el("#active-exclusion-keywords").innerHTML = activeExclusions.map((keyword) => '<span class="exclusion-chip"><span>' + escapeHtml(keyword)
@@ -1656,7 +1722,7 @@ function renderSettings() {
 
 function renderPreferenceLearningSettings() {
   const target = el("#settings-learning-content");
-  const model = state.data.preferenceModel;
+  const model = contextForProfile(selectedSettingsProfile()?.id).preferenceModel;
   if (!model) {
     target.innerHTML = '<p class="review-learning-empty">尚未形成学习偏好。完成一次职位审阅复盘后会显示在这里。</p>';
     return;
@@ -1679,7 +1745,7 @@ async function addExclusionKeyword() {
   const keyword = input.value.trim();
   if (!keyword) return toast("请输入排除关键词。", "error");
   try {
-    await api("/api/settings/exclusion-keywords", { method: "POST", body: JSON.stringify({ keyword }) });
+    await api("/api/settings/exclusion-keywords", { method: "POST", body: JSON.stringify({ keyword, profileId: selectedSettingsProfile()?.id }) });
     input.value = "";
     await reload();
     toast("排除词已启用；启动任务前仍会再次要求确认。", "success");
@@ -1690,7 +1756,7 @@ async function addExclusionKeyword() {
 
 async function approveExclusionSuggestion(id) {
   try {
-    await api("/api/exclusion-suggestions/" + id, { method: "POST", body: "{}" });
+    await api("/api/exclusion-suggestions/" + id, { method: "POST", body: JSON.stringify({ profileId: selectedSettingsProfile()?.id }) });
     await reload();
     toast("建议已批准并加入生效排除词。", "success");
   } catch (error) {
@@ -1700,7 +1766,7 @@ async function approveExclusionSuggestion(id) {
 
 async function dismissExclusionSuggestion(id) {
   try {
-    await api("/api/exclusion-suggestions/" + id, { method: "DELETE" });
+    await api("/api/exclusion-suggestions/" + id + "?profileId=" + encodeURIComponent(selectedSettingsProfile()?.id || ""), { method: "DELETE" });
     await reload();
     toast("已忽略这条排除建议。");
   } catch (error) {
@@ -1710,7 +1776,7 @@ async function dismissExclusionSuggestion(id) {
 
 async function removeActiveExclusion(encodedKeyword) {
   try {
-    await api("/api/settings/exclusion-keywords/" + encodedKeyword, { method: "DELETE" });
+    await api("/api/settings/exclusion-keywords/" + encodedKeyword + "?profileId=" + encodeURIComponent(selectedSettingsProfile()?.id || ""), { method: "DELETE" });
     await reload();
     toast("这个排除词已停止生效。", "success");
   } catch (error) {
@@ -1896,18 +1962,20 @@ function render() {
 async function reload() {
   state.data = await api("/api/bootstrap");
   if (!state.profileId && state.data.profiles.length) state.profileId = state.data.activeProfile?.id || state.data.profiles[0].id;
+  if (!state.data.profiles.some((profile) => profile.id === state.profileId)) state.profileId = state.data.activeProfile?.id || state.data.profiles[0]?.id || null;
+  if (!state.data.profiles.some((profile) => profile.id === state.settingsProfileId)) state.settingsProfileId = state.data.activeProfile?.id || state.data.profiles[0]?.id || null;
   el("#api-status").textContent = "本地服务已连接";
   el("#api-status-dot").classList.add("is-online");
   render();
 }
 
-async function launchRun(routineTaskIds = null) {
+async function launchRun(routineTaskIds = null, profileId = null) {
   const launcher = window.open("about:blank", "job-agent-worker-launch");
   try {
     if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
     const result = await api("/api/runs", {
       method: "POST",
-      body: JSON.stringify(routineTaskIds ? { routineTaskIds } : {})
+      body: JSON.stringify({ ...(routineTaskIds ? { routineTaskIds } : {}), profileId })
     });
     const firstLaunch = result.launchUrls[0];
     if (launcher && firstLaunch?.url) {
@@ -1985,17 +2053,27 @@ function requestRunConfirmation(routineTaskIds = null) {
   const allTasks = (state.data.routineTasks || []).filter((task) => task.status === "READY");
   const selected = routineTaskIds ? allTasks.filter((task) => routineTaskIds.includes(task.id)) : allTasks;
   if (!selected.length) return toast("没有可运行任务。请先验证并启用任务组合。", "error");
+  if (!state.data.profiles?.length) return toast("请先创建并确认至少一个职业画像。", "error");
   state.pendingRunTaskIds = routineTaskIds ? selected.map((task) => task.id) : null;
-  const exclusions = state.data.settings.exclusionKeywords || [];
-  el("#run-exclusion-review").innerHTML = '<div class="run-confirm-summary"><strong>本次 ' + selected.length + ' 项任务</strong><span>'
-    + escapeHtml([...new Set(selected.map((task) => names[task.platform]))].join(" / ")) + '</span></div>'
-    + (exclusions.length
-      ? '<div class="run-confirm-keywords">' + exclusions.map((keyword) => '<span>' + escapeHtml(keyword) + '</span>').join("") + '</div>'
-      : '<p class="exclusion-empty">当前没有生效的排除关键词，本次 Worker 不会按排除词跳过职位。</p>');
+  state.pendingRunProfileId = state.data.activeProfile?.id || state.data.profiles[0].id;
+  el("#run-profile-select").innerHTML = profileSelectOptions(state.pendingRunProfileId);
+  renderRunProfileConfirmation(selected);
   el("#run-exclusion-confirmed").checked = false;
   el("#confirm-start-run").disabled = true;
   el("#run-confirmation-dialog").showModal();
   refreshIcons();
+}
+
+function renderRunProfileConfirmation(selectedTasks = null) {
+  const allTasks = (state.data.routineTasks || []).filter((task) => task.status === "READY");
+  const selected = selectedTasks || (state.pendingRunTaskIds ? allTasks.filter((task) => state.pendingRunTaskIds.includes(task.id)) : allTasks);
+  const profile = state.data.profiles.find((item) => item.id === state.pendingRunProfileId) || state.data.profiles[0];
+  const exclusions = contextForProfile(profile?.id).exclusionKeywords || [];
+  el("#run-exclusion-review").innerHTML = '<div class="run-confirm-summary"><strong>本次 ' + selected.length + ' 项任务</strong><span>'
+    + escapeHtml([...new Set(selected.map((task) => names[task.platform]))].join(" / ")) + ' · ' + escapeHtml(profileLabel(profile)) + '</span></div>'
+    + (exclusions.length
+      ? '<div class="run-confirm-keywords">' + exclusions.map((keyword) => '<span>' + escapeHtml(keyword) + '</span>').join("") + '</div>'
+      : '<p class="exclusion-empty">当前没有生效的排除关键词，本次 Worker 不会按排除词跳过职位。</p>');
 }
 
 async function confirmStartRun(event) {
@@ -2004,7 +2082,7 @@ async function confirmStartRun(event) {
   const button = el("#confirm-start-run");
   button.disabled = true;
   const requestedIds = state.pendingRunTaskIds;
-  const result = await launchRun(requestedIds);
+  const result = await launchRun(requestedIds, state.pendingRunProfileId);
   if (!result) {
     button.disabled = false;
     return;
@@ -2015,6 +2093,7 @@ async function confirmStartRun(event) {
     reconcileCategorySelectionsFromRoutineTasks();
   }
   state.pendingRunTaskIds = null;
+  state.pendingRunProfileId = null;
 }
 
 async function uploadResume() {
@@ -2081,6 +2160,7 @@ async function generateProfile() {
   const resumeText = el("#resume-text").value.trim();
   if (resumeText.length < 80) return toast("请先提供足够的简历文本。", "error");
   const externalProfileText = el("#external-profile-text").value.trim();
+  const profileName = el("#generated-profile-name").value.trim();
   const button = el("#generate-profile");
   const originalMarkup = button.innerHTML;
   button.disabled = true;
@@ -2092,6 +2172,7 @@ async function generateProfile() {
     const result = await api("/api/profiles/generate", {
       method: "POST",
       body: JSON.stringify({
+        name: profileName,
         resumeText,
         sourceName: state.resumeSource || "pasted-resume.txt",
         externalProfileText
@@ -2099,6 +2180,7 @@ async function generateProfile() {
     });
     state.profileId = result.profile.id;
     state.profilePane = "editor";
+    el("#generated-profile-name").value = "";
     await reload();
     state.view = "profile";
     render();
@@ -2123,6 +2205,49 @@ async function generateProfile() {
     button.classList.remove("is-busy");
     button.removeAttribute("aria-busy");
     button.innerHTML = originalMarkup;
+    refreshIcons();
+  }
+}
+
+function openNewProfileDialog() {
+  const selected = selectedProfile();
+  const form = el("#new-profile-form");
+  form.reset();
+  const copy = el("#new-profile-copy-current");
+  copy.disabled = !selected;
+  el("#new-profile-copy-note").textContent = selected
+    ? `复制“${profileLabel(selected)}”的画像字段；学习偏好、排除词和待审核建议会保持为空。`
+    : "当前没有可复制的画像，将创建空白画像。";
+  el("#new-profile-dialog").showModal();
+  el("#new-profile-name").focus();
+  refreshIcons();
+}
+
+async function createProfile(event) {
+  event.preventDefault();
+  const name = el("#new-profile-name").value.trim();
+  if (!name) return toast("请输入画像名称。", "error");
+  const selected = selectedProfile();
+  const copyCurrent = el("#new-profile-copy-current").checked && selected;
+  const submit = event.submitter || el("#new-profile-form button[type='submit']");
+  submit.disabled = true;
+  try {
+    const result = await api("/api/profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        ...(copyCurrent ? { copyFromProfileId: selected.id, profile: commitProfileEditor() } : {})
+      })
+    });
+    state.profileId = result.profile.id;
+    state.profilePane = "editor";
+    el("#new-profile-dialog").close();
+    await reload();
+    toast(copyCurrent ? "新画像已创建，并复制了当前画像内容。" : "空白画像已创建。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    submit.disabled = false;
     refreshIcons();
   }
 }
@@ -2353,7 +2478,10 @@ function profileForm() {
 
 function commitProfileEditor() {
   const selected = selectedProfile();
-  if (selected && el("#profile-fields")?.querySelector(".profile-record-workspace")) selected.profile = profileForm();
+  if (selected && el("#profile-fields")?.querySelector(".profile-record-workspace")) {
+    selected.profile = profileForm();
+    selected.name = el("#profile-record-name")?.value.trim() || selected.name;
+  }
   return selected?.profile;
 }
 
@@ -2473,7 +2601,8 @@ function removeCustomProfileSection(button) {
 
 async function saveProfile(id) {
   try {
-    await api("/api/profiles/" + id, { method: "PUT", body: JSON.stringify({ profile: profileForm() }) });
+    const record = selectedProfile();
+    await api("/api/profiles/" + id, { method: "PUT", body: JSON.stringify({ profile: profileForm(), name: el("#profile-record-name")?.value || record?.name }) });
     await reload();
     toast("画像已保存。");
   } catch (error) {
@@ -2483,11 +2612,26 @@ async function saveProfile(id) {
 
 async function activateProfile(id) {
   try {
-    await api("/api/profiles/" + id, { method: "PUT", body: JSON.stringify({ profile: profileForm() }) });
+    const record = selectedProfile();
+    await api("/api/profiles/" + id, { method: "PUT", body: JSON.stringify({ profile: profileForm(), name: el("#profile-record-name")?.value || record?.name }) });
     const result = await api("/api/profiles/" + id + "/activate", { method: "POST", body: "{}" });
     state.profileId = id;
     await reload();
-    toast(result.deleted ? "已确认画像，并清理 " + result.deleted + " 个其他版本。" : "已确认当前职业画像。");
+    toast("已设为默认画像；其他画像仍会保留。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function deleteProfile(id) {
+  const profile = state.data.profiles.find((item) => item.id === id);
+  if (!profile || !window.confirm(`删除画像“${profileLabel(profile)}”？该画像的职位历史仍会保留，但不能再用于新任务或重新生成文档。`)) return;
+  try {
+    const result = await api("/api/profiles/" + id, { method: "DELETE" });
+    state.profileId = result.activeProfileId;
+    state.settingsProfileId = result.activeProfileId;
+    await reload();
+    toast("画像已删除。", "success");
   } catch (error) {
     toast(error.message, "error");
   }
@@ -2520,17 +2664,23 @@ function settingPayload() {
       jdIntervalSeconds: Number(el("#timing-jd-interval").value),
       jdRequestTimeoutSeconds: Number(el("#timing-jd-request-timeout").value),
       jdPageTimeoutSeconds: Number(el("#timing-jd-page-timeout").value)
+    },
+    coverLetter: {
+      maxPages: Number(el("#cover-letter-max-pages").value),
+      prompt: el("#cover-letter-prompt").value.trim()
     }
   };
 }
 
 function categoryTaskEditorRow(task = {}) {
   const platform = task.platform || "linkedin";
+  const jobType = task.jobType || "any";
   const postedWithinDays = Number(task.postedWithinDays || 0);
   const platformOptions = ["linkedin", "indeed", "seek"].map((value) => '<option value="' + value + '"' + (platform === value ? " selected" : "") + '>' + names[value] + '</option>').join("");
   const timeOptions = Object.entries(postedWithinLabels).map(([value, label]) => '<option value="' + value + '"' + (postedWithinDays === Number(value) ? " selected" : "") + '>' + label + '</option>').join("");
   return '<div class="category-task-editor-row" data-category-task-id="' + escapeHtml(task.id || "") + '">'
     + '<label class="field"><span>平台</span><select data-category-task-field="platform">' + platformOptions + '</select></label>'
+    + '<label class="field"><span>职位类型</span><select data-category-task-field="jobType">' + jobTypeOptions(platform, jobType) + '</select></label>'
     + '<label class="field category-task-keyword"><span>关键词（逗号表示任一）</span><input data-category-task-field="keyword" required maxlength="160" placeholder="intern, internship" value="' + escapeHtml(task.keyword || "") + '"></label>'
     + '<label class="field category-task-location"><span>地点</span><input data-category-task-field="location" required maxlength="120" value="' + escapeHtml(task.location || "") + '"></label>'
     + '<label class="field"><span>时间</span><select data-category-task-field="postedWithinDays">' + timeOptions + '</select></label>'
@@ -2543,7 +2693,8 @@ function taskIdentityKey(task) {
     String(task?.platform || "").toLowerCase(),
     String(task?.keyword || "").toLowerCase().split(",").map((value) => value.trim()).filter(Boolean).join(","),
     String(task?.location || "").toLowerCase().replace(/\s+/g, " ").trim(),
-    Number(task?.postedWithinDays || 0)
+    Number(task?.postedWithinDays || 0),
+    String(task?.jobType || "any")
   ].join("\u0000");
 }
 
@@ -2562,6 +2713,7 @@ function verifiedTaskOptions() {
       keyword: source.keyword,
       location: source.location,
       postedWithinDays: Number(source.postedWithinDays || 0),
+      jobType: source.jobType || "any",
       enabled: Boolean(enabled)
     });
   };
@@ -2579,7 +2731,7 @@ function verifiedTaskOptions() {
 function visibleVerifiedTaskOptions() {
   const query = String(el("#category-verified-search")?.value || "").toLowerCase().trim();
   if (!query) return verifiedTaskOptions();
-  return verifiedTaskOptions().filter((task) => [names[task.platform], task.platform, task.keyword, task.location, postedWithinLabels[task.postedWithinDays]]
+  return verifiedTaskOptions().filter((task) => [names[task.platform], task.platform, task.keyword, task.location, postedWithinLabels[task.postedWithinDays], jobTypeLabels[task.jobType || "any"]]
     .some((value) => String(value || "").toLowerCase().includes(query)));
 }
 
@@ -2597,7 +2749,7 @@ function renderVerifiedTaskPicker() {
       + '<span>' + badge(names[task.platform], "source-" + task.platform) + '</span>'
       + '<strong title="' + escapeHtml(task.keyword) + '">' + escapeHtml(task.keyword) + '</strong>'
       + '<span class="verified-task-location" title="' + escapeHtml(task.location) + '">' + escapeHtml(task.location) + '</span>'
-      + '<span class="verified-task-time">' + escapeHtml(postedWithinLabels[task.postedWithinDays] || "不限") + '</span>'
+      + '<span class="verified-task-time">' + escapeHtml(postedWithinLabels[task.postedWithinDays] || "不限") + ' · ' + escapeHtml(jobTypeLabels[task.jobType || "any"] || task.jobType) + '</span>'
       + '<span class="verified-task-state">' + badge(task.enabled ? "可运行" : "已预检", "status-badge") + '</span>'
       + '</label>';
   }).join("") || '<div class="category-editor-empty">' + (options.length ? "没有匹配的已预检任务。" : "还没有通过预检的任务，可先在下方新增。") + '</div>';
@@ -2663,7 +2815,8 @@ function taskCategoryFormInput() {
       platform: task.platform,
       keyword: task.keyword,
       location: task.location,
-      postedWithinDays: task.postedWithinDays
+      postedWithinDays: task.postedWithinDays,
+      jobType: task.jobType || "any"
     };
   });
   const draftTasks = [...document.querySelectorAll("#category-task-editor .category-task-editor-row")].map((row) => ({
@@ -2671,7 +2824,8 @@ function taskCategoryFormInput() {
     platform: row.querySelector('[data-category-task-field="platform"]').value,
     keyword: row.querySelector('[data-category-task-field="keyword"]').value,
     location: row.querySelector('[data-category-task-field="location"]').value,
-    postedWithinDays: Number(row.querySelector('[data-category-task-field="postedWithinDays"]').value)
+    postedWithinDays: Number(row.querySelector('[data-category-task-field="postedWithinDays"]').value),
+    jobType: row.querySelector('[data-category-task-field="jobType"]').value
   }));
   const tasks = [...verifiedTasks, ...draftTasks];
   if (!tasks.length) throw new Error("请至少选择一项已预检任务，或新增一项待预检任务。");
@@ -2768,6 +2922,7 @@ function openRoutineTaskDialog() {
   el("#routine-task-form").reset();
   el("#routine-task-dialog-title").textContent = "添加待预检任务";
   el("#routine-task-submit-label").textContent = "加入待预检";
+  syncRoutineJobTypeOptions("any");
   el("#routine-task-dialog").showModal();
 }
 
@@ -2779,6 +2934,7 @@ function openValidationEditor(id) {
   el("#routine-task-keyword").value = validation.keyword;
   el("#routine-task-location").value = validation.location;
   el("#routine-task-time").value = String(validation.postedWithinDays);
+  syncRoutineJobTypeOptions(validation.jobType || "any");
   el("#routine-task-dialog-title").textContent = "修改待预检任务";
   el("#routine-task-submit-label").textContent = "保存到待预检";
   el("#routine-task-dialog").showModal();
@@ -2789,7 +2945,8 @@ function routineTaskInput() {
     platform: el("#routine-task-platform").value,
     keyword: el("#routine-task-keyword").value,
     location: el("#routine-task-location").value,
-    postedWithinDays: Number(el("#routine-task-time").value)
+    postedWithinDays: Number(el("#routine-task-time").value),
+    jobType: el("#routine-task-job-type").value
   };
 }
 
@@ -3649,6 +3806,140 @@ async function rereviewJob(id, button) {
   }
 }
 
+function renderCoverLetterRecord(record) {
+  state.coverLetterCurrent = record || null;
+  el("#cover-letter-result").hidden = !record;
+  el("#cover-letter-version").textContent = record ? `版本 ${record.version} · ${profileLabel(state.data.profiles.find((item) => item.id === record.profileId))}` : "";
+  el("#cover-letter-overview").textContent = record?.overview || "";
+  el("#cover-letter-subject").value = record?.subject || "";
+  el("#cover-letter-salutation").value = record?.salutation || "";
+  el("#cover-letter-body").value = record?.body || "";
+  el("#cover-letter-closing").value = record?.closing || "";
+  el("#cover-letter-applicant").value = record?.applicantName || "";
+  el("#cover-letter-revision").value = "";
+}
+
+function setCoverLetterBusy(busy, label = "生成 Cover Letter") {
+  const generate = el("#generate-cover-letter");
+  const revise = el("#revise-cover-letter");
+  const save = el("#save-cover-letter");
+  const exportButton = el("#export-cover-letter");
+  [generate, revise, save, exportButton].forEach((button) => { button.disabled = busy; });
+  generate.classList.toggle("is-busy", busy);
+  generate.innerHTML = busy
+    ? '<i data-lucide="loader-circle" class="button-spinner"></i><span>' + escapeHtml(label) + "</span>"
+    : '<i data-lucide="sparkles"></i><span>生成 Cover Letter</span>';
+  refreshIcons();
+}
+
+async function openCoverLetter(jobId) {
+  const job = state.data.jobs.find((item) => item.id === jobId);
+  if (!job || !hasCompleteJobJd(job)) return toast("需要先取得完整 JD，才能生成 Cover Letter。", "error");
+  state.coverLetterJobId = jobId;
+  state.coverLetterCurrent = null;
+  const run = runForJob(job);
+  const profileId = job.profileId || run?.profileId || state.data.activeProfile?.id || state.data.profiles[0]?.id;
+  el("#cover-letter-title").textContent = job.title;
+  el("#cover-letter-job-meta").textContent = [job.company, job.location, names[job.source]].filter(Boolean).join(" · ");
+  el("#cover-letter-profile").innerHTML = profileSelectOptions(profileId);
+  el("#cover-letter-pages").value = String(state.data.settings.coverLetter?.maxPages ?? 1);
+  el("#cover-letter-instructions").value = state.data.settings.coverLetter?.prompt || "";
+  renderCoverLetterRecord(null);
+  el("#cover-letter-dialog").showModal();
+  refreshIcons();
+  try {
+    const result = await api(`/api/jobs/${jobId}/cover-letters`);
+    const latest = result.coverLetters?.[0] || null;
+    if (latest) {
+      el("#cover-letter-profile").value = latest.profileId;
+      el("#cover-letter-pages").value = String(latest.maxPages || el("#cover-letter-pages").value);
+      el("#cover-letter-instructions").value = latest.customInstructions || el("#cover-letter-instructions").value;
+      renderCoverLetterRecord(latest);
+    }
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function coverLetterDraftFromForm() {
+  return {
+    overview: el("#cover-letter-overview").textContent,
+    subject: el("#cover-letter-subject").value,
+    salutation: el("#cover-letter-salutation").value,
+    body: el("#cover-letter-body").value,
+    closing: el("#cover-letter-closing").value,
+    applicantName: el("#cover-letter-applicant").value
+  };
+}
+
+async function saveCoverLetterEdits({ quiet = false } = {}) {
+  if (!state.coverLetterCurrent) throw new Error("请先生成 Cover Letter。");
+  const result = await api(`/api/cover-letters/${state.coverLetterCurrent.id}`, {
+    method: "PUT",
+    body: JSON.stringify(coverLetterDraftFromForm())
+  });
+  renderCoverLetterRecord(result.coverLetter);
+  if (!quiet) toast("Cover Letter 编辑已保存。", "success");
+  return result.coverLetter;
+}
+
+async function generateCoverLetterDraft({ revise = false } = {}) {
+  if (!state.coverLetterJobId) return;
+  const revisionRequest = el("#cover-letter-revision").value.trim();
+  if (revise && !revisionRequest) return toast("请先填写希望如何修改。", "error");
+  try {
+    if (revise && state.coverLetterCurrent) await saveCoverLetterEdits({ quiet: true });
+    setCoverLetterBusy(true, revise ? "正在按建议修改..." : "正在生成...");
+    const result = await api(`/api/jobs/${state.coverLetterJobId}/cover-letters`, {
+      method: "POST",
+      body: JSON.stringify({
+        profileId: el("#cover-letter-profile").value,
+        maxPages: Number(el("#cover-letter-pages").value),
+        customInstructions: el("#cover-letter-instructions").value.trim(),
+        previousCoverLetterId: revise ? state.coverLetterCurrent?.id : null,
+        revisionRequest: revise ? revisionRequest : ""
+      })
+    });
+    renderCoverLetterRecord(result.coverLetter);
+    await reload();
+    state.view = "jobs";
+    toast(revise ? "已生成修改版本。" : "Cover Letter 已生成。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    setCoverLetterBusy(false);
+  }
+}
+
+function exportCoverLetterPdf() {
+  if (!state.coverLetterCurrent || !state.coverLetterJobId) return toast("请先生成 Cover Letter。", "error");
+  const printWindow = window.open("about:blank", "_blank");
+  if (!printWindow) return toast("浏览器阻止了导出窗口，请允许本站打开弹窗。", "error");
+  const job = state.data.jobs.find((item) => item.id === state.coverLetterJobId);
+  const profile = state.data.profiles.find((item) => item.id === el("#cover-letter-profile").value)?.profile || {};
+  const draft = coverLetterDraftFromForm();
+  const basic = profile.basicInfo || {};
+  const contact = [basic.location, basic.phone, basic.email, basic.linkedinUrl, basic.websiteUrl].filter(Boolean).map(escapeHtml).join(" · ");
+  const body = draft.body.split(/\n{2,}/).filter(Boolean).map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>")}</p>`).join("");
+  const documentTitle = `${draft.applicantName || "Cover Letter"} - ${job?.title || "Application"}`;
+  printWindow.document.write(`<!doctype html><html><head><title>${escapeHtml(documentTitle)}</title><style>
+    @page { size: A4; margin: 20mm 21mm; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #142033; font: 11pt/1.48 Arial, Helvetica, sans-serif; }
+    header { border-bottom: 1px solid #b8c4d2; padding-bottom: 10px; margin-bottom: 22px; }
+    h1 { margin: 0 0 5px; font-size: 18pt; font-weight: 700; letter-spacing: 0; }
+    .contact, .meta { color: #526172; font-size: 9.5pt; }
+    .meta { margin-bottom: 18px; }
+    .subject { font-weight: 700; margin: 18px 0; }
+    p { margin: 0 0 12px; }
+    .closing { margin-top: 18px; }
+  </style></head><body><header><h1>${escapeHtml(draft.applicantName)}</h1><div class="contact">${contact}</div></header>
+  <div class="meta">${escapeHtml(new Date().toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric" }))}<br>${escapeHtml(job?.company || "")}<br>${escapeHtml(job?.location || "")}</div>
+  ${draft.subject ? `<div class="subject">${escapeHtml(draft.subject)}</div>` : ""}<p>${escapeHtml(draft.salutation)}</p>${body}<div class="closing">${escapeHtml(draft.closing)}<br><br>${escapeHtml(draft.applicantName)}</div>
+  <script>setTimeout(() => { window.print(); }, 250);<\/script></body></html>`);
+  printWindow.document.close();
+}
+
 document.addEventListener("click", (event) => {
   if (event.target.closest("#toggle-job-assistant")) {
     state.jobAssistantOpen = !state.jobAssistantOpen;
@@ -3723,12 +4014,15 @@ document.addEventListener("click", (event) => {
     if (state.profilePane === "editor" && profilePane.dataset.profilePane === "upload") commitProfileEditor();
     return setProfilePane(profilePane.dataset.profilePane);
   }
+  if (event.target.closest("#open-new-profile")) return openNewProfileDialog();
   const routinePane = event.target.closest("[data-routine-pane]");
   if (routinePane) return setRoutinePane(routinePane.dataset.routinePane);
   const scoreDetails = event.target.closest("[data-score-details]");
   if (scoreDetails) return openScoreDetails(scoreDetails.dataset.scoreDetails);
   const rereview = event.target.closest("[data-rereview]");
   if (rereview) return rereviewJob(rereview.dataset.rereview, rereview);
+  const coverLetter = event.target.closest("[data-cover-letter]");
+  if (coverLetter) return openCoverLetter(coverLetter.dataset.coverLetter);
   const feedback = event.target.closest("[data-feedback]");
   if (feedback) return openFeedback(feedback.dataset.feedback, feedback.dataset.feedbackMode);
   const viewedButton = event.target.closest("[data-toggle-viewed]");
@@ -3780,6 +4074,8 @@ document.addEventListener("click", (event) => {
   if (save) return saveProfile(save.dataset.saveProfile);
   const activate = event.target.closest("[data-activate]");
   if (activate) return activateProfile(activate.dataset.activate);
+  const deleteProfileButton = event.target.closest("[data-delete-profile]");
+  if (deleteProfileButton) return deleteProfile(deleteProfileButton.dataset.deleteProfile);
   const clearOtherProfilesButton = event.target.closest("[data-clear-other-profiles]");
   if (clearOtherProfilesButton) return clearOtherProfiles();
   const toggleCategoryButton = event.target.closest("[data-toggle-category]");
@@ -3904,6 +4200,23 @@ document.addEventListener("pointerup", finishProfileChipPointerDrag);
 document.addEventListener("pointercancel", finishProfileChipPointerDrag);
 document.addEventListener("change", (event) => {
   if (event.target.matches("#job-category, #job-source, #job-status, #job-viewed, #job-sort")) renderJobs();
+  if (event.target.matches("#settings-profile-select")) {
+    state.settingsProfileId = event.target.value;
+    renderSettings();
+    refreshIcons();
+  }
+  if (event.target.matches("#run-profile-select")) {
+    state.pendingRunProfileId = event.target.value;
+    el("#run-exclusion-confirmed").checked = false;
+    el("#confirm-start-run").disabled = true;
+    renderRunProfileConfirmation();
+  }
+  if (event.target.matches("#routine-task-platform")) syncRoutineJobTypeOptions();
+  if (event.target.matches('[data-category-task-field="platform"]')) {
+    const row = event.target.closest(".category-task-editor-row");
+    const jobType = row.querySelector('[data-category-task-field="jobType"]');
+    jobType.innerHTML = jobTypeOptions(event.target.value, "any");
+  }
   if (event.target.matches("#ai-wire-api")) state.aiConfigDirty = true;
   if (event.target.matches("[data-category-verified-task]")) {
     const id = event.target.dataset.categoryVerifiedTask;
@@ -4014,6 +4327,7 @@ el("#open-import").addEventListener("click", openImport);
 el("#extract-resume").addEventListener("click", uploadResume);
 el("#copy-external-profile-prompt").addEventListener("click", copyExternalGptPrompt);
 el("#generate-profile").addEventListener("click", generateProfile);
+el("#new-profile-form").addEventListener("submit", createProfile);
 el("#save-settings").addEventListener("click", saveSettings);
 el("#add-exclusion-keyword").addEventListener("click", addExclusionKeyword);
 el("#save-ai-config").addEventListener("click", saveAiConfig);
@@ -4031,6 +4345,10 @@ el("#run-confirmation-form").addEventListener("submit", confirmStartRun);
 el("#remove-feedback").addEventListener("click", removeJobFeedback);
 el("#complete-run-review").addEventListener("click", completeRunReview);
 el("#job-assistant-form").addEventListener("submit", sendJobAssistant);
+el("#generate-cover-letter").addEventListener("click", () => generateCoverLetterDraft());
+el("#revise-cover-letter").addEventListener("click", () => generateCoverLetterDraft({ revise: true }));
+el("#save-cover-letter").addEventListener("click", () => saveCoverLetterEdits().catch((error) => toast(error.message, "error")));
+el("#export-cover-letter").addEventListener("click", exportCoverLetterPdf);
 
 reload().catch((error) => {
   el("#api-status").textContent = "本地服务未连接";

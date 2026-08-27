@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.0.1
+// @version      1.1.1
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.0.1";
+    const APP_VERSION = "1.1.1";
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
         cooldownMinutes: 5,
@@ -1001,11 +1001,20 @@
 
     function agentHumanBlockReason() {
         const path = location.pathname.toLowerCase();
-        if (/(captcha|challenge|checkpoint|authwall|login)/.test(path)) return "The site requires sign-in or a security check in this worker tab.";
-        const text = (document.body?.innerText || "").slice(0, 16000);
-        if (/captcha|verify you are human|unusual traffic|security check|robot check/i.test(text)) {
-            return "The site requested a manual security verification in this worker tab.";
-        }
+        if (/(captcha|challenge|checkpoint|authwall|login)/.test(path)) return "检测到登录页或安全验证页。请在 Worker 标签页完成登录或验证，然后点击“继续”。";
+        const challengePattern = /additional verification required|additional verification|verify (?:that )?you(?:'re| are) (?:a )?human|confirm (?:that )?you(?:'re| are) human|verify your identity|are you (?:a )?robot|unusual traffic|complete (?:the )?security (?:check|verification)|security verification required|checking (?:your )?browser|access (?:has been )?blocked|需要进行其他验证|验证您是人类|安全验证/i;
+        const visibleChallenge = Array.from(document.querySelectorAll("iframe[src*='captcha' i], iframe[src*='challenge' i], iframe[src*='turnstile' i], iframe[title*='captcha' i], iframe[title*='challenge' i], [id*='captcha' i], [id*='challenge' i], [data-testid*='captcha' i], .cf-turnstile, form[action*='challenge' i]"))
+            .some(agentVisible);
+        if (visibleChallenge) return "检测到可见的安全验证。请在 Worker 标签页完成验证，然后点击“继续”。";
+        const prominentText = Array.from(document.querySelectorAll("h1, h2, [role='alert'], [role='dialog']"))
+            .filter(agentVisible)
+            .slice(0, 30)
+            .map((element) => element.innerText || element.textContent || "")
+            .join("\n");
+        if (challengePattern.test(prominentText)) return "检测到可见的安全验证。请在 Worker 标签页完成验证，然后点击“继续”。";
+        if (SITE.findCards(document).some(agentVisible)) return null;
+        const text = `${document.title || ""}\n${(document.body?.innerText || "").slice(0, 16000)}`;
+        if (challengePattern.test(text)) return "检测到可见的安全验证。请在 Worker 标签页完成验证，然后点击“继续”。";
         return null;
     }
 
@@ -1166,6 +1175,11 @@
         const deadline = Date.now() + 16000;
         while (!ui && Date.now() < deadline) await sleep(300);
         if (!ui) return agentSubmit("failed", "Job results did not load in the worker tab.", { results: [] });
+        try {
+            if (!await agentApplyIndeedJobTypeFilter(agentTask, "task")) return;
+        } catch (error) {
+            return agentSubmit("failed", `Job type filter failed: ${error.message || String(error)}`, { results: [] });
+        }
         agentStartedTaskId = agentTask.id;
         const includeKeywords = agentIncludeKeywordText(agentTask.keyword);
         ui.include.value = includeKeywords;
@@ -1636,6 +1650,100 @@
         return false;
     }
 
+    const INDEED_JOB_TYPE_LABELS = {
+        casual: "Casual",
+        "part-time": "Part-time",
+        "full-time": "Full-time",
+        permanent: "Permanent",
+        temporary: "Temporary",
+        "temp-to-perm": "Temp to perm",
+        "fixed-term": "Fixed term",
+        graduate: "Graduate",
+        seasonal: "Seasonal",
+        contract: "Contract",
+        subcontract: "Subcontract",
+        "student-job": "Student Job"
+    };
+
+    async function agentFindIndeedJobTypeOption(label, trigger, timeout = 8000) {
+        const deadline = Date.now() + timeout;
+        while (Date.now() < deadline) {
+            if (trigger?.isConnected && trigger.getAttribute("aria-expanded") !== "true") trigger.click();
+            const menu = document.querySelector("[role='menu'][aria-label*='Job type' i], [role='menu'][aria-label*='type' i]");
+            const options = Array.from((menu || document).querySelectorAll("[role='menuitemcheckbox'], [role='option'], input[type='checkbox'], label"));
+            const option = options.find((node) => {
+                const target = node.matches("input") ? node.closest("label, [role='menuitemcheckbox'], [role='option']") || node : node;
+                const text = (node.getAttribute("aria-label") || target.getAttribute("aria-label") || target.innerText || target.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+                const expected = label.toLowerCase();
+                return agentVisible(target) && (text === expected || text.startsWith(`${expected} `) || text.startsWith(`${expected} (`));
+            });
+            if (option) return option;
+            await sleep(180);
+        }
+        return null;
+    }
+
+    function agentJobTypeOptionChecked(option) {
+        if (!option) return false;
+        const input = option.matches("input") ? option : option.querySelector("input[type='checkbox']");
+        return Boolean(input?.checked || option.getAttribute("aria-checked") === "true" || option.getAttribute("aria-selected") === "true");
+    }
+
+    async function agentApplyIndeedJobTypeFilter(subject, mode = "task", attempt = 0) {
+        const jobType = String(subject.jobType || "any");
+        if (jobType === "any") return true;
+        const label = INDEED_JOB_TYPE_LABELS[jobType];
+        if (!label) throw new Error(`Indeed does not support job type ${jobType}.`);
+        if (attempt > 2) throw new Error(`Indeed did not retain Job type “${label}”.`);
+        setStatus(`Job Agent: 正在选择 Job type = ${label}...`);
+        log(`正在选择 Job type = ${label}`);
+        const trigger = await agentWaitFor(["button[aria-label='Job type filter']", "button[aria-label*='Job type' i]"], 6000);
+        if (!trigger) throw new Error("未找到 Indeed 的 Job type 筛选器。");
+        if (trigger.getAttribute("aria-expanded") !== "true") trigger.click();
+        const option = await agentFindIndeedJobTypeOption(label, trigger);
+        if (!option) {
+            const menu = document.querySelector("[role='menu'][aria-label*='Job type' i], [role='menu'][aria-label*='type' i]");
+            const available = Array.from(menu?.querySelectorAll("[role='menuitemcheckbox'], [role='option'], label") || [])
+                .filter(agentVisible)
+                .map((node) => (node.getAttribute("aria-label") || node.innerText || node.textContent || "").replace(/\s+/g, " ").trim())
+                .filter(Boolean)
+                .join("、");
+            throw new Error(`Job type 已打开，但 8 秒内未找到“${label}”选项。当前选项：${available || "未加载"}。`);
+        }
+        if (agentJobTypeOptionChecked(option)) {
+            if (mode === "task") {
+                agentTask.jobTypeApplied = true;
+                gmSet(AGENT.taskKey, agentTask);
+            }
+            log(`Job type 已确认：${label}`);
+            if (trigger.getAttribute("aria-expanded") === "true") {
+                trigger.click();
+                await sleep(200);
+            }
+            return true;
+        }
+        if (mode === "preflight") {
+            gmSet(AGENT.preflightKey, {
+                validationId: subject.id,
+                preflightAttempt: Number(subject.preflightAttempt || 1),
+                stage: "jobtype-verify"
+            });
+        }
+        const clickable = option.matches("input") ? option.closest("label, [role='menuitemcheckbox'], [role='option']") || option : option;
+        clickable.scrollIntoView({ block: "nearest" });
+        clickable.click();
+        const checkedDeadline = Date.now() + 3000;
+        while (Date.now() < checkedDeadline && !agentJobTypeOptionChecked(option)) await sleep(150);
+        if (!agentJobTypeOptionChecked(option)) throw new Error(`已点击“${label}”，但 Indeed 未将它标记为已选中。`);
+        const menu = clickable.closest("[role='menu'], [role='listbox'], [role='dialog']") || clickable.parentElement;
+        const update = Array.from((menu?.parentElement || document).querySelectorAll("button, [role='button']"))
+            .find((button) => agentVisible(button) && /^update$/i.test((button.innerText || button.textContent || "").trim()));
+        if (update) update.click();
+        else if (!await agentWaitAndClickText(/^update$/i, 4000)) throw new Error("已选择 Job type，但 4 秒内未找到 Indeed 的 Update 确认按钮。");
+        await sleep(1500);
+        return agentApplyIndeedJobTypeFilter(subject, mode, attempt + 1);
+    }
+
     async function agentWaitForIndeedDateOption(pattern, timeout = 8000) {
         const deadline = Date.now() + timeout;
         while (Date.now() < deadline) {
@@ -1940,9 +2048,10 @@
                 }
                 throw new Error("Date posted 未确认生效。Indeed 没有在结果 URL 中写入对应的 fromage 参数。");
             }
+            if (!await agentApplyIndeedJobTypeFilter(validation, "preflight")) return true;
             await agentAssertSearchResults(validation);
             setStatus("Job Agent: 预检通过。");
-            log("预检通过：搜索条件与 Date posted 均已确认。");
+            log("预检通过：搜索条件、Date posted 与 Job type 均已确认。");
             await agentSubmitPreflight(validation, "valid");
         } catch (error) {
             const reason = `预检失败：${error.message || String(error)}`;
