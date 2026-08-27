@@ -2,5 +2,7 @@ data/state.json
 data/ai-config.json
 data/uploads/
 data/*.log
+data/*.tmp
+data/backups/
 tools/__pycache__/
 .env

@@ -9,16 +9,18 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   aiPrivateConfig,
   aiStatus,
+  answerJobQuestions,
   configureAi,
   evaluateJdWithAi,
+  generateCoverLetter,
   generateProfile,
+  isTransientAiError,
   reflectOnJobFeedback,
   testAiConnection
 } from "./src/ai.mjs";
 import {
   localJdScreen,
   normalizeJob,
-  strongSourceKey,
   validateProfileDraft
 } from "./src/screening.mjs";
 import {
@@ -29,6 +31,7 @@ import {
 } from "./src/learning.mjs";
 import { normalizeKeywordAlternatives, primarySearchKeyword } from "./src/task-keywords.mjs";
 import { createStorage, newId } from "./src/storage.mjs";
+import { findDuplicate, strongIdentityKeys } from "./src/job-identity.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -43,6 +46,14 @@ const defaultSettings = JSON.parse(await readFile(join(root, "config", "job-sear
 const defaultTaskCategories = JSON.parse(await readFile(join(root, "config", "task-categories.json"), "utf8"));
 const platformOrder = ["linkedin", "indeed", "seek"];
 const allowedPlatforms = new Set(platformOrder);
+const platformJobTypes = {
+  linkedin: new Set(["any"]),
+  seek: new Set(["any", "full-time", "part-time", "contract", "casual"]),
+  indeed: new Set([
+    "any", "casual", "part-time", "full-time", "permanent", "temporary",
+    "temp-to-perm", "fixed-term", "graduate", "seasonal", "contract", "subcontract", "student-job"
+  ])
+};
 
 await loadDotEnv(join(root, ".env"));
 await loadSavedAiConfig();
@@ -51,16 +62,28 @@ const autoReviewQueue = [];
 const queuedAutoReviewIds = new Set();
 const jdRetryBatches = new Map();
 let autoReviewRunning = false;
+let autoReviewCooldownTimer = null;
 await storage.ensureState();
 await storage.update((state) => {
   state.settings = safeSettings(state.settings);
   state.exclusionSuggestions = (state.exclusionSuggestions ?? []).map(safeExclusionSuggestion).filter(Boolean);
-  for (const record of state.profiles) record.profile = validateProfileDraft(record.profile);
+  for (const record of state.profiles) {
+    record.profile = validateProfileDraft(record.profile);
+    record.name = safeProfileName(record.name || record.profile.basicInfo?.name || `Profile ${record.version || ""}`);
+  }
   if (state.preferenceModel) state.preferenceModel = validatePreferenceModel(state.preferenceModel);
+  migrateProfileContexts(state);
+  state.coverLetters ??= [];
   migrateKeywordAlternatives(state);
-  backfillPreferenceExclusionSuggestions(state);
-  compactPendingExclusionSuggestions(state);
-  removeCoveredPendingExclusionSuggestions(state);
+  migrateTaskJobTypes(state);
+  for (const profile of state.profiles) {
+    backfillPreferenceExclusionSuggestions(state, profile.id);
+    compactPendingExclusionSuggestions(state, profile.id);
+    removeCoveredPendingExclusionSuggestions(state, profile.id);
+  }
+  state.legacyWorkerHistory ??= [];
+  state.workerHistoryMigrations ??= [];
+  normalizeUnifiedHistory(state);
 });
 
 const maxBodyBytes = 7 * 1024 * 1024;
@@ -131,12 +154,125 @@ function publicProfile(profile) {
   return { ...safe, profile: validateProfileDraft(safe.profile) };
 }
 
+function cloneData(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function safeProfileName(value) {
+  return String(value || "Career profile").replace(/\s+/g, " ").trim().slice(0, 80) || "Career profile";
+}
+
+function nextProfileVersion(state) {
+  const version = Math.max(
+    0,
+    Number(state.profileVersionCounter) || 0,
+    ...state.profiles.map((item) => Number(item.version) || 0)
+  ) + 1;
+  state.profileVersionCounter = version;
+  return version;
+}
+
+function safeCoverLetterDraft(input) {
+  const clean = (value, max) => String(value || "").replace(/\r\n/g, "\n").trim().slice(0, max);
+  return {
+    overview: clean(input?.overview, 500),
+    subject: clean(input?.subject, 220),
+    salutation: clean(input?.salutation, 120),
+    body: clean(input?.body, 24_000),
+    closing: clean(input?.closing, 120),
+    applicantName: clean(input?.applicantName, 120)
+  };
+}
+
+function profileContext(state, profileId = state.activeProfileId) {
+  if (!profileId) return { exclusionKeywords: [], exclusionSuggestions: [], preferenceModel: null };
+  state.profileContexts ??= {};
+  const context = state.profileContexts[profileId] && typeof state.profileContexts[profileId] === "object"
+    ? state.profileContexts[profileId]
+    : {};
+  context.exclusionKeywords = [...new Set((context.exclusionKeywords ?? []).map((item) => String(item || "").trim()).filter(Boolean))].slice(0, 100);
+  context.exclusionSuggestions = (context.exclusionSuggestions ?? []).map(safeExclusionSuggestion).filter(Boolean);
+  context.preferenceModel = context.preferenceModel ? validatePreferenceModel(context.preferenceModel) : null;
+  state.profileContexts[profileId] = context;
+  return context;
+}
+
+function requireProfileContext(state, profileId) {
+  const id = String(profileId || state.activeProfileId || "");
+  if (!id || !state.profiles.some((profile) => profile.id === id)) throw new Error("Choose a valid career profile.");
+  return { id, context: profileContext(state, id) };
+}
+
+function findSuggestionContext(state, suggestionId, requestedProfileId = null) {
+  const profileIds = requestedProfileId ? [String(requestedProfileId)] : state.profiles.map((profile) => profile.id);
+  for (const profileId of profileIds) {
+    const context = profileContext(state, profileId);
+    const suggestion = context.exclusionSuggestions.find((item) => item.id === suggestionId);
+    if (suggestion) return { profileId, context, suggestion };
+  }
+  return null;
+}
+
+function migrateProfileContexts(state) {
+  state.profileContexts = state.profileContexts && typeof state.profileContexts === "object" && !Array.isArray(state.profileContexts)
+    ? state.profileContexts
+    : {};
+  for (const record of state.profiles) profileContext(state, record.id);
+  if (!state.profileContextsMigrated && state.activeProfileId && state.profiles.some((record) => record.id === state.activeProfileId)) {
+    const active = profileContext(state, state.activeProfileId);
+    if (!active.exclusionKeywords.length && (state.settings.exclusionKeywords ?? []).length) {
+      active.exclusionKeywords = [...state.settings.exclusionKeywords];
+    }
+    if (!active.exclusionSuggestions.length && (state.exclusionSuggestions ?? []).length) {
+      active.exclusionSuggestions = cloneData(state.exclusionSuggestions);
+    }
+    if (!active.preferenceModel && state.preferenceModel) active.preferenceModel = cloneData(state.preferenceModel);
+  }
+  state.profileContextsMigrated = true;
+}
+
+function publicProfileContexts(state) {
+  return Object.fromEntries(state.profiles.map((profile) => {
+    const context = profileContext(state, profile.id);
+    return [profile.id, cloneData(context)];
+  }));
+}
+
+function profileRecordForRun(state, run) {
+  return state.profiles.find((profile) => profile.id === run?.profileId)
+    ?? (run?.profileSnapshot ? {
+      id: run.profileId,
+      name: run.profileName || "Archived profile",
+      profile: run.profileSnapshot,
+      archived: true
+    } : null)
+    ?? state.profiles.find((profile) => profile.id === state.activeProfileId)
+    ?? null;
+}
+
+function runForJob(state, job) {
+  return job?.runId ? state.runs.find((run) => run.id === job.runId) ?? null : null;
+}
+
+function profileBundleForJob(state, job) {
+  const run = runForJob(state, job);
+  const profileId = job?.profileId || run?.profileId || state.activeProfileId;
+  const record = state.profiles.find((profile) => profile.id === profileId) ?? null;
+  return {
+    profileId,
+    record,
+    profile: cloneData(run?.profileSnapshot || record?.profile || null),
+    preferenceModel: cloneData(run?.preferenceModelSnapshot || profileContext(state, profileId).preferenceModel || null)
+  };
+}
+
 function buildBootstrap(state) {
   const retryCutoff = Date.now() - 20 * 60 * 1000;
   for (const [id, batch] of jdRetryBatches) {
     if (Date.parse(batch.createdAt) < retryCutoff) jdRetryBatches.delete(id);
   }
   const activeProfile = state.profiles.find((profile) => profile.id === state.activeProfileId) ?? null;
+  const activeContext = profileContext(state, state.activeProfileId);
   state.runs.forEach(ensureRunCounterShape);
   return {
     settings: state.settings,
@@ -148,8 +284,23 @@ function buildBootstrap(state) {
     validations: state.validations,
     taskCategories: state.taskCategories,
     reviewReflections: state.reviewReflections,
-    preferenceModel: state.preferenceModel,
-    exclusionSuggestions: state.exclusionSuggestions,
+    preferenceModel: activeContext.preferenceModel,
+    exclusionSuggestions: activeContext.exclusionSuggestions,
+    profileContexts: publicProfileContexts(state),
+    coverLetters: (state.coverLetters ?? []).map((item) => ({
+      id: item.id,
+      jobId: item.jobId,
+      profileId: item.profileId,
+      version: item.version,
+      overview: item.overview,
+      updatedAt: item.updatedAt
+    })),
+    unifiedHistory: {
+      agentJobs: state.jobs.length,
+      migratedWorkerRecords: (state.legacyWorkerHistory ?? []).length,
+      totalKnownJobs: state.jobs.filter((job) => !job.duplicateOf).length + (state.legacyWorkerHistory ?? []).length,
+      migrations: (state.workerHistoryMigrations ?? []).slice(0, 10)
+    },
     jdRetryBatches: [...jdRetryBatches.values()].map((batch) => ({
       id: batch.id,
       total: batch.jobIds.length,
@@ -288,6 +439,11 @@ function safeSettings(input) {
   const exclusionKeywords = [...new Set((Array.isArray(input.exclusionKeywords) ? input.exclusionKeywords : defaultSettings.exclusionKeywords ?? [])
     .map((keyword) => String(keyword ?? "").replace(/\s+/g, " ").trim())
     .filter((keyword) => keyword.length >= 2 && keyword.length <= 80))].slice(0, 100);
+  const coverLetter = {
+    maxPages: Math.max(1, Math.min(3, Math.round(Number(input.coverLetter?.maxPages ?? defaultSettings.coverLetter?.maxPages ?? 1) || 1))),
+    prompt: String(input.coverLetter?.prompt ?? defaultSettings.coverLetter?.prompt ?? "")
+      .replace(/\s+/g, " ").trim().slice(0, 2000)
+  };
   if (![0, 1, 3, 7, 14, 30].includes(postedWithinDays)) {
     throw new Error("Posted-within filter must be one of 0, 1, 3, 7, 14, or 30 days.");
   }
@@ -307,6 +463,7 @@ function safeSettings(input) {
     searches,
     exclusionKeywords,
     workerTiming,
+    coverLetter,
     thresholds
   };
 }
@@ -318,11 +475,13 @@ function safeRoutineTaskInput(input) {
   const keyword = normalizeKeywordAlternatives(String(input.keyword ?? "").slice(0, 160));
   const location = String(input.location ?? "").trim().slice(0, 120);
   const postedWithinDays = Number(input.postedWithinDays ?? 0);
+  const jobType = String(input.jobType ?? "any").toLowerCase().trim() || "any";
   if (!allowedPlatforms.has(platform)) throw new Error("Choose LinkedIn, Indeed, or SEEK.");
   if (!keyword) throw new Error("Enter a job keyword.");
   if (!location) throw new Error("Enter a location.");
   if (!supportedPostedWithinDays.has(postedWithinDays)) throw new Error("Choose a supported posted-within value.");
-  return { platform, keyword, location, postedWithinDays };
+  if (!platformJobTypes[platform].has(jobType)) throw new Error(`${platform} does not support the selected job type.`);
+  return { platform, keyword, location, postedWithinDays, jobType };
 }
 
 function migrateKeywordAlternatives(state) {
@@ -347,11 +506,26 @@ function migrateKeywordAlternatives(state) {
     .filter((task) => !changedValidationIds.has(task.validationId));
 }
 
+function migrateTaskJobTypes(state) {
+  for (const collection of [state.validations, state.routineTasks]) {
+    for (const task of collection ?? []) task.jobType = String(task.jobType || "any");
+  }
+  for (const category of state.taskCategories ?? []) {
+    for (const task of category.tasks ?? []) task.jobType = String(task.jobType || "any");
+  }
+  for (const run of state.runs ?? []) {
+    run.profileId ??= state.activeProfileId ?? null;
+    for (const task of run.tasks ?? []) task.jobType = String(task.jobType || "any");
+  }
+  for (const job of state.jobs ?? []) job.searchJobType = String(job.searchJobType || "any");
+}
+
 function sameRoutineTask(left, right) {
   return left?.platform === right?.platform
     && left?.keyword === right?.keyword
     && left?.location === right?.location
-    && Number(left?.postedWithinDays) === Number(right?.postedWithinDays);
+    && Number(left?.postedWithinDays) === Number(right?.postedWithinDays)
+    && String(left?.jobType ?? "any") === String(right?.jobType ?? "any");
 }
 
 const helpfulFeedbackReasons = new Set(["ROLE_RELEVANT", "SKILL_MATCH", "WOULD_APPLY", "REJECTION_CORRECT"]);
@@ -430,15 +604,17 @@ function exclusionKeywordCovered(keyword, enabledKeywords = []) {
   });
 }
 
-function removeCoveredPendingExclusionSuggestions(state) {
-  const enabledKeywords = state.settings.exclusionKeywords ?? [];
-  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => suggestion.status !== "pending"
+function removeCoveredPendingExclusionSuggestions(state, profileId = state.activeProfileId) {
+  const context = profileContext(state, profileId);
+  const enabledKeywords = context.exclusionKeywords;
+  context.exclusionSuggestions = context.exclusionSuggestions.filter((suggestion) => suggestion.status !== "pending"
     || !exclusionKeywordCovered(suggestion.keyword, enabledKeywords));
 }
 
-function compactPendingExclusionSuggestions(state) {
+function compactPendingExclusionSuggestions(state, profileId = state.activeProfileId) {
+  const context = profileContext(state, profileId);
   const compacted = [];
-  for (const suggestion of state.exclusionSuggestions) {
+  for (const suggestion of context.exclusionSuggestions) {
     if (suggestion.status !== "pending") {
       compacted.push(suggestion);
       continue;
@@ -454,18 +630,19 @@ function compactPendingExclusionSuggestions(state) {
     }
     compacted.push({ ...suggestion, keyword });
   }
-  state.exclusionSuggestions = compacted;
+  context.exclusionSuggestions = compacted;
 }
 
-function addExclusionSuggestions(state, job, signals) {
+function addExclusionSuggestions(state, job, signals, profileId = job?.profileId || state.activeProfileId) {
   if (isPositiveJobFeedback(job)) return;
-  const active = state.settings.exclusionKeywords ?? [];
+  const context = profileContext(state, profileId);
+  const active = context.exclusionKeywords;
   for (const rawKeyword of signals?.exclusionKeywords ?? []) {
     const keyword = compactExclusionKeyword(rawKeyword);
     if (!keyword) continue;
     const normalized = keyword.toLowerCase();
     if (exclusionKeywordCovered(keyword, active)) continue;
-    const existing = state.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === normalized);
+    const existing = context.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === normalized);
     if (existing) {
       existing.sourceJobIds = [...new Set([...(existing.sourceJobIds ?? []), job.id])].slice(0, 30);
       existing.sourceTitles = [...new Set([...(existing.sourceTitles ?? []), job.title])].slice(0, 12);
@@ -480,14 +657,15 @@ function addExclusionSuggestions(state, job, signals) {
       sourceRunId: job.runId,
       sourceType: "job-review"
     });
-    if (suggestion) state.exclusionSuggestions.unshift(suggestion);
+    if (suggestion) context.exclusionSuggestions.unshift(suggestion);
   }
-  compactPendingExclusionSuggestions(state);
-  state.exclusionSuggestions = state.exclusionSuggestions.slice(0, 300);
+  compactPendingExclusionSuggestions(state, profileId);
+  context.exclusionSuggestions = context.exclusionSuggestions.slice(0, 300);
 }
 
-function removeJobFromPendingExclusionSuggestions(state, jobId) {
-  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => {
+function removeJobFromPendingExclusionSuggestions(state, jobId, profileId = state.activeProfileId) {
+  const context = profileContext(state, profileId);
+  context.exclusionSuggestions = context.exclusionSuggestions.filter((suggestion) => {
     if (suggestion.status !== "pending" || !(suggestion.sourceJobIds ?? []).includes(jobId)) return true;
     suggestion.sourceJobIds = suggestion.sourceJobIds.filter((id) => id !== jobId);
     suggestion.sourceTitles = [...new Set(suggestion.sourceJobIds
@@ -497,18 +675,19 @@ function removeJobFromPendingExclusionSuggestions(state, jobId) {
   });
 }
 
-function addReflectionExclusionSuggestions(state, evidenceJobs, preferenceModel, runId) {
+function addReflectionExclusionSuggestions(state, evidenceJobs, preferenceModel, runId, profileId = state.activeProfileId) {
   const jobs = evidenceJobs.filter(isStrictExclusionFeedback);
   if (!jobs.length) return;
+  const context = profileContext(state, profileId);
   const evidenceIds = new Set(jobs.map((job) => job.id));
   const legacyReflectionReasons = new Set([
     "人工确认 Rejected 判断正确后，由审阅复盘整理。",
     "根据人工确认的不相关职位，由审阅复盘整理为待审核建议。"
   ]);
-  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => suggestion.status !== "pending"
+  context.exclusionSuggestions = context.exclusionSuggestions.filter((suggestion) => suggestion.status !== "pending"
     || !(suggestion.sourceType === "review-reflection" || legacyReflectionReasons.has(suggestion.reason))
     || !(suggestion.sourceJobIds ?? []).some((id) => evidenceIds.has(id)));
-  const active = state.settings.exclusionKeywords ?? [];
+  const active = context.exclusionKeywords;
   const candidates = [...new Set([
     ...(preferenceModel?.avoidSignals ?? []),
     ...(preferenceModel?.titleExclusions ?? [])
@@ -522,7 +701,7 @@ function addReflectionExclusionSuggestions(state, evidenceJobs, preferenceModel,
       return title.includes(normalized) || normalized.includes(title);
     }).filter((job) => !coveredJobIds.has(job.id));
     if (!sources.length) continue;
-    const existing = state.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === normalized);
+    const existing = context.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === normalized);
     if (existing) {
       existing.sourceJobIds = [...new Set([...(existing.sourceJobIds ?? []), ...sources.map((job) => job.id)])].slice(0, 30);
       existing.sourceTitles = [...new Set([...(existing.sourceTitles ?? []), ...sources.map((job) => job.title)])].slice(0, 12);
@@ -539,25 +718,27 @@ function addReflectionExclusionSuggestions(state, evidenceJobs, preferenceModel,
       sourceRunId: runId,
       sourceType: "review-reflection"
     });
-    if (suggestion) state.exclusionSuggestions.unshift(suggestion);
+    if (suggestion) context.exclusionSuggestions.unshift(suggestion);
     sources.forEach((job) => coveredJobIds.add(job.id));
   }
-  compactPendingExclusionSuggestions(state);
-  removeCoveredPendingExclusionSuggestions(state);
-  state.exclusionSuggestions = state.exclusionSuggestions.slice(0, 300);
+  compactPendingExclusionSuggestions(state, profileId);
+  removeCoveredPendingExclusionSuggestions(state, profileId);
+  context.exclusionSuggestions = context.exclusionSuggestions.slice(0, 300);
 }
 
-function backfillPreferenceExclusionSuggestions(state) {
-  if (!state.preferenceModel) return;
-  const evidenceJobs = state.jobs.filter(isStrictExclusionFeedback);
-  state.preferenceModel = ensurePreferenceModelNegativeCoverage(state.preferenceModel, evidenceJobs);
+function backfillPreferenceExclusionSuggestions(state, profileId = state.activeProfileId) {
+  const context = profileContext(state, profileId);
+  if (!context.preferenceModel) return;
+  const evidenceJobs = state.jobs.filter((job) => (job.profileId || runForJob(state, job)?.profileId || state.activeProfileId) === profileId)
+    .filter(isStrictExclusionFeedback);
+  context.preferenceModel = ensurePreferenceModelNegativeCoverage(context.preferenceModel, evidenceJobs);
   const reflection = state.reviewReflections.find((item) => item.id === state.runs
-    .find((run) => run.id === state.preferenceModel.sourceRunId)?.reviewReflectionId)
-    ?? state.reviewReflections.find((item) => item.runId === state.preferenceModel.sourceRunId);
-  if (reflection && reflection.version === state.preferenceModel.version) {
-    reflection.modelSnapshot = state.preferenceModel;
+    .find((run) => run.id === context.preferenceModel.sourceRunId)?.reviewReflectionId)
+    ?? state.reviewReflections.find((item) => item.runId === context.preferenceModel.sourceRunId);
+  if (reflection && reflection.version === context.preferenceModel.version) {
+    reflection.modelSnapshot = context.preferenceModel;
   }
-  addReflectionExclusionSuggestions(state, evidenceJobs, state.preferenceModel, state.preferenceModel.sourceRunId);
+  addReflectionExclusionSuggestions(state, evidenceJobs, context.preferenceModel, context.preferenceModel.sourceRunId, profileId);
 }
 
 function feedbackFingerprint(jobs) {
@@ -619,23 +800,36 @@ function isAiRoleRejectedSignal(job) {
       && job.learningSignals?.exclusionKeywords?.length));
 }
 
-function safeTaskCategoryInput(input, existing = null) {
+function safeTaskCategoryInput(input, existing = null, state = null) {
   const name = String(input.name ?? "").trim().slice(0, 80);
   const incomingTasks = Array.isArray(input.tasks) ? input.tasks.slice(0, 80) : [];
   if (!name) throw new Error("Enter a category name.");
   if (!incomingTasks.length) throw new Error("Add at least one task to the category.");
   const existingTasks = new Map((existing?.tasks ?? []).map((task) => [task.id, task]));
   const usedIds = new Set();
+  const usedTaskKeys = new Set();
   const tasks = incomingTasks.map((task) => {
     const taskInput = safeRoutineTaskInput(task);
+    const taskKey = [taskInput.platform, taskInput.keyword, taskInput.location.toLowerCase(), taskInput.postedWithinDays].join("\u0000");
+    if (usedTaskKeys.has(taskKey)) throw new Error("The same task cannot be added to a combination twice.");
+    usedTaskKeys.add(taskKey);
     const requestedId = String(task.id ?? "");
     const previous = existingTasks.get(requestedId);
     const id = previous && !usedIds.has(requestedId) ? requestedId : newId("category_task");
+    const sourceValidationId = String(task.sourceValidationId ?? "");
+    const sourceValidation = sourceValidationId
+      ? state?.validations.find((validation) => validation.id === sourceValidationId)
+      : null;
+    if (sourceValidationId && (!sourceValidation || sourceValidation.status !== "VALID" || !sameRoutineTask(sourceValidation, taskInput))) {
+      throw new Error("The selected preflighted task is no longer valid. Refresh and select it again.");
+    }
     usedIds.add(id);
     return {
       id,
       ...taskInput,
-      validationId: previous && sameRoutineTask(previous, taskInput) ? previous.validationId ?? null : null
+      validationId: previous && sameRoutineTask(previous, taskInput)
+        ? previous.validationId ?? sourceValidation?.id ?? null
+        : sourceValidation?.id ?? null
     };
   });
   return { name, tasks };
@@ -670,6 +864,7 @@ function createRoutineTask(validation) {
     keyword: validation.keyword,
     location: validation.location,
     postedWithinDays: validation.postedWithinDays,
+    jobType: validation.jobType || "any",
     enabled: true,
     status: "READY",
     createdAt: new Date().toISOString()
@@ -699,7 +894,8 @@ function resetValidationForPreflight(state, validation, taskInput = {}) {
 function categoryTaskValidation(state, category, task) {
   const candidates = [
     state.validations.find((record) => record.id === task.validationId),
-    state.validations.find((record) => record.categoryId === category.id && record.categoryTaskId === task.id)
+    state.validations.find((record) => record.categoryId === category.id && record.categoryTaskId === task.id),
+    state.validations.find((record) => record.status === "VALID" && sameRoutineTask(record, task))
   ].filter(Boolean);
   return candidates.find((record) => sameRoutineTask(record, task)) ?? null;
 }
@@ -804,8 +1000,11 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
   const run = runId ? state.runs.find((item) => item.id === runId) : null;
   if (runId && !run) throw new Error("Run was not found.");
   if (run) ensureRunCounterShape(run);
-  const existingByKey = new Map(state.jobs.map((job) => [strongSourceKey(job), job]).filter(([key]) => key));
+  const profileId = run?.profileId || state.activeProfileId || null;
+  const preferenceModel = run?.preferenceModelSnapshot || profileContext(state, profileId).preferenceModel;
+  const existingPool = [...(state.legacyWorkerHistory ?? []), ...state.jobs];
   const jobs = [];
+  let addedCount = 0;
 
   for (const rawJob of rawJobs) {
     const candidate = normalizeJob(task ? {
@@ -814,19 +1013,42 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
       routineTaskId: task.routineTaskId,
       searchKeyword: task.keyword,
       searchLocation: task.location,
-      searchPostedWithinDays: task.postedWithinDays
-    } : rawJob, { thresholds: state.settings.thresholds, runId, preferenceModel: state.preferenceModel });
-    const key = strongSourceKey(candidate);
-    const existing = key ? existingByKey.get(key) : null;
+      searchPostedWithinDays: task.postedWithinDays,
+      searchJobType: task.jobType || "any",
+      profileId
+    } : { ...rawJob, profileId: rawJob.profileId || profileId }, { thresholds: state.settings.thresholds, runId, preferenceModel });
+    const candidateKeys = strongIdentityKeys(candidate);
+    const existingInTask = task && candidateKeys.length
+      ? state.jobs.find((job) => job.runId === runId && job.runTaskId === task.id
+        && strongIdentityKeys(job).some((key) => candidateKeys.includes(key)))
+      : null;
+    if (existingInTask) {
+      jobs.push(existingInTask);
+      continue;
+    }
+    const duplicate = findDuplicate(candidate, existingPool);
+    const existing = duplicate?.existing ?? null;
     if (existing) {
       candidate.duplicateOf = existing.id;
+      candidate.deduplication = {
+        type: duplicate.type,
+        confidence: duplicate.confidence,
+        matchedJobId: existing.id,
+        matchedSource: existing.source,
+        decidedAt: new Date().toISOString()
+      };
       if (!candidate.description && existing.description) {
         candidate.description = existing.description;
         candidate.descriptionSource = existing.descriptionSource;
         candidate.descriptionFetchStatus = existing.descriptionFetchStatus;
         candidate.descriptionFetchedAt = existing.descriptionFetchedAt;
       }
-      if (existing.screening?.jdReviewed && /^ai(?:$|-)/i.test(existing.screening.engine || "")) {
+      const existingRun = runForJob(state, existing);
+      const sameProfileBasis = Boolean(profileId && existing.profileId === profileId)
+        && (!run?.profileSnapshot || !existingRun?.profileSnapshot
+          || JSON.stringify(run.profileSnapshot) === JSON.stringify(existingRun.profileSnapshot));
+      candidate.deduplication.sameProfileBasis = sameProfileBasis;
+      if (sameProfileBasis && existing.screening?.jdReviewed && /^ai(?:$|-)/i.test(existing.screening.engine || "")) {
         candidate.description = existing.description;
         candidate.descriptionSource = existing.descriptionSource;
         candidate.descriptionFetchStatus = existing.descriptionFetchStatus;
@@ -844,9 +1066,10 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
         };
       }
     }
-    if (key) existingByKey.set(key, candidate);
     state.jobs.push(candidate);
+    existingPool.push(candidate);
     jobs.push(candidate);
+    addedCount += 1;
     if (run) {
       const counters = run.counters[candidate.source];
       if (counters) {
@@ -857,16 +1080,51 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
     }
   }
 
-  state.importBatches.unshift({
-    id: newId("import"),
-    label: String(label).slice(0, 120),
-    runId,
-    taskId: task?.id ?? null,
-    importedAt: new Date().toISOString(),
-    count: jobs.length
-  });
-  state.importBatches = state.importBatches.slice(0, 100);
+  if (addedCount) {
+    state.importBatches.unshift({
+      id: newId("import"),
+      label: String(label).slice(0, 120),
+      runId,
+      taskId: task?.id ?? null,
+      importedAt: new Date().toISOString(),
+      count: addedCount
+    });
+    state.importBatches = state.importBatches.slice(0, 100);
+  }
   return jobs;
+}
+
+function mergeWorkerResultJobs(state, rawJobs, { run, task }) {
+  const merged = [];
+  const missing = [];
+  for (const rawJob of rawJobs) {
+    const agentJobId = String(rawJob?.agentJobId || "").trim();
+    const existing = agentJobId
+      ? state.jobs.find((job) => job.id === agentJobId && job.runId === run.id && job.runTaskId === task.id)
+      : null;
+    if (!existing) {
+      missing.push(rawJob);
+      continue;
+    }
+    const fetched = rawJob.descriptionFetchStatus === "fetched" || rawJob.descriptionSource === "detail-page";
+    if (fetched) {
+      existing.description = String(rawJob.description || "").replace(/\s+/g, " ").trim() || existing.description;
+      existing.descriptionSource = "detail-page";
+      existing.descriptionFetchStatus = "fetched";
+      existing.descriptionFetchError = null;
+      existing.descriptionFetchedAt = rawJob.descriptionFetchedAt || new Date().toISOString();
+    } else if (!existing.aiReview || existing.aiReview.status !== "reused") {
+      existing.descriptionFetchStatus = rawJob.descriptionFetchStatus || existing.descriptionFetchStatus;
+      existing.descriptionFetchError = rawJob.descriptionFetchError || null;
+    }
+    merged.push(existing);
+  }
+  if (missing.length) merged.push(...addJobsToState(state, missing, {
+    runId: run.id,
+    label: `${task.platform} worker result fallback`,
+    task
+  }));
+  return merged;
 }
 
 function isRejectedBeforeJd(job) {
@@ -888,9 +1146,17 @@ function hasCompleteDescription(job) {
 
 function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
   const jobIds = [];
-  const profile = state.profiles.find((item) => item.id === state.activeProfileId);
   const aiConfigured = aiStatus().configured;
   for (const job of jobs) {
+    const profileBundle = profileBundleForJob(state, job);
+    if (job.duplicateOf && !hasAiJdReview(job) && !hasCompleteDescription(job)) {
+      if (!hasAiJdReview(job)) {
+        job.screening = { ...job.screening, screeningStatus: "DUPLICATE_SKIPPED" };
+        job.aiReview = { status: "skipped", reason: "unified_history_duplicate", duplicateOf: job.duplicateOf };
+      }
+      continue;
+    }
+    if (job.duplicateOf && hasAiJdReview(job) && !force) continue;
     if (isRejectedBeforeJd(job)) {
       job.aiReview = { status: "skipped", reason: "title_rejected" };
       continue;
@@ -904,7 +1170,7 @@ function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
       };
       continue;
     }
-    if (!profile) {
+    if (!profileBundle.profile) {
       job.screening.screeningStatus = "PROFILE_REQUIRED";
       job.aiReview = { status: "blocked", reason: "Activate a career profile before automatic AI review." };
       continue;
@@ -924,6 +1190,16 @@ function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
     jobIds.push(job.id);
   }
   return jobIds;
+}
+
+function automaticAiRetryLimit() {
+  const parsed = Number.parseInt(process.env.JOB_AGENT_AI_AUTO_RETRY_LIMIT || "1", 10);
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= 5 ? parsed : 1;
+}
+
+function automaticAiCooldownMs() {
+  const parsed = Number.parseInt(process.env.JOB_AGENT_AI_AUTO_RETRY_COOLDOWN_MS || "60000", 10);
+  return Number.isInteger(parsed) && parsed >= 1_000 && parsed <= 10 * 60_000 ? parsed : 60_000;
 }
 
 function buildOnDemandJdUrl(job, batchId = null) {
@@ -946,7 +1222,9 @@ function buildOnDemandJdUrl(job, batchId = null) {
   const url = new URL(job.jobUrl);
   const host = url.hostname.toLowerCase();
   if (job.source === "linkedin" && !host.endsWith("linkedin.com")) throw new Error("The LinkedIn job link is invalid.");
-  if (job.source === "seek" && !host.endsWith("seek.com.au")) throw new Error("The SEEK job link is invalid.");
+  const isSeekHost = host === "seek.com" || host.endsWith(".seek.com")
+    || host === "seek.com.au" || host.endsWith(".seek.com.au");
+  if (job.source === "seek" && !isSeekHost) throw new Error("The SEEK job link is invalid.");
   if (!["linkedin", "seek"].includes(job.source)) throw new Error("This platform does not support automatic JD retrieval.");
   url.hash = marker.toString();
   return url.href;
@@ -966,6 +1244,14 @@ function retryableFailedJd(job) {
     && !isRejectedBeforeJd(job)
     && ["linkedin", "indeed", "seek"].includes(job.source)
     && (job.descriptionFetchStatus === "failed" || job.screening?.screeningStatus === "JD_FETCH_FAILED" || staleFetch));
+}
+
+function retryableFailedAiReview(job) {
+  return Boolean(job
+    && job.screening?.screeningStatus === "AI_ERROR"
+    && !isRejectedBeforeJd(job)
+    && hasCompleteDescription(job)
+    && !queuedAutoReviewIds.has(job.id));
 }
 
 async function advanceJdRetryBatch(batchId) {
@@ -1024,14 +1310,24 @@ function enqueueAutoReviews(jobIds) {
     queuedAutoReviewIds.add(jobId);
     autoReviewQueue.push(jobId);
   }
-  if (!autoReviewRunning && autoReviewQueue.length) void drainAutoReviewQueue();
+  if (!autoReviewRunning && !autoReviewCooldownTimer && autoReviewQueue.length) void drainAutoReviewQueue();
+}
+
+function scheduleAutoReviewDrain(delayMs) {
+  if (autoReviewCooldownTimer || !autoReviewQueue.length) return;
+  autoReviewCooldownTimer = setTimeout(() => {
+    autoReviewCooldownTimer = null;
+    if (!autoReviewRunning && autoReviewQueue.length) void drainAutoReviewQueue();
+  }, delayMs);
 }
 
 async function prepareAutoReview(jobId) {
   return storage.update((state) => {
     const job = state.jobs.find((item) => item.id === jobId);
     if (!job || hasAiJdReview(job) || isRejectedBeforeJd(job)) return null;
-    const profile = state.profiles.find((item) => item.id === state.activeProfileId);
+    const transientAttempts = Math.max(0, Number(job.aiReview?.transientAttempts || 0));
+    const retryRequested = job.aiReview?.retryRequested === true;
+    const profileBundle = profileBundleForJob(state, job);
     const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
     if (run) ensureRunCounterShape(run);
     if (!hasCompleteDescription(job)) {
@@ -1039,7 +1335,7 @@ async function prepareAutoReview(jobId) {
       job.aiReview = { status: "blocked", reason: job.descriptionFetchError || "Complete JD unavailable." };
       return null;
     }
-    if (!profile) {
+    if (!profileBundle.profile) {
       job.screening.screeningStatus = "PROFILE_REQUIRED";
       job.aiReview = { status: "blocked", reason: "No active career profile." };
       return null;
@@ -1049,7 +1345,7 @@ async function prepareAutoReview(jobId) {
       job.aiReview = { status: "blocked", reason: "AI is not configured." };
       return null;
     }
-    if (!canUseAiForRun(run)) {
+    if (!canUseAiForRun(run) && !retryRequested) {
       if (run) run.counters.ai.budgetSkipped += 1;
       job.screening.screeningStatus = "AI_BUDGET_SKIPPED";
       job.aiReview = { status: "blocked", reason: "The automatic AI review limit for this run was reached." };
@@ -1058,12 +1354,15 @@ async function prepareAutoReview(jobId) {
     if (run) run.counters.ai.calls += 1;
     const startedAt = new Date().toISOString();
     job.screening = { ...job.screening, screeningStatus: "AI_REVIEWING", engine: "ai-pending" };
-    job.aiReview = { status: "reviewing", startedAt };
+    job.aiReview = { status: "reviewing", startedAt, retryRequested, transientAttempts };
     return {
       job: JSON.parse(JSON.stringify(job)),
-      profile: JSON.parse(JSON.stringify(profile.profile)),
+      profile: profileBundle.profile,
       thresholds: JSON.parse(JSON.stringify(state.settings.thresholds)),
-      preferenceModel: state.preferenceModel ? JSON.parse(JSON.stringify(state.preferenceModel)) : null
+      preferenceModel: profileBundle.preferenceModel,
+      profileId: profileBundle.profileId,
+      retryRequested,
+      transientAttempts
     };
   });
 }
@@ -1093,48 +1392,83 @@ async function processAutoReview(jobId) {
         generatedAt: completedAt,
         engine: "ai"
       };
-      if (roleRejected) addExclusionSuggestions(state, job, job.learningSignals);
+      if (roleRejected) addExclusionSuggestions(state, job, job.learningSignals, prepared.profileId);
       const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
       if (run) {
         ensureRunCounterShape(run);
         run.counters.ai.jdReviewed += 1;
         recordAiUsage(run, evaluated.usage);
+        if (prepared.retryRequested) recalculateRunCounters(state, run);
       }
     });
+    return { completed: true };
   } catch (error) {
+    const transientError = isTransientAiError(error);
+    const transientAttempts = prepared.transientAttempts + 1;
+    const retryAt = new Date(Date.now() + automaticAiCooldownMs()).toISOString();
+    const willRetry = transientError && transientAttempts <= automaticAiRetryLimit();
     await storage.update((state) => {
       const job = state.jobs.find((item) => item.id === jobId);
       if (!job) return;
       job.screening = {
         ...job.screening,
         jdReviewed: false,
-        screeningStatus: "AI_ERROR",
-        engine: "ai-error",
-        reason: `AI JD review failed: ${error.message}`,
+        screeningStatus: willRetry ? "AI_RETRY_WAIT" : "AI_ERROR",
+        engine: willRetry ? "ai-pending" : "ai-error",
+        reason: willRetry
+          ? `AI service is temporarily unavailable. Automatic retry scheduled after ${retryAt}.`
+          : `AI JD review failed: ${error.message}`,
         concerns: [...(job.screening?.concerns ?? []), "automatic AI review needs another attempt"]
       };
-      job.aiReview = { status: "failed", failedAt: new Date().toISOString(), reason: error.message };
+      job.aiReview = willRetry
+        ? {
+            status: "retry_wait",
+            retryAt,
+            transientAttempts,
+            retryRequested: true,
+            reason: error.message
+          }
+        : {
+            status: "failed",
+            failedAt: new Date().toISOString(),
+            transientAttempts,
+            reason: error.message
+          };
       const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
       if (run) {
         ensureRunCounterShape(run);
-        run.counters.ai.errors += 1;
+        if (prepared.retryRequested) recalculateRunCounters(state, run);
+        else if (!willRetry) run.counters.ai.errors += 1;
       }
     });
+    return { transientError, willRetry, retryAt };
   }
 }
 
 async function drainAutoReviewQueue() {
   if (autoReviewRunning) return;
   autoReviewRunning = true;
+  let cooldownMs = 0;
   try {
     while (autoReviewQueue.length) {
       const jobId = autoReviewQueue.shift();
       queuedAutoReviewIds.delete(jobId);
-      await processAutoReview(jobId);
+      const result = await processAutoReview(jobId);
+      if (result?.transientError) {
+        if (result.willRetry) {
+          queuedAutoReviewIds.add(jobId);
+          autoReviewQueue.unshift(jobId);
+        }
+        cooldownMs = automaticAiCooldownMs();
+        break;
+      }
     }
   } finally {
     autoReviewRunning = false;
-    if (autoReviewQueue.length) void drainAutoReviewQueue();
+    if (autoReviewQueue.length) {
+      if (cooldownMs) scheduleAutoReviewDrain(cooldownMs);
+      else void drainAutoReviewQueue();
+    }
   }
 }
 
@@ -1142,10 +1476,11 @@ async function resumeAutoReviews() {
   const ids = await storage.update((state) => {
     const pending = [];
     for (const job of state.jobs) {
-      if (!["AI_QUEUED", "AI_REVIEWING"].includes(job.screening?.screeningStatus)) continue;
+      if (!["AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus)) continue;
+      const transientAttempts = Math.max(0, Number(job.aiReview?.transientAttempts || 0));
       job.screening.screeningStatus = "AI_QUEUED";
       job.screening.engine = "ai-pending";
-      job.aiReview = { status: "queued", queuedAt: new Date().toISOString(), resumed: true };
+      job.aiReview = { status: "queued", queuedAt: new Date().toISOString(), resumed: true, transientAttempts };
       pending.push(job.id);
     }
     return pending;
@@ -1159,6 +1494,7 @@ function jobBelongsToRunTask(job, task, run) {
   const candidates = run.tasks.filter((candidate) => job.source === candidate.platform
     && normalized(job.searchKeyword) === normalized(candidate.keyword)
     && normalized(job.searchLocation) === normalized(candidate.location)
+    && normalized(job.searchJobType || "any") === normalized(candidate.jobType || "any")
     && (job.searchPostedWithinDays === null || job.searchPostedWithinDays === undefined
       || Number(job.searchPostedWithinDays) === Number(candidate.postedWithinDays)));
   return candidates.length === 1 && candidates[0].id === task.id;
@@ -1178,33 +1514,163 @@ function reconcileLearningAfterJobDeletion(state, removedJobs) {
     }
   }
   if (!removedFeedback) return;
-  state.exclusionSuggestions = state.exclusionSuggestions.filter((suggestion) => {
-    suggestion.sourceJobIds = (suggestion.sourceJobIds ?? []).filter((id) => !removedIds.has(id));
-    return suggestion.status === "approved" || suggestion.sourceJobIds.length;
-  });
-  const helpfulJobs = state.jobs
-    .filter(isPositiveJobFeedback)
-    .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
-    .slice(0, 120);
-  const legacyNotHelpfulJobs = state.jobs
-    .filter(isLegacyNegativeJobFeedback)
-    .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
-    .slice(0, 120);
-  const rejectedJobs = state.jobs.filter(isAiRoleRejectedSignal).slice(0, 120);
-  if (!helpfulJobs.length && !legacyNotHelpfulJobs.length && !rejectedJobs.length) {
-    state.preferenceModel = null;
-    return;
+  for (const profile of state.profiles) {
+    const context = profileContext(state, profile.id);
+    context.exclusionSuggestions = context.exclusionSuggestions.filter((suggestion) => {
+      suggestion.sourceJobIds = (suggestion.sourceJobIds ?? []).filter((id) => !removedIds.has(id));
+      return suggestion.status === "approved" || suggestion.sourceJobIds.length;
+    });
+    const profileJobs = state.jobs.filter((job) => (job.profileId || runForJob(state, job)?.profileId || state.activeProfileId) === profile.id);
+    const helpfulJobs = profileJobs.filter(isPositiveJobFeedback)
+      .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt))).slice(0, 120);
+    const legacyNotHelpfulJobs = profileJobs.filter(isLegacyNegativeJobFeedback)
+      .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt))).slice(0, 120);
+    const rejectedJobs = profileJobs.filter(isAiRoleRejectedSignal).slice(0, 120);
+    if (!helpfulJobs.length && !legacyNotHelpfulJobs.length && !rejectedJobs.length) {
+      context.preferenceModel = null;
+      continue;
+    }
+    const now = new Date().toISOString();
+    context.preferenceModel = validatePreferenceModel(localPreferenceReflection({ helpfulJobs, rejectedJobs, legacyNotHelpfulJobs }), {
+      version: (Number(context.preferenceModel?.version) || 0) + 1,
+      feedbackCount: helpfulJobs.length + legacyNotHelpfulJobs.length + rejectedJobs.length,
+      positiveFeedbackCount: helpfulJobs.length,
+      rejectedSignalCount: rejectedJobs.length,
+      sourceRunId: null,
+      engine: "local-rules-after-deletion",
+      updatedAt: now
+    });
   }
-  const now = new Date().toISOString();
-  state.preferenceModel = validatePreferenceModel(localPreferenceReflection({ helpfulJobs, rejectedJobs, legacyNotHelpfulJobs }), {
-    version: (Number(state.preferenceModel?.version) || 0) + 1,
-    feedbackCount: helpfulJobs.length + legacyNotHelpfulJobs.length + rejectedJobs.length,
-    positiveFeedbackCount: helpfulJobs.length,
-    rejectedSignalCount: rejectedJobs.length,
-    sourceRunId: null,
-    engine: "local-rules-after-deletion",
-    updatedAt: now
-  });
+}
+
+function applyDuplicate(candidate, duplicate) {
+  candidate.duplicateOf = duplicate?.existing?.id ?? null;
+  candidate.deduplication = duplicate ? {
+    type: duplicate.type,
+    confidence: duplicate.confidence,
+    matchedJobId: duplicate.existing.id,
+    matchedSource: duplicate.existing.source,
+    decidedAt: new Date().toISOString()
+  } : null;
+  return candidate;
+}
+
+function rebuildDuplicateLinks(state) {
+  const previous = [...(state.legacyWorkerHistory ?? [])];
+  for (const job of state.jobs) {
+    applyDuplicate(job, findDuplicate(job, previous));
+    previous.push(job);
+  }
+}
+
+function legacyHistoryRecord(platform, input) {
+  const raw = input && typeof input === "object" ? input : { key: input };
+  const source = String(platform || raw.source || raw.site || "").toLowerCase();
+  if (!allowedPlatforms.has(source)) return null;
+  const key = String(raw.key || raw.legacyKey || "").replace(/\s+/g, " ").trim();
+  const keyJobId = key.match(/^(?:job|(?:linkedin|indeed|seek):job):(.+)$/i)?.[1] || "";
+  const inputId = /^(?:job|legacy_history)_/i.test(String(raw.id || "")) ? "" : raw.id;
+  const sourceJobId = String(raw.sourceJobId || raw.jobId || inputId || keyJobId).trim() || null;
+  const keyUrl = key.match(/^(?:url|(?:linkedin|indeed|seek):url):(.+)$/i)?.[1] || "";
+  const jobUrl = String(raw.jobUrl || raw.link || keyUrl).trim() || null;
+  const fpParts = key.match(/^fp:(.+?)\|(.+)$/i);
+  const explicitTitle = String(raw.title || "").replace(/\s+/g, " ").trim();
+  const explicitCompany = String(raw.company || "").replace(/\s+/g, " ").trim();
+  const title = explicitTitle || (fpParts?.[2] ? String(fpParts[2]).trim() : "");
+  const company = explicitCompany || (fpParts?.[1] ? String(fpParts[1]).trim() : "");
+  const opaque = !sourceJobId && !jobUrl;
+  if (!sourceJobId && !jobUrl && !title && !key) return null;
+  const identity = [source, sourceJobId, jobUrl, key, title, company, raw.location].map((value) => String(value || "")).join("|");
+  return {
+    id: `legacy_history_${createHash("sha256").update(identity).digest("hex").slice(0, 24)}`,
+    source,
+    sourceJobId,
+    jobUrl,
+    title,
+    company: company || null,
+    location: String(raw.location || "").replace(/\s+/g, " ").trim() || null,
+    firstSeenAt: String(raw.firstSeenAt || raw.firstSeen || raw.createdAt || "").trim() || null,
+    lastSeenAt: String(raw.lastSeenAt || raw.lastSeen || raw.updatedAt || "").trim() || null,
+    legacyKey: key || null,
+    opaque,
+    importedAt: new Date().toISOString(),
+    origin: "tampermonkey-history-migration"
+  };
+}
+
+function normalizeUnifiedHistory(state) {
+  state.legacyWorkerHistory ??= [];
+  const before = state.legacyWorkerHistory.length;
+  const compacted = [];
+  let mergedAliases = 0;
+  let ignored = 0;
+  for (const input of state.legacyWorkerHistory) {
+    const record = legacyHistoryRecord(input?.source, input);
+    if (!record) {
+      ignored += 1;
+      continue;
+    }
+    record.id = input.id || record.id;
+    record.importedAt = input.importedAt || record.importedAt;
+    const duplicate = findDuplicate(record, compacted);
+    if (duplicate) {
+      mergedAliases += 1;
+      continue;
+    }
+    compacted.push(record);
+  }
+  state.legacyWorkerHistory = compacted;
+  rebuildDuplicateLinks(state);
+  for (const run of state.runs) recalculateRunCounters(state, run);
+  return {
+    before,
+    after: compacted.length,
+    mergedAliases,
+    ignored,
+    opaque: compacted.filter((record) => record.opaque).length,
+    agentOccurrences: state.jobs.length,
+    duplicateOccurrences: state.jobs.filter((job) => job.duplicateOf).length,
+    totalKnownJobs: state.jobs.filter((job) => !job.duplicateOf).length + compacted.length
+  };
+}
+
+function importLegacyWorkerHistory(state, platform, records) {
+  state.legacyWorkerHistory ??= [];
+  state.workerHistoryMigrations ??= [];
+  const pool = [...state.legacyWorkerHistory, ...state.jobs];
+  let imported = 0;
+  let covered = 0;
+  let ignored = 0;
+  let preservedOpaque = 0;
+  for (const input of records.slice(0, 20_000)) {
+    const record = legacyHistoryRecord(platform, input);
+    if (!record) {
+      ignored += 1;
+      continue;
+    }
+    if (findDuplicate(record, pool)) {
+      covered += 1;
+      continue;
+    }
+    state.legacyWorkerHistory.push(record);
+    pool.push(record);
+    imported += 1;
+    if (record.opaque) preservedOpaque += 1;
+  }
+  const migration = {
+    id: newId("history_migration"),
+    platform,
+    received: records.length,
+    imported,
+    covered,
+    ignored,
+    preservedOpaque,
+    importedAt: new Date().toISOString()
+  };
+  state.workerHistoryMigrations.unshift(migration);
+  state.workerHistoryMigrations = state.workerHistoryMigrations.slice(0, 30);
+  const cleanup = normalizeUnifiedHistory(state);
+  return { migration, cleanup };
 }
 
 function removeJobs(state, predicate) {
@@ -1212,9 +1678,9 @@ function removeJobs(state, predicate) {
   if (!removedJobs.length) return [];
   const removedIds = new Set(removedJobs.map((job) => job.id));
   state.jobs = state.jobs.filter((job) => !removedIds.has(job.id));
-  for (const job of state.jobs) {
-    if (removedIds.has(job.duplicateOf)) job.duplicateOf = null;
-  }
+  state.coverLetters = (state.coverLetters ?? []).filter((item) => !removedIds.has(item.jobId));
+  rebuildDuplicateLinks(state);
+  for (const run of state.runs) recalculateRunCounters(state, run);
   reconcileLearningAfterJobDeletion(state, removedJobs);
   return removedJobs;
 }
@@ -1237,7 +1703,13 @@ function recalculateRunCounters(state, run) {
   run.counters.ai.reflections = state.reviewReflections.filter((reflection) => reflection.runId === run.id).length;
 }
 
-function createRun(settings, routineTasks, routineTaskIds = null) {
+function createRun(state, routineTaskIds = null, requestedProfileId = null) {
+  const settings = state.settings;
+  const routineTasks = state.routineTasks;
+  const profile = state.profiles.find((item) => item.id === requestedProfileId)
+    ?? state.profiles.find((item) => item.id === state.activeProfileId);
+  if (!profile) throw new Error("Choose a career profile before starting a run.");
+  const context = profileContext(state, profile.id);
   const requestedIds = Array.isArray(routineTaskIds) && routineTaskIds.length
     ? new Set(routineTaskIds.map((id) => String(id)))
     : null;
@@ -1253,7 +1725,8 @@ function createRun(settings, routineTasks, routineTaskIds = null) {
     location: task.location,
     priority: index + 1,
     postedWithinDays: task.postedWithinDays,
-    exclusionKeywords: [...(settings.exclusionKeywords ?? [])],
+    jobType: task.jobType || "any",
+    exclusionKeywords: [...context.exclusionKeywords],
     workerTiming: { ...(settings.workerTiming ?? {}) },
     attempt: 1,
     status: "queued",
@@ -1273,7 +1746,11 @@ function createRun(settings, routineTasks, routineTaskIds = null) {
     state: "WAITING_FOR_WORKERS",
     startedAt: new Date().toISOString(),
     completedAt: null,
-    settingsSnapshot: settings,
+    profileId: profile.id,
+    profileName: profile.name,
+    profileSnapshot: cloneData(profile.profile),
+    preferenceModelSnapshot: cloneData(context.preferenceModel),
+    settingsSnapshot: { ...cloneData(settings), exclusionKeywords: [...context.exclusionKeywords] },
     tasks,
     counters
   };
@@ -1291,6 +1768,12 @@ function updateRunState(run) {
   }
   run.state = statuses.some((status) => status === "failed") ? "COMPLETED_WITH_ERRORS" : "COMPLETED";
   run.completedAt ??= new Date().toISOString();
+}
+
+function runTaskWorkerIsStale(task, timeoutMs = 30_000) {
+  if (task?.status !== "running") return false;
+  const heartbeat = Date.parse(task.workerHeartbeatAt || task.progress?.updatedAt || task.startedAt || "");
+  return Number.isFinite(heartbeat) && Date.now() - heartbeat > timeoutMs;
 }
 
 function workerLandingUrl(platform, runId) {
@@ -1348,6 +1831,97 @@ async function handleApi(request, response, url) {
   if (request.method === "GET" && path === "/api/bootstrap") {
     return sendJson(response, 200, buildBootstrap(await storage.ensureState()));
   }
+  const jobCoverLettersMatch = /^\/api\/jobs\/([^/]+)\/cover-letters$/.exec(path);
+  if (request.method === "GET" && jobCoverLettersMatch) {
+    const state = await storage.ensureState();
+    if (!state.jobs.some((job) => job.id === jobCoverLettersMatch[1])) throw new Error("Job was not found.");
+    const coverLetters = (state.coverLetters ?? []).filter((item) => item.jobId === jobCoverLettersMatch[1])
+      .sort((left, right) => Number(right.version) - Number(left.version));
+    return sendJson(response, 200, { coverLetters });
+  }
+  if (request.method === "POST" && jobCoverLettersMatch) {
+    if (!aiStatus().configured) throw new Error("Configure AI before generating a cover letter.");
+    const body = await readJson(request);
+    const state = await storage.ensureState();
+    const job = state.jobs.find((item) => item.id === jobCoverLettersMatch[1]);
+    if (!job) throw new Error("Job was not found.");
+    if (!hasCompleteDescription(job)) throw new Error("Fetch the complete JD before generating a cover letter.");
+    const requestedProfileId = String(body.profileId || job.profileId || runForJob(state, job)?.profileId || state.activeProfileId || "");
+    const profileRecord = state.profiles.find((item) => item.id === requestedProfileId);
+    if (!profileRecord) throw new Error("Choose a valid career profile for this cover letter.");
+    const defaults = state.settings.coverLetter ?? {};
+    const maxPages = Math.max(1, Math.min(3, Math.round(Number(body.maxPages ?? defaults.maxPages ?? 1) || 1)));
+    const customInstructions = String(body.customInstructions ?? defaults.prompt ?? "").trim().slice(0, 2_000);
+    const previous = body.previousCoverLetterId
+      ? (state.coverLetters ?? []).find((item) => item.id === body.previousCoverLetterId && item.jobId === job.id)
+      : null;
+    const generated = await generateCoverLetter({
+      job,
+      profile: profileRecord.profile,
+      customInstructions,
+      maxPages,
+      previousDraft: previous,
+      revisionRequest: body.revisionRequest
+    });
+    const record = await storage.update((latest) => {
+      const versions = (latest.coverLetters ?? []).filter((item) => item.jobId === job.id).map((item) => Number(item.version) || 0);
+      const now = new Date().toISOString();
+      const created = {
+        id: newId("cover_letter"),
+        jobId: job.id,
+        profileId: profileRecord.id,
+        profileName: profileRecord.name,
+        version: Math.max(0, ...versions) + 1,
+        maxPages,
+        customInstructions,
+        revisionRequest: String(body.revisionRequest || "").trim().slice(0, 1_500) || null,
+        previousCoverLetterId: previous?.id || null,
+        ...generated.coverLetter,
+        usage: generated.usage,
+        engine: "ai",
+        createdAt: now,
+        updatedAt: now
+      };
+      latest.coverLetters ??= [];
+      latest.coverLetters.unshift(created);
+      latest.coverLetters = latest.coverLetters.slice(0, 300);
+      return created;
+    });
+    return sendJson(response, 201, { coverLetter: record });
+  }
+  const coverLetterMatch = /^\/api\/cover-letters\/([^/]+)$/.exec(path);
+  if (request.method === "PUT" && coverLetterMatch) {
+    const body = await readJson(request);
+    const coverLetter = await storage.update((state) => {
+      const record = (state.coverLetters ?? []).find((item) => item.id === coverLetterMatch[1]);
+      if (!record) throw new Error("Cover letter was not found.");
+      Object.assign(record, safeCoverLetterDraft(body), { updatedAt: new Date().toISOString() });
+      return record;
+    });
+    return sendJson(response, 200, { coverLetter });
+  }
+  if (request.method === "POST" && path === "/api/jobs/assistant") {
+    const body = await readJson(request);
+    if (!aiStatus().configured) throw new Error("Configure AI before using the job review assistant.");
+    const question = String(body.question || "").trim();
+    if (question.length < 2) throw new Error("Enter a question about the current jobs.");
+    const requestedIds = [...new Set((Array.isArray(body.jobIds) ? body.jobIds : [])
+      .map((id) => String(id || "").trim()).filter(Boolean))].slice(0, 2_000);
+    const state = await storage.ensureState();
+    const jobsById = new Map(state.jobs.map((job) => [job.id, job]));
+    const jobs = requestedIds.map((id) => jobsById.get(id)).filter(Boolean);
+    if (!jobs.length) throw new Error("The current review view does not contain any jobs for the assistant.");
+    const requestedProfileId = String(body.profileId || jobs[0]?.profileId || runForJob(state, jobs[0])?.profileId || state.activeProfileId || "");
+    const profile = state.profiles.find((item) => item.id === requestedProfileId)?.profile ?? null;
+    const result = await answerJobQuestions({
+      question,
+      conversation: body.conversation,
+      profile,
+      jobs,
+      context: body.context
+    });
+    return sendJson(response, 200, result);
+  }
   if (request.method === "PUT" && path === "/api/ai-config") {
     const body = await readJson(request);
     const ai = await saveAiConfig(mergedAiConfig(body));
@@ -1377,8 +1951,11 @@ async function handleApi(request, response, url) {
         validations: state.validations.length,
         importBatches: state.importBatches.length,
         reviewReflections: state.reviewReflections.length,
-        preferenceModel: state.preferenceModel ? 1 : 0,
-        exclusionSuggestions: state.exclusionSuggestions.length
+        preferenceModel: Object.values(state.profileContexts ?? {}).filter((context) => context.preferenceModel).length,
+        exclusionSuggestions: Object.values(state.profileContexts ?? {}).reduce((sum, context) => sum + (context.exclusionSuggestions?.length || 0), 0),
+        coverLetters: (state.coverLetters ?? []).length,
+        legacyWorkerHistory: (state.legacyWorkerHistory ?? []).length,
+        workerHistoryMigrations: (state.workerHistoryMigrations ?? []).length
       };
       state.jobs = [];
       state.runs = [];
@@ -1391,6 +1968,13 @@ async function handleApi(request, response, url) {
       state.reviewReflections = [];
       state.preferenceModel = null;
       state.exclusionSuggestions = [];
+      state.coverLetters = [];
+      for (const context of Object.values(state.profileContexts ?? {})) {
+        context.preferenceModel = null;
+        context.exclusionSuggestions = [];
+      }
+      state.legacyWorkerHistory = [];
+      state.workerHistoryMigrations = [];
       return {
         cleared: counts,
         preserved: {
@@ -1410,7 +1994,7 @@ async function handleApi(request, response, url) {
     const settings = safeSettings(body);
     await storage.update((state) => {
       state.settings = settings;
-      removeCoveredPendingExclusionSuggestions(state);
+      for (const profile of state.profiles) removeCoveredPendingExclusionSuggestions(state, profile.id);
     });
     return sendJson(response, 200, { settings });
   }
@@ -1428,47 +2012,51 @@ async function handleApi(request, response, url) {
     const body = await readJson(request);
     const keyword = String(body.keyword ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
     if (keyword.length < 2) throw new Error("Enter an exclusion keyword with at least two characters.");
-    const settings = await storage.update((state) => {
-      const existing = state.settings.exclusionKeywords ?? [];
-      if (!exclusionKeywordCovered(keyword, existing)) state.settings.exclusionKeywords.push(keyword);
-      removeCoveredPendingExclusionSuggestions(state);
-      return state.settings;
+    const result = await storage.update((state) => {
+      const { id, context } = requireProfileContext(state, body.profileId);
+      if (!exclusionKeywordCovered(keyword, context.exclusionKeywords)) context.exclusionKeywords.push(keyword);
+      removeCoveredPendingExclusionSuggestions(state, id);
+      return { profileId: id, context };
     });
-    return sendJson(response, 201, { settings });
+    return sendJson(response, 201, result);
   }
   const exclusionKeywordMatch = /^\/api\/settings\/exclusion-keywords\/([^/]+)$/.exec(path);
   if (request.method === "DELETE" && exclusionKeywordMatch) {
     const keyword = decodeURIComponent(exclusionKeywordMatch[1]);
-    const settings = await storage.update((state) => {
-      state.settings.exclusionKeywords = (state.settings.exclusionKeywords ?? []).filter((value) => value.toLowerCase() !== keyword.toLowerCase());
-      const suggestion = state.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === keyword.toLowerCase());
+    const profileId = url.searchParams.get("profileId");
+    const result = await storage.update((state) => {
+      const { id, context } = requireProfileContext(state, profileId);
+      context.exclusionKeywords = context.exclusionKeywords.filter((value) => value.toLowerCase() !== keyword.toLowerCase());
+      const suggestion = context.exclusionSuggestions.find((item) => item.keyword.toLowerCase() === keyword.toLowerCase());
       if (suggestion) {
         suggestion.status = "pending";
         suggestion.approvedAt = null;
       }
-      return state.settings;
+      return { profileId: id, context };
     });
-    return sendJson(response, 200, { settings });
+    return sendJson(response, 200, result);
   }
   const exclusionSuggestionMatch = /^\/api\/exclusion-suggestions\/([^/]+)$/.exec(path);
   if (request.method === "POST" && exclusionSuggestionMatch) {
+    const body = await readJson(request);
     const result = await storage.update((state) => {
-      const suggestion = state.exclusionSuggestions.find((item) => item.id === exclusionSuggestionMatch[1]);
-      if (!suggestion) throw new Error("Exclusion suggestion was not found.");
+      const match = findSuggestionContext(state, exclusionSuggestionMatch[1], body.profileId);
+      if (!match) throw new Error("Exclusion suggestion was not found.");
+      const { profileId, context, suggestion } = match;
       suggestion.status = "approved";
       suggestion.approvedAt = new Date().toISOString();
-      const existing = state.settings.exclusionKeywords ?? [];
-      if (!exclusionKeywordCovered(suggestion.keyword, existing)) state.settings.exclusionKeywords.push(suggestion.keyword);
-      removeCoveredPendingExclusionSuggestions(state);
-      return { suggestion, settings: state.settings };
+      if (!exclusionKeywordCovered(suggestion.keyword, context.exclusionKeywords)) context.exclusionKeywords.push(suggestion.keyword);
+      removeCoveredPendingExclusionSuggestions(state, profileId);
+      return { suggestion, profileId, context };
     });
     return sendJson(response, 200, result);
   }
   if (request.method === "DELETE" && exclusionSuggestionMatch) {
     const deleted = await storage.update((state) => {
-      const index = state.exclusionSuggestions.findIndex((item) => item.id === exclusionSuggestionMatch[1]);
-      if (index < 0) throw new Error("Exclusion suggestion was not found.");
-      return state.exclusionSuggestions.splice(index, 1)[0];
+      const match = findSuggestionContext(state, exclusionSuggestionMatch[1], url.searchParams.get("profileId"));
+      if (!match) throw new Error("Exclusion suggestion was not found.");
+      const index = match.context.exclusionSuggestions.findIndex((item) => item.id === exclusionSuggestionMatch[1]);
+      return match.context.exclusionSuggestions.splice(index, 1)[0];
     });
     return sendJson(response, 200, { deleted });
   }
@@ -1485,13 +2073,10 @@ async function handleApi(request, response, url) {
     const externalProfileText = String(body.externalProfileText ?? "").trim();
     const generated = await generateProfile(resumeText, body.sourceName || "resume", externalProfileText);
     const profile = await storage.update((state) => {
-      const version = Math.max(
-        0,
-        Number(state.profileVersionCounter) || 0,
-        ...state.profiles.map((item) => Number(item.version) || 0)
-      ) + 1;
+      const version = nextProfileVersion(state);
       const record = {
         id: newId("profile"),
+        name: safeProfileName(body.name || generated.profile.basicInfo?.name || `Profile ${version}`),
         version,
         status: "draft",
         createdAt: new Date().toISOString(),
@@ -1506,8 +2091,43 @@ async function handleApi(request, response, url) {
         aiUsage: generated.usage,
         profile: generated.profile
       };
-      state.profileVersionCounter = version;
       state.profiles.unshift(record);
+      profileContext(state, record.id);
+      return record;
+    });
+    return sendJson(response, 201, { profile: publicProfile(profile) });
+  }
+
+  if (request.method === "POST" && path === "/api/profiles") {
+    const body = await readJson(request);
+    const requestedName = String(body.name || "").replace(/\s+/g, " ").trim();
+    if (!requestedName) return apiError(response, 400, "Enter a profile name.");
+    const profile = await storage.update((state) => {
+      const copyFromProfileId = String(body.copyFromProfileId || "");
+      const source = copyFromProfileId ? state.profiles.find((item) => item.id === copyFromProfileId) : null;
+      if (copyFromProfileId && !source) throw new Error("The profile selected for copying was not found.");
+      const version = nextProfileVersion(state);
+      const record = {
+        id: newId("profile"),
+        name: safeProfileName(requestedName),
+        version,
+        status: "draft",
+        createdAt: new Date().toISOString(),
+        activatedAt: null,
+        sourceName: source ? `Copy of ${source.name}` : "Manual profile",
+        sourceText: "",
+        sourceTextLength: 0,
+        externalProfileUsed: false,
+        externalProfileLength: 0,
+        engine: source ? "copied" : "manual",
+        aiError: null,
+        aiUsage: null,
+        profile: validateProfileDraft(source
+          ? cloneData(body.profile && typeof body.profile === "object" ? body.profile : source.profile)
+          : { schemaVersion: 2 })
+      };
+      state.profiles.unshift(record);
+      profileContext(state, record.id);
       return record;
     });
     return sendJson(response, 201, { profile: publicProfile(profile) });
@@ -1520,6 +2140,7 @@ async function handleApi(request, response, url) {
       const record = state.profiles.find((item) => item.id === profileMatch[1]);
       if (!record) throw new Error("Profile was not found.");
       record.profile = validateProfileDraft(body.profile);
+      if (body.name !== undefined) record.name = safeProfileName(body.name);
       record.updatedAt = new Date().toISOString();
       return record;
     });
@@ -1533,9 +2154,8 @@ async function handleApi(request, response, url) {
       state.activeProfileId = record.id;
       record.status = "approved";
       record.activatedAt = new Date().toISOString();
-      const deleted = state.profiles.length - 1;
-      state.profiles = [record];
-      return { profile: record, deleted };
+      profileContext(state, record.id);
+      return { profile: record, deleted: 0 };
     });
     const ids = await storage.update((state) => prepareAutoReviewJobs(
       state,
@@ -1548,11 +2168,28 @@ async function handleApi(request, response, url) {
     const result = await storage.update((state) => {
       const active = state.profiles.find((item) => item.id === state.activeProfileId);
       if (!active) throw new Error("Confirm a career profile before clearing other versions.");
+      const removedIds = state.profiles.filter((item) => item.id !== active.id).map((item) => item.id);
       const deleted = state.profiles.length - 1;
       state.profiles = [active];
+      for (const id of removedIds) delete state.profileContexts?.[id];
       return { active, deleted };
     });
     return sendJson(response, 200, { profile: publicProfile(result.active), deleted: result.deleted });
+  }
+
+  if (request.method === "DELETE" && profileMatch) {
+    const result = await storage.update((state) => {
+      if (state.profiles.length <= 1) throw new Error("Keep at least one career profile.");
+      const index = state.profiles.findIndex((item) => item.id === profileMatch[1]);
+      if (index < 0) throw new Error("Profile was not found.");
+      const deleted = state.profiles.splice(index, 1)[0];
+      delete state.profileContexts?.[deleted.id];
+      if (state.activeProfileId === deleted.id) {
+        state.activeProfileId = state.profiles.find((item) => item.status === "approved")?.id || state.profiles[0].id;
+      }
+      return { deleted: publicProfile(deleted), activeProfileId: state.activeProfileId };
+    });
+    return sendJson(response, 200, result);
   }
 
   if (request.method === "POST" && path === "/api/task-categories/prepare") {
@@ -1599,8 +2236,8 @@ async function handleApi(request, response, url) {
 
   if (request.method === "POST" && path === "/api/task-categories") {
     const body = await readJson(request);
-    const input = safeTaskCategoryInput(body);
     const category = await storage.update((state) => {
+      const input = safeTaskCategoryInput(body, null, state);
       const now = new Date().toISOString();
       const record = {
         id: newId("task_category"),
@@ -1623,7 +2260,7 @@ async function handleApi(request, response, url) {
       const record = state.taskCategories.find((item) => item.id === taskCategoryMatch[1]);
       if (!record) throw new Error("Task category was not found.");
       if (record.builtin) throw new Error("Built-in task categories cannot be edited.");
-      const input = safeTaskCategoryInput(body, record);
+      const input = safeTaskCategoryInput(body, record, state);
       record.name = input.name;
       record.tasks = input.tasks;
       record.updatedAt = new Date().toISOString();
@@ -1879,7 +2516,7 @@ async function handleApi(request, response, url) {
     const run = await storage.update((state) => {
       const active = state.runs.find((item) => ["WAITING_FOR_WORKERS", "NEEDS_USER_ACTION"].includes(item.state));
       if (active) throw new Error("A run is already active. Finish or clear it before starting another run.");
-      const run = createRun(state.settings, state.routineTasks, body.routineTaskIds);
+      const run = createRun(state, body.routineTaskIds, body.profileId);
       state.runs.unshift(run);
       state.runs = state.runs.slice(0, 60);
       return run;
@@ -1934,6 +2571,11 @@ async function handleApi(request, response, url) {
         : state.runs.find((item) => item.state === "WAITING_FOR_WORKERS");
       if (!run) return { run: null, task: null };
       ensureRunCounterShape(run);
+      const profileRecord = profileRecordForRun(state, run);
+      if (!profileRecord) throw new Error("The career profile used by this run is no longer available.");
+      const profileId = run.profileId || profileRecord.id;
+      const context = profileContext(state, profileId);
+      const belongsToProfile = (job) => (job.profileId || runForJob(state, job)?.profileId || state.activeProfileId) === profileId;
       const activeForPlatform = run.tasks.find((item) => item.platform === platform && item.status === "running");
       if (activeForPlatform) {
         if (activeForPlatform.workerId === workerId) return { run, task: activeForPlatform, reason: "already_claimed" };
@@ -1990,39 +2632,78 @@ async function handleApi(request, response, url) {
     });
     return sendJson(response, 200, result);
   }
+  if (request.method === "POST" && path === "/api/worker/history/import") {
+    const body = await readJson(request);
+    const platform = String(body.platform || "").toLowerCase();
+    if (!allowedPlatforms.has(platform)) return apiError(response, 400, "A valid Worker platform is required.");
+    if (!Array.isArray(body.records)) return apiError(response, 400, "Worker history records must be an array.");
+    if (body.records.length > 20_000) return apiError(response, 400, "Import at most 20,000 Worker history records at a time.");
+    const result = await storage.update((state) => importLegacyWorkerHistory(state, platform, body.records));
+    return sendJson(response, 200, {
+      ...result,
+      clearLocalHistory: result.migration.ignored === 0
+    });
+  }
+  if (request.method === "POST" && path === "/api/history/normalize") {
+    const cleanup = await storage.update((state) => normalizeUnifiedHistory(state));
+    return sendJson(response, 200, { cleanup });
+  }
   if (request.method === "POST" && path === "/api/worker/title-plan") {
     const body = await readJson(request);
     const rawJobs = Array.isArray(body.jobs) ? body.jobs.slice(0, 1000) : [];
-    const state = await storage.ensureState();
-    const existingByKey = new Map(state.jobs.map((job) => [strongSourceKey(job), job]).filter(([key]) => key));
-    const plan = rawJobs.map((rawJob, index) => {
-      try {
-        const job = normalizeJob(rawJob, {
-          thresholds: state.settings.thresholds,
-          runId: body.runId || null,
-          preferenceModel: state.preferenceModel
-        });
-        const existing = existingByKey.get(strongSourceKey(job));
+    const result = await storage.update((state) => {
+      const run = state.runs.find((item) => item.id === body.runId);
+      const task = run?.tasks.find((item) => item.id === body.taskId);
+      if (!run || !task) throw new Error("Run task was not found.");
+      if (task.status !== "running") throw new Error("Only a running task can submit discovered jobs.");
+      const jobs = rawJobs.length ? addJobsToState(state, rawJobs, {
+        runId: run.id,
+        label: `${task.platform} discovered candidates`,
+        task
+      }) : [];
+      const plan = jobs.map((job, index) => {
+        if (job.duplicateOf) {
+          if (hasAiJdReview(job) && job.description) {
+            return { index, jobId: job.id, action: "reuse", reuseKind: "review", existingJobId: job.duplicateOf, reason: "Unified Agent history already has a review for the selected profile." };
+          }
+          if (hasCompleteDescription(job)) {
+            return { index, jobId: job.id, action: "reuse", reuseKind: "jd", existingJobId: job.duplicateOf, reason: "Unified Agent history supplied the saved JD for a new profile review." };
+          }
+          if (isRejectedBeforeJd(job)) {
+            return { index, jobId: job.id, action: "reject", reason: job.screening.reason };
+          }
+          if (!job.deduplication?.sameProfileBasis) {
+            return { index, jobId: job.id, action: "fetch", existingJobId: job.duplicateOf, reason: "This profile has not reviewed the historical job and no reusable JD is available." };
+          }
+          return { index, jobId: job.id, action: "skip_seen", existingJobId: job.duplicateOf, reason: "Unified Agent history already contains this job without a reusable JD." };
+        }
         if (isRejectedBeforeJd(job)) {
-          return { index, action: "reject", reason: job.screening.reason };
+          return { index, jobId: job.id, action: "reject", reason: job.screening.reason };
         }
-        if (existing && hasAiJdReview(existing) && existing.description) {
-          return { index, action: "reuse", existingJobId: existing.id };
-        }
-        return { index, action: "fetch" };
-      } catch (error) {
-        return { index, action: "fetch", warning: error.message };
-      }
-    });
-    return sendJson(response, 200, {
-      plan,
-      counts: {
+        return { index, jobId: job.id, action: "fetch" };
+      });
+      const counts = {
         total: plan.length,
         fetch: plan.filter((item) => item.action === "fetch").length,
         reuse: plan.filter((item) => item.action === "reuse").length,
+        reusedReviews: plan.filter((item) => item.reuseKind === "review").length,
+        reusedJds: plan.filter((item) => item.reuseKind === "jd").length,
+        seen: plan.filter((item) => item.action === "skip_seen").length,
         rejected: plan.filter((item) => item.action === "reject").length
-      }
+      };
+      task.pipelineStats = {
+        discovered: counts.total,
+        duplicateHistory: counts.seen + counts.reuse,
+        reusedReviews: counts.reusedReviews,
+        reusedJds: counts.reusedJds,
+        localRejected: counts.rejected,
+        jdPlanned: counts.fetch,
+        updatedAt: new Date().toISOString()
+      };
+      recalculateRunCounters(state, run);
+      return { plan, counts };
     });
+    return sendJson(response, 200, result);
   }
   if (request.method === "POST" && path === "/api/worker/job-jd") {
     const body = await readJson(request);
@@ -2098,9 +2779,14 @@ async function handleApi(request, response, url) {
       // Persist partial discoveries even when the worker needs help or fails.
       // Retrying can create marked duplicates, but it must never silently lose jobs.
       const jobs = Array.isArray(body.jobs) && body.jobs.length
-        ? addJobsToState(state, body.jobs, { runId: run.id, label: `${task.platform} worker result`, task })
+        ? mergeWorkerResultJobs(state, body.jobs, { run, task })
         : [];
       const autoReviewJobIds = prepareAutoReviewJobs(state, jobs);
+      task.pipelineStats = {
+        ...(task.pipelineStats || {}),
+        aiQueued: autoReviewJobIds.length,
+        completedAt: new Date().toISOString()
+      };
       if (autoReviewJobIds.length) {
         task.progress = {
           phase: "ai_queued",
@@ -2140,6 +2826,40 @@ async function handleApi(request, response, url) {
       run.completedAt = null;
       updateRunState(run);
       return { run, task, launchUrl: workerLandingUrl(task.platform, run.id) };
+    });
+    return sendJson(response, 200, result);
+  }
+
+  const launchRunTaskMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/launch$/.exec(path);
+  if (request.method === "POST" && launchRunTaskMatch) {
+    const result = await storage.update((state) => {
+      const run = state.runs.find((item) => item.id === launchRunTaskMatch[1]);
+      const task = run?.tasks.find((item) => item.id === launchRunTaskMatch[2]);
+      if (!run || !task) throw new Error("Run task was not found.");
+      ensureRunCounterShape(run);
+      const nextInSequence = run.tasks.find((item) => ["queued", "running", "needs_user_action"].includes(item.status));
+      if (run.settingsSnapshot.executionMode === "sequential" && nextInSequence?.id !== task.id) {
+        throw new Error("An earlier task must finish before this worker can be opened.");
+      }
+      let recovered = false;
+      if (task.status === "running") {
+        if (!runTaskWorkerIsStale(task)) throw new Error("This task still has an active worker.");
+        task.attempt += 1;
+        task.status = "queued";
+        task.reason = null;
+        task.workerId = null;
+        task.workerHeartbeatAt = null;
+        task.stopRequestedAt = null;
+        task.startedAt = null;
+        task.completedAt = null;
+        task.progress = { phase: "queued", message: "Worker 窗口已重新打开，等待领取任务。", updatedAt: new Date().toISOString() };
+        run.completedAt = null;
+        recovered = true;
+      } else if (task.status !== "queued") {
+        throw new Error("Only a queued or disconnected running task can reopen its worker.");
+      }
+      updateRunState(run);
+      return { run, task, recovered, launchUrl: workerLandingUrl(task.platform, run.id) };
     });
     return sendJson(response, 200, result);
   }
@@ -2248,7 +2968,7 @@ async function handleApi(request, response, url) {
       task.startedAt = null;
       task.completedAt = null;
       updateRunState(run);
-      return { run, task };
+      return { run, task, launchUrl: workerLandingUrl(task.platform, run.id) };
     });
     return sendJson(response, 200, task);
   }
@@ -2322,8 +3042,9 @@ async function handleApi(request, response, url) {
       }
       job.feedback = feedback;
       if (feedback && !job.viewedAt) job.viewedAt = feedback.updatedAt;
-      if (clearing || isPositiveJobFeedback(job)) removeJobFromPendingExclusionSuggestions(state, job.id);
-      if (rejectedJob && isStrictExclusionFeedback(job)) addExclusionSuggestions(state, job, job.learningSignals);
+      const profileId = profileBundleForJob(state, job).profileId;
+      if (clearing || isPositiveJobFeedback(job)) removeJobFromPendingExclusionSuggestions(state, job.id, profileId);
+      if (rejectedJob && isStrictExclusionFeedback(job)) addExclusionSuggestions(state, job, job.learningSignals, profileId);
       return job;
     });
     return sendJson(response, 200, { job });
@@ -2343,6 +3064,10 @@ async function handleApi(request, response, url) {
         throw new Error(`Wait for ${pendingAiReviews.length} automatic AI JD reviews to finish before completing the reflection.`);
       }
       ensureRunCounterShape(run);
+      const profileId = run.profileId || state.activeProfileId;
+      const profileRecord = state.profiles.find((item) => item.id === profileId) || null;
+      const context = profileContext(state, profileId);
+      const belongsToProfile = (job) => profileBundleForJob(state, job).profileId === profileId;
       const runHelpful = state.jobs.filter((job) => job.runId === run.id && isPositiveJobFeedback(job));
       const runRejected = state.jobs.filter((job) => job.runId === run.id
         && isAiRoleRejectedSignal(job));
@@ -2352,20 +3077,23 @@ async function handleApi(request, response, url) {
       if (!runEvidence.length && !previousReflection) throw new Error("Review at least one AI-screened job before completing the reflection.");
 
       const activeHelpful = state.jobs
+        .filter(belongsToProfile)
         .filter(isPositiveJobFeedback)
         .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
         .slice(0, 120);
       const activeRejected = state.jobs
+        .filter(belongsToProfile)
         .filter(isAiRoleRejectedSignal)
         .slice(0, 120);
       const activeLegacy = state.jobs
+        .filter(belongsToProfile)
         .filter(isLegacyNegativeJobFeedback)
         .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
         .slice(0, 120);
       const helpfulFeedback = activeHelpful.map(feedbackForAi);
       const rejectedJobSignals = activeRejected.map(rejectedSignalForAi);
       const legacyNotHelpfulFeedback = activeLegacy.map(feedbackForAi);
-      const profile = state.profiles.find((item) => item.id === state.activeProfileId)?.profile ?? null;
+      const profile = run.profileSnapshot || profileRecord?.profile;
       const ai = aiStatus();
       const canUseAi = ai.configured && run.counters.ai.calls < ai.budget.maxAiCallsPerRun;
       let generated;
@@ -2375,7 +3103,7 @@ async function handleApi(request, response, url) {
       if (canUseAi) {
         run.counters.ai.calls += 1;
         try {
-          const evaluated = await reflectOnJobFeedback({ helpfulFeedback, rejectedJobSignals, legacyNotHelpfulFeedback, previousModel: state.preferenceModel, profile });
+          const evaluated = await reflectOnJobFeedback({ helpfulFeedback, rejectedJobSignals, legacyNotHelpfulFeedback, previousModel: context.preferenceModel, profile });
           generated = evaluated.preferenceModel;
           usage = evaluated.usage;
           recordAiUsage(run, usage);
@@ -2390,7 +3118,7 @@ async function handleApi(request, response, url) {
         if (ai.configured) aiError = "AI call budget reached; local reflection used.";
       }
       const now = new Date().toISOString();
-      const version = (Number(state.preferenceModel?.version) || 0) + 1;
+      const version = (Number(context.preferenceModel?.version) || 0) + 1;
       let preferenceModel = validatePreferenceModel(generated, {
         version,
         feedbackCount: activeHelpful.length + activeRejected.length + activeLegacy.length,
@@ -2400,10 +3128,11 @@ async function handleApi(request, response, url) {
         engine,
         updatedAt: now
       });
-      preferenceModel = ensurePreferenceModelNegativeCoverage(preferenceModel, state.jobs);
+      preferenceModel = ensurePreferenceModelNegativeCoverage(preferenceModel, state.jobs.filter(belongsToProfile));
       const reflection = {
         id: newId("reflection"),
         runId: run.id,
+        profileId,
         version,
         createdAt: now,
         feedbackCount: runEvidence.length,
@@ -2417,8 +3146,8 @@ async function handleApi(request, response, url) {
         usage,
         modelSnapshot: preferenceModel
       };
-      state.preferenceModel = preferenceModel;
-      addReflectionExclusionSuggestions(state, [...activeRejected, ...activeLegacy], preferenceModel, run.id);
+      context.preferenceModel = preferenceModel;
+      addReflectionExclusionSuggestions(state, [...activeRejected, ...activeLegacy], preferenceModel, run.id, profileId);
       state.reviewReflections.unshift(reflection);
       state.reviewReflections = state.reviewReflections.slice(0, 100);
       run.reviewReflectionId = reflection.id;
@@ -2441,8 +3170,8 @@ async function handleApi(request, response, url) {
       const job = state.jobs.find((item) => item.id === reviewMatch[1]);
       if (!job) throw new Error("Job was not found.");
       if (body.description !== undefined) job.description = String(body.description).trim() || null;
-      const profile = state.profiles.find((item) => item.id === state.activeProfileId);
-      if (!profile) throw new Error("Activate a career profile before JD review.");
+      const profileBundle = profileBundleForJob(state, job);
+      if (!profileBundle.profile) throw new Error("Choose a career profile before JD review.");
       if (!job.description) throw new Error("A complete job description is not available. Rerun its source task to fetch the JD first.");
       const run = job.runId ? state.runs.find((item) => item.id === job.runId) : null;
       const hasAi = aiStatus().configured;
@@ -2450,7 +3179,7 @@ async function handleApi(request, response, url) {
       try {
         if (aiBudgetAvailable) {
           if (run) run.counters.ai.calls += 1;
-          const evaluated = await evaluateJdWithAi(job, profile.profile, state.settings.thresholds, state.preferenceModel);
+          const evaluated = await evaluateJdWithAi(job, profileBundle.profile, state.settings.thresholds, profileBundle.preferenceModel);
           job.screening = evaluated.screening;
           const reviewedAt = new Date().toISOString();
           const roleRejected = job.screening.category === "REJECTED" && job.screening.workRights?.assessment !== "INELIGIBLE";
@@ -2461,10 +3190,10 @@ async function handleApi(request, response, url) {
             generatedAt: reviewedAt,
             engine: "ai"
           };
-          if (roleRejected) addExclusionSuggestions(state, job, job.learningSignals);
+          if (roleRejected) addExclusionSuggestions(state, job, job.learningSignals, profileBundle.profileId);
           recordAiUsage(run, evaluated.usage);
         } else {
-          job.screening = localJdScreen(job, profile.profile, state.settings.thresholds, state.preferenceModel);
+          job.screening = localJdScreen(job, profileBundle.profile, state.settings.thresholds, profileBundle.preferenceModel);
           if (hasAi && run) {
             run.counters.ai.budgetSkipped += 1;
             job.screening.engine = "local-rules-budget-fallback";
@@ -2510,6 +3239,37 @@ async function handleApi(request, response, url) {
     jdRetryBatches.set(batch.id, batch);
     const first = await advanceJdRetryBatch(batch.id);
     return sendJson(response, 201, first);
+  }
+
+  if (request.method === "POST" && path === "/api/jobs/retry-failed-ai") {
+    const body = await readJson(request);
+    const requestedIds = [...new Set((Array.isArray(body.jobIds) ? body.jobIds : [])
+      .map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 100);
+    if (!requestedIds.length) throw new Error("Choose at least one failed AI review to retry.");
+    if (!aiStatus().configured) throw new Error("Configure AI before retrying failed reviews.");
+    const result = await storage.update((state) => {
+      if (!state.profiles.find((profile) => profile.id === state.activeProfileId)) {
+        throw new Error("Activate a career profile before retrying failed reviews.");
+      }
+      const queuedAt = new Date().toISOString();
+      const jobIds = requestedIds.filter((id) => retryableFailedAiReview(
+        state.jobs.find((job) => job.id === id)
+      ));
+      for (const id of jobIds) {
+        const job = state.jobs.find((item) => item.id === id);
+        job.screening = { ...job.screening, screeningStatus: "AI_QUEUED", engine: "ai-pending" };
+        job.aiReview = {
+          status: "queued",
+          queuedAt,
+          retryRequested: true,
+          previousError: job.aiReview?.reason || job.screening?.reason || null
+        };
+      }
+      return { jobIds };
+    });
+    if (!result.jobIds.length) throw new Error("None of the selected jobs still have a retryable AI review failure.");
+    enqueueAutoReviews(result.jobIds);
+    return sendJson(response, 202, { queued: result.jobIds.length, jobIds: result.jobIds });
   }
 
   if (request.method === "POST" && fetchJdMatch) {

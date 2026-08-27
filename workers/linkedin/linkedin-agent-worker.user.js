@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - LinkedIn
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.0.0
+// @version      1.1.0
 // @description  Job Agent worker for LinkedIn. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/linkedin/linkedin-agent-worker.user.js
@@ -25,7 +25,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.0.0";
+    const APP_VERSION = "1.1.0";
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
         cooldownMinutes: 5,
@@ -1489,7 +1489,7 @@
                 continue;
             }
 
-            if (isSeen(candidate)) {
+            if (!agentTask && isSeen(candidate)) {
                 scanState.skippedSeen += 1;
                 updateCounters();
                 continue;
@@ -1920,7 +1920,7 @@
         const results = Array.from(scanState.resultMap.values()).sort(compareResults);
         scanState.collected = results.length;
 
-        if (results.length && settings.autoMarkSeen) {
+        if (!agentTask && results.length && settings.autoMarkSeen) {
             for (const result of results) markSeen(result, "summary-generated");
             saveHistory(historyStore);
             log(`已把本次 ${results.length} 个汇总结果写入已看记录。`);
@@ -2952,6 +2952,43 @@ render();
         });
     }
 
+    async function agentMigrateWorkerHistory(reportEmpty = false) {
+        const records = Object.entries(historyStore.jobs || {}).map(([key, record]) => ({ ...(record || {}), key: record?.key || key }));
+        if (!records.length && !reportEmpty) return { ok: true, received: 0, skipped: true };
+        try {
+            const response = await agentRequest("POST", "/api/worker/history/import", { platform: AGENT.platform, records });
+            if (response.clearLocalHistory) {
+                historyStore = emptyHistory();
+                saveHistory(historyStore);
+                GM_setValue(LEGACY_HISTORY_KEY, []);
+                log(`已把 ${records.length} 条 LinkedIn Worker 历史迁移到 Job Agent；后续 Agent 任务统一在本地平台判重。`);
+            }
+            return { ok: true, received: records.length, ...response };
+        } catch (error) {
+            log(`Worker 历史暂未迁移，已保留本地副本：${error.message || String(error)}`, "warn");
+            return { ok: false, received: records.length, error: error.message || String(error) };
+        }
+    }
+
+    async function agentRunHistoryMigration(params) {
+        agentShowOverlay("正在迁移 LinkedIn 历史", "只整理已看记录，不会搜索、领取或运行任何任务。");
+        const result = await agentMigrateWorkerHistory(true);
+        if (!result?.ok) {
+            agentShowOverlay("LinkedIn 历史迁移失败", `${result?.error || "未知错误"}。原 Worker 历史已保留。`);
+            window.opener?.postMessage({ type: "job-agent-history-migration-failed", platform: AGENT.platform, error: result?.error || "未知错误" }, AGENT.apiBase);
+            return;
+        }
+        const migration = result.migration || {};
+        agentShowOverlay("LinkedIn 历史迁移完成", `收到 ${migration.received || 0} 条；新增 ${migration.imported || 0} 条，已有 ${migration.covered || 0} 条。`);
+        window.opener?.postMessage({ type: "job-agent-history-migration-progress", platform: AGENT.platform, migration, cleanup: result.cleanup }, AGENT.apiBase);
+        const next = params.get("jobAgentMigrationNext") || (window.name === "job-agent-history-migration"
+            ? "https://au.indeed.com/jobs?q=jobs&l=Australia"
+            : "");
+        if (next) return setTimeout(() => window.location.replace(next), 900);
+        window.opener?.postMessage({ type: "job-agent-history-migration-finished", platform: AGENT.platform, migration, cleanup: result.cleanup }, AGENT.apiBase);
+        setTimeout(() => window.close(), 1200);
+    }
+
     function agentScheduleClaim(runId, delay = 7000) {
         clearTimeout(agentPollTimer);
         agentPollTimer = setTimeout(() => { void agentClaimNext(runId); }, delay);
@@ -3368,7 +3405,7 @@ render();
                 jobs
             });
             plan = response.plan;
-            log(`Job Agent 标题初筛：需获取 ${response.counts.fetch} 份 JD，复用 ${response.counts.reuse} 份，标题拒绝 ${response.counts.rejected} 份。`);
+            log(`Job Agent 中央预筛：发现 ${response.counts.total} 个，历史跳过 ${response.counts.seen} 个，复用 ${response.counts.reuse} 个，本地拒绝 ${response.counts.rejected} 个，需获取 ${response.counts.fetch} 份 JD。`);
         } catch (error) {
             log(`标题初筛计划暂不可用，将为全部职位尝试获取 JD：${error.message}`, "warn");
             plan = jobs.map((_, index) => ({ index, action: "fetch" }));
@@ -3380,9 +3417,15 @@ render();
         for (let index = 0; index < jobs.length; index += 1) {
             if (agentStopRequested) break;
             const job = jobs[index];
-            const action = planByIndex.get(index)?.action || "fetch";
+            const planItem = planByIndex.get(index);
+            const action = planItem?.action || "fetch";
+            if (planItem?.jobId) job.agentJobId = planItem.jobId;
             if (action === "reject") {
                 job.descriptionFetchStatus = "skipped-rejected";
+                continue;
+            }
+            if (action === "skip_seen") {
+                job.descriptionFetchStatus = "skipped-history";
                 continue;
             }
             if (action === "reuse") {
@@ -3828,6 +3871,11 @@ render();
 
     async function agentBoot() {
         const params = new URL(location.href).searchParams;
+        const migrationParams = new URLSearchParams(location.hash.replace(/^#/, ""));
+        if (window.name === "job-agent-history-migration" || migrationParams.get("jobAgentHistoryMigration") === "1" || params.get("jobAgentHistoryMigration") === "1") {
+            await agentRunHistoryMigration(migrationParams.get("jobAgentHistoryMigration") === "1" ? migrationParams : params);
+            return;
+        }
         if (params.get("jobAgentReset") === "1") {
             agentRunHistoryReset(params);
             return;
@@ -3841,6 +3889,7 @@ render();
             if (agentIsManagedPreflightWindow()) await agentRunPendingPreflight();
             return;
         }
+        await agentMigrateWorkerHistory();
         let runId = params.get("jobAgentRun") || agentStoredTask()?.runId;
         agentTask = agentStoredTask();
         if (agentTask && runId && agentTask.runId !== runId) {
@@ -3869,6 +3918,8 @@ render();
         void agentRunOnDemandJd(agentOnDemandJd, agentJdBatch);
     } else if (agentJdChildRequest) {
         void agentRunJdChild(agentJdChildRequest);
+    } else if (agentHashParams.get("jobAgentHistoryMigration") === "1" || new URL(location.href).searchParams.get("jobAgentHistoryMigration") === "1") {
+        void agentBoot();
     } else if (location.pathname.startsWith("/jobs/search/")) {
         initUI();
         void agentBoot();

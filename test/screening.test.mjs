@@ -49,6 +49,33 @@ test("clear non-technology titles are rejected without JD review", () => {
   assert.match(result.reason, /不属于当前设置的技术求职方向/);
 });
 
+test("explicitly unrelated early-career titles do not consume JD or AI review", () => {
+  for (const title of [
+    "Occupational Therapist - Graduate Program 2027",
+    "Graduate Speech Pathologist | Hobart",
+    "Digital Marketing Intern",
+    "Graduate Recruitment Consultant",
+    "Retail Sales Assistant"
+  ]) {
+    const result = screenTitle(title, { thresholds });
+    assert.equal(result.titleClassification, "CLEAR_REJECT", title);
+    assert.equal(result.screeningStatus, "TITLE_SCREENED", title);
+    assert.equal(result.jdReviewed, false, title);
+  }
+});
+
+test("an ambiguous title can be rejected from a clearly unrelated card snippet", () => {
+  const job = normalizeJob({
+    source: "seek",
+    sourceJobId: "preview-reject",
+    title: "Graduate Program 2027",
+    description: "Join our allied health team to deliver occupational therapy and patient care in a clinical practice."
+  }, { thresholds });
+  assert.equal(job.screening.titleClassification, "CLEAR_REJECT");
+  assert.equal(job.screening.screeningStatus, "PREVIEW_SCREENED");
+  assert.equal(job.screening.engine, "local-preview");
+});
+
 test("broad early-career titles request JD review", () => {
   const result = screenTitle("Graduate Analyst", { thresholds });
   assert.equal(result.titleClassification, "AMBIGUOUS");

@@ -20,7 +20,11 @@ export function createDefaultState(settings, taskCategories = []) {
     importBatches: [],
     reviewReflections: [],
     preferenceModel: null,
-    exclusionSuggestions: []
+    exclusionSuggestions: [],
+    profileContexts: {},
+    coverLetters: [],
+    legacyWorkerHistory: [],
+    workerHistoryMigrations: []
   };
 }
 
@@ -64,7 +68,13 @@ export function createStorage({ dataDirectory, defaultSettings, defaultTaskCateg
         importBatches: Array.isArray(state.importBatches) ? state.importBatches : [],
         reviewReflections: Array.isArray(state.reviewReflections) ? state.reviewReflections : [],
         preferenceModel: state.preferenceModel && typeof state.preferenceModel === "object" ? state.preferenceModel : null,
-        exclusionSuggestions: Array.isArray(state.exclusionSuggestions) ? state.exclusionSuggestions : []
+        exclusionSuggestions: Array.isArray(state.exclusionSuggestions) ? state.exclusionSuggestions : [],
+        profileContexts: state.profileContexts && typeof state.profileContexts === "object" && !Array.isArray(state.profileContexts)
+          ? state.profileContexts
+          : {},
+        coverLetters: Array.isArray(state.coverLetters) ? state.coverLetters : [],
+        legacyWorkerHistory: Array.isArray(state.legacyWorkerHistory) ? state.legacyWorkerHistory : [],
+        workerHistoryMigrations: Array.isArray(state.workerHistoryMigrations) ? state.workerHistoryMigrations : []
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;

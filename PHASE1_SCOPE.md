@@ -18,36 +18,43 @@ limiting.
 
 The daily workflow is:
 
-1. Add one daily task at a time with its platform, keyword, location, and
-   posted-within range.
+1. Add one daily task at a time with its platform, keyword, location,
+   posted-within range, and supported platform job type. LinkedIn currently
+   keeps job type unrestricted; Indeed and SEEK expose their native choices.
 2. Before the task exists in the routine, open that platform's worker to fill
    its real search controls, select the platform's date control, and submit a
    test search. Unsupported or unapplied date choices fail validation.
    Comma-separated keyword alternatives use the first term for the platform
    query and all terms as local include rules; raw boolean `OR` is normalized
    to this representation for backward compatibility.
-3. Start a run from only the validated daily tasks. Tasks run strictly in
-   sequence across all platforms.
+3. Select an approved career profile and start a run from only the validated
+   daily tasks. The run stores an immutable profile and preference snapshot,
+   and tasks run strictly in sequence across all platforms.
 4. Open one normal browser Worker tab for the run. The tab navigates between
    platforms in task order, applies each keyword, location, and optional date
    range, then uses that platform helper's existing collection logic.
-5. Import the collected results into one normalized daily list.
-6. Classify each title locally as `CLEAR_MATCH`, `CLEAR_REJECT`, or
-   `AMBIGUOUS`.
-7. Keep clear matches, reject clear mismatches, and place ambiguous jobs in a
-   JD review queue.
-8. Screen an ambiguous JD with the active career profile, optionally through
-   an OpenAI-compatible local or cloud endpoint.
+5. Persist every discovered card as a run-scoped occurrence in one Agent-owned
+   local history before the Worker fetches any full JD.
+6. Compare the occurrence with the unified LinkedIn, Indeed, and SEEK history.
+   Exact same-source IDs and conservative high-confidence cross-platform
+   matches skip repeated JD and AI work while retaining the occurrence.
+7. Classify each remaining title and available card snippet locally. Clear
+   mismatches remain recorded but do not enter the JD queue.
+8. Fetch and screen the full JD only for non-duplicate jobs that remain
+   plausible or uncertain, optionally through an OpenAI-compatible endpoint.
 9. Review, filter, sort, and open the retained jobs manually. The system
    stops before any application action.
-10. Mark unhelpful results during the review, optionally identifying an
+10. Generate an optional English cover letter from a reviewed JD and the
+    selected profile, revise it with user guidance, and print it to PDF.
+11. Mark helpful or unhelpful results during the review, optionally identifying an
     over-optimistic classification or an unrelated role, then complete the
-    day's review to consolidate those explicit signals for later runs.
+    day's review to consolidate those explicit signals into the selected
+    profile's learning context for later runs.
 
 ## What This First Build Includes
 
 - A local dashboard for the daily run, combined jobs, routine settings, and
-  career profile versions.
+  multiple independently approved career profiles.
 - Resume upload and text extraction for `.txt`, `.docx`, and text-based PDF
   files.
 - Career-profile drafts generated either by a configured AI endpoint or a
@@ -55,8 +62,14 @@ The daily workflow is:
   in a fixed JSON format; the agent reconciles it with the uploaded resume,
   with resume facts taking precedence. When the local endpoint is unavailable,
   a valid external JSON profile remains usable as a draft. Profiles must be
-  explicitly activated. Confirming a profile retains only that version and
-  removes all other stored profile drafts and prior versions.
+  explicitly activated. Profiles may be named, selected per run, edited, or
+  deleted without changing the immutable snapshots stored by earlier runs.
+- Profile-scoped preference learning, enabled exclusion keywords, and pending
+  exclusion suggestions. Signals learned while reviewing casual work do not
+  alter a separate professional-career profile.
+- Named profile creation from a blank record, a copy of an existing profile,
+  or a new resume extraction. Copying profile content never copies learning,
+  exclusions, or pending suggestions.
 - Individually managed daily tasks. A task is added only after a browser
   preflight succeeds, then can be deleted individually or cleared together.
   Existing runs retain their own task snapshots.
@@ -66,6 +79,9 @@ The daily workflow is:
 - Platform-aware preflight for LinkedIn `Date posted`, Indeed `Date posted`,
   and SEEK `Listing time`. The preflight uses the actual search form rather
   than treating a constructed URL as proof of a valid filter.
+- Platform-aware job type filtering for Indeed and SEEK. The chosen value is
+  validated by the Agent, included in task identity and run snapshots, and
+  applied through each platform's native filter control by its Worker.
 - Preflight records can be edited, retried, or deleted. Editing and retrying
   withdraws any linked daily task until the fresh platform check succeeds;
   deleting a record leaves an already validated daily task intact.
@@ -88,6 +104,11 @@ The daily workflow is:
   task runs concurrently with another task in the same run.
 - A normalized job contract, title screening, configurable match thresholds,
   JD review, structured AI JSON validation, run status, filters, and sorting.
+- One Agent-owned local history for all three platforms. Updated Workers use a
+  dedicated setup action to migrate their previous local history without
+  claiming or running a task, then defer managed task deduplication to the
+  Agent. Each new run still stores its own occurrence
+  so deletion can roll back that run and rebuild remaining duplicate links.
 - The default review list contains only the newest run. Starting another run
   moves previous jobs into a searchable history view with a run-batch filter;
   it never deletes those saved jobs or their review results.
@@ -97,22 +118,30 @@ The daily workflow is:
   preference model informs future title and JD screening without deleting
   jobs. Feedback can be withdrawn and the run reflected again so obsolete
   preferences stop influencing later results.
+- Versioned cover-letter drafts generated from a completed JD review and one
+  selected profile. The user can revise the English letter with additional
+  guidance, edit and save it locally, and export through the browser's PDF
+  print flow. Maximum pages and the base prompt are user-configurable.
 - Local JSON storage under `data/`; secrets remain in environment variables.
 
 ## Deliberate Boundaries
 
-- No auto-apply, application-form filling, resume tailoring, cover letters,
-  email automation, interview tracking, cloud scheduler, or account bypass.
+- No auto-apply, application-form filling, resume tailoring, email automation,
+  interview tracking, cloud scheduler, or account bypass. Cover letters stop
+  at local drafting, editing, and user-initiated PDF export.
 - Login, CAPTCHA, and anti-bot checks are not solved or bypassed. A worker
   should report `needs_user_action`; the user finishes the browser action and
   then resumes the run.
 - The worker scripts deliberately use a different Tampermonkey identity from
-  the frozen helpers, so they do not overwrite them. Their platform histories
-  start separately. The dashboard keeps every imported result, including a
-  marked repeat, so a retry never silently drops a job.
-- The dashboard does not remove imported jobs just because they look similar.
-  Source history remains the authority for platform-level skipping; a repeated
-  import is retained and visibly marked rather than silently lost.
+  the frozen helpers, so they do not overwrite them.
+- The Agent never merges jobs from fuzzy title similarity. Cross-platform
+  deduplication requires the same normalized full title and company plus a
+  compatible specific city or state. Broad Australia-only locations, different
+  years, different titles, and same-platform reposts with new IDs remain
+  separate. Uncertain cases are retained.
+- A duplicate is not deleted: the run-scoped occurrence remains in local
+  history with a link to the earlier record. This preserves task statistics and
+  allows deletion of a mistaken run to rebuild the remaining history.
 
 ## Data Contracts
 
@@ -133,6 +162,8 @@ platform does not provide data:
   "discoveredAt": "2026-08-08T10:00:00.000Z",
   "searchKeyword": "graduate software engineer",
   "searchLocation": "Melbourne VIC",
+  "searchJobType": "full-time",
+  "profileId": "profile_...",
   "screening": null
 }
 ```
@@ -144,19 +175,24 @@ for manual action; a retry may be marked as a duplicate, never discarded.
 
 ## Screening Rules
 
-Stage A is local and title-first:
+Stage A is local and costs no AI tokens:
 
 - Direct technology, software, AI/ML, data, IT, and graduate-program titles
   are `CLEAR_MATCH`.
 - Obvious unrelated professions, senior leadership, and non-technology
   disciplines are `CLEAR_REJECT`.
 - Broad titles such as `Graduate Analyst` are `AMBIGUOUS`.
+- An ambiguous title can still be rejected when its card snippet clearly
+  identifies an unrelated profession and contains no conflicting technology
+  signal.
 
-Stage B only runs for ambiguous titles. It considers the active profile,
-technology terms, eligibility/seniority concerns, and the JD. If an AI endpoint
-is configured, job title and JD are explicitly sent as untrusted data and the
-returned JSON is validated before it is saved. A failed AI response becomes
-`AI_ERROR`; it never stops the full run.
+Stage B runs only after unified-history and Stage A checks. It considers the
+run's selected profile snapshot, its profile-scoped preferences, technology
+terms, eligibility/seniority concerns, and the full JD. A saved JD can be
+reused across profiles, but an AI score can be reused only when the profile
+basis matches. If an AI endpoint is configured, job title and JD are explicitly sent as
+untrusted data and the returned JSON is validated before it is saved. A failed
+AI response becomes `AI_ERROR`; it never stops the full run.
 
 Initial score bands are configurable:
 
@@ -171,22 +207,28 @@ Initial score bands are configurable:
 ## First-Version Architecture
 
 ```text
-Frozen browser helpers (unchanged)    Worker copies (new, separately installed)
-                                         |
-Dashboard starts worker tabs --> per-platform queue --> normalized local jobs
-                                                        |
-Resume upload --> approved career profile --> title rules --> JD review
-                                                        |
-                                              combined review dashboard
+Worker card scan --> Agent run occurrence --> unified local history check
+                                              |
+                                  local title + card-snippet rules
+                                              |
+                                      selected JD retrieval
+                                              |
+Resume upload --> approved career profiles --> selected run snapshot
+                                             --> AI JD review --> review dashboard
+                                                                  |
+                                                        optional cover letter
 ```
 
 ## File Map
 
 - `config/job-search-routine.json`: first-run execution and screening defaults.
 - `src/storage.mjs`: local atomic JSON persistence.
+- `src/job-identity.mjs`: conservative same-source and cross-platform identity
+  matching for the unified history.
 - `src/screening.mjs`: normalized jobs, title rules, local JD assessment, and
   validation.
-- `src/ai.mjs`: optional OpenAI-compatible structured profile/JD evaluation.
+- `src/ai.mjs`: optional OpenAI-compatible structured profile/JD evaluation
+  and cover-letter drafting.
 - `tools/extract_resume.py`: isolated `.docx`/PDF text extractor.
 - `workers/`: independently installable LinkedIn, Indeed, and SEEK worker
   scripts. These are the only scripts that talk to the local Agent API.
