@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.1.1
+// @version      1.1.2
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.1.1";
+    const APP_VERSION = "1.1.2";
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
         cooldownMinutes: 5,
@@ -1454,7 +1454,7 @@
             log(`Job Agent 中央预筛：发现 ${response.counts.total} 个，历史跳过 ${response.counts.seen} 个，复用 ${response.counts.reuse} 个，本地拒绝 ${response.counts.rejected} 个，需获取 ${response.counts.fetch} 份 JD。`);
         } catch (error) {
             log(`标题初筛计划暂不可用，将为全部职位尝试获取 JD：${error.message}`, "warn");
-            plan = jobs.map((_, index) => ({ index, action: "fetch" }));
+            plan = jobs.map((_, index) => ({ index, action: task.aiReviewEnabled === false ? "skip_ai" : "fetch" }));
         }
         const planByIndex = new Map(plan.map((item) => [item.index, item]));
         const fetchIndexes = plan.filter((item) => item.action === "fetch").map((item) => item.index);
@@ -1476,6 +1476,10 @@
             }
             if (action === "reuse") {
                 job.descriptionFetchStatus = "reused";
+                continue;
+            }
+            if (action === "skip_ai") {
+                job.descriptionFetchStatus = "skipped-ai";
                 continue;
             }
             completed += 1;

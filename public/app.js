@@ -18,6 +18,7 @@ const state = {
   feedbackMode: "positive",
   pendingRunTaskIds: null,
   pendingRunProfileId: null,
+  pendingRunAiReviewEnabled: true,
   resumeSource: "",
   editingValidationId: null,
   notifiedTaskIds: new Set(),
@@ -149,7 +150,8 @@ const screeningStatusLabels = {
   JD_SCREENED: "完整 JD 已审阅",
   PROFILE_REQUIRED: "需要职业画像",
   AI_NOT_CONFIGURED: "AI 未配置",
-  AI_BUDGET_SKIPPED: "已达到 AI 审阅上限"
+  AI_BUDGET_SKIPPED: "已达到 AI 审阅上限",
+  COLLECTED_ONLY: "仅采集，未启用 AI"
 };
 const externalGptProfilePrompt = [
   "You are a meticulous resume data extractor. The user will attach or paste their resume in this chat.",
@@ -167,9 +169,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v1.1.0", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v1.1.1", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v1.1.0", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v1.1.1", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v1.1.2", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v1.1.1", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -278,6 +280,9 @@ function badge(value, type = "") {
 
 function screeningMethodBadge(job) {
   const screening = job.screening || {};
+  if (screening.screeningStatus === "COLLECTED_ONLY") {
+    return '<span class="badge screening-method-badge" title="本次运行只采集职位，未自动获取 JD 或调用 AI"><i data-lucide="inbox"></i>仅采集</span>';
+  }
   const ai = /^ai(?:$|-)/i.test(screening.engine || "");
   const rawAiError = String(job.aiReview?.reason || screening.reason || "");
   const aiErrorMessage = /upstream_error|api_error|temporar(?:y|ily)|\b50[234]\b/i.test(rawAiError)
@@ -851,9 +856,49 @@ async function sendJobAssistant(event) {
   }
 }
 
+function isImplicitInterestJob(job) {
+  const rejected = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
+  return Number(job.engagement?.externalOpenCount) > 0 && !job.feedback && !rejected;
+}
+
+function uniqueImplicitInterestJobs(jobs) {
+  const byCanonicalJob = new Map();
+  for (const job of jobs.filter(isImplicitInterestJob)) {
+    const key = job.duplicateOf || job.id;
+    const current = byCanonicalJob.get(key);
+    if (!current || String(job.engagement?.lastExternalOpenedAt || "") > String(current.engagement?.lastExternalOpenedAt || "")) {
+      byCanonicalJob.set(key, job);
+    }
+  }
+  return [...byCanonicalJob.values()];
+}
+
+function trackExternalJobOpen(jobId) {
+  const job = state.data.jobs.find((item) => item.id === jobId);
+  if (!job) return;
+  const now = new Date().toISOString();
+  const previous = job.engagement && typeof job.engagement === "object" ? job.engagement : {};
+  job.engagement = {
+    externalOpenCount: Math.max(0, Number(previous.externalOpenCount) || 0) + 1,
+    firstExternalOpenedAt: previous.firstExternalOpenedAt || now,
+    lastExternalOpenedAt: now,
+    lastSurface: state.view === "overview" ? "overview" : state.jobsPane === "history" ? "history" : "current"
+  };
+  if (state.view === "jobs") renderReviewLearning();
+  api("/api/jobs/" + jobId + "/engagement/open", {
+    method: "POST",
+    keepalive: true,
+    body: JSON.stringify({ surface: job.engagement.lastSurface })
+  }).then((result) => {
+    Object.assign(job, result.job);
+    if (state.view === "jobs") renderReviewLearning();
+  }).catch((error) => console.warn("Could not record external job open:", error));
+}
+
 function actionButtons(job) {
+  const externalOpenCount = Math.max(0, Number(job.engagement?.externalOpenCount) || 0);
   const open = /^https?:\/\//i.test(job.jobUrl || "")
-    ? '<a class="icon-button" href="' + escapeHtml(job.jobUrl) + '" target="_blank" rel="noreferrer" title="打开原职位"><i data-lucide="external-link"></i></a>'
+    ? '<a class="icon-button" data-track-job-open="' + job.id + '" href="' + escapeHtml(job.jobUrl) + '" target="_blank" rel="noreferrer" title="打开原职位' + (externalOpenCount ? ' · 已跳转 ' + externalOpenCount + ' 次（弱兴趣信号）' : '') + '"><i data-lucide="external-link"></i></a>'
     : "";
   const correctionActive = isRejectionCorrection(job);
   const rejected = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
@@ -997,7 +1042,7 @@ function reflectionHasCurrentFeedback(reflection, evidenceJobs) {
   const reflectedIds = new Set(reflection.feedbackJobIds || []);
   return reflectedIds.size === evidenceJobs.length
     && evidenceJobs.every((job) => reflectedIds.has(job.id)
-      && String(job.feedback?.updatedAt || job.learningSignals?.generatedAt || "") <= String(reflection.createdAt || ""));
+      && String(job.feedback?.updatedAt || job.engagement?.lastExternalOpenedAt || job.learningSignals?.generatedAt || "") <= String(reflection.createdAt || ""));
 }
 
 function uniqueJobsById(jobs) {
@@ -1020,14 +1065,15 @@ function renderReviewLearning() {
   const confirmedRejectedJobs = rejectedJobs.filter(isRejectionApproval);
   const automaticRejectedJobs = rejectedJobs.filter((job) => !isRejectionApproval(job));
   const legacyJobs = jobs.filter((job) => job.feedback?.helpfulness === "NOT_HELPFUL" && job.feedback?.reason !== "CLASSIFICATION_WRONG");
-  const evidenceJobs = uniqueJobsById([...helpfulJobs, ...rejectedJobs, ...legacyJobs]);
+  const implicitInterestJobs = uniqueImplicitInterestJobs(jobs);
+  const evidenceJobs = uniqueJobsById([...helpfulJobs, ...rejectedJobs, ...legacyJobs, ...implicitInterestJobs]);
   const reflection = run ? (state.data.reviewReflections || []).find((item) => item.runId === run.id) : null;
   const runFinished = run && ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state);
   const pendingAiReviews = jobs.filter((job) => ["AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus)).length;
   const reflected = reflectionHasCurrentFeedback(reflection, evidenceJobs);
   const button = el("#complete-run-review");
   const label = button.querySelector("span");
-  el("#review-feedback-count").textContent = (helpfulJobs.length - correctionJobs.length) + " 条有用 · " + legacyJobs.length + " 条没用 · " + correctionJobs.length + " 条 Rejected 纠错 · " + confirmedRejectedJobs.length + " 条 Rejected 已确认 · " + automaticRejectedJobs.length + " 条 AI 排除";
+  el("#review-feedback-count").textContent = (helpfulJobs.length - correctionJobs.length) + " 条有用 · " + legacyJobs.length + " 条没用 · " + correctionJobs.length + " 条 Rejected 纠错 · " + confirmedRejectedJobs.length + " 条 Rejected 已确认 · " + automaticRejectedJobs.length + " 条 AI 排除 · " + implicitInterestJobs.length + " 条跳转（弱信号）";
   button.hidden = false;
   button.disabled = !runFinished || pendingAiReviews > 0 || (!evidenceJobs.length && !reflection) || reflected;
   label.textContent = reflection ? (reflected ? "本次复盘已完成" : "更新本次复盘") : "完成本次审阅并复盘";
@@ -1393,7 +1439,7 @@ function renderRoutine() {
   el("#runs-list").innerHTML = state.data.runs.map((run) => {
     const canDelete = ["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(run.state);
     return '<article class="run-row"><div><strong>'
-      + dateTime(run.startedAt) + "</strong><span>" + run.tasks.length + " 项任务</span></div><div>"
+      + dateTime(run.startedAt) + "</strong><span>" + run.tasks.length + " 项任务 · " + (run.aiReviewEnabled === false ? "仅采集" : "AI 审阅") + "</span></div><div>"
       + badge(run.state, "run-state-badge") + '</div><div class="run-platform-counts"><span>LI '
       + run.counters.linkedin.newJobs + "</span><span>IN " + run.counters.indeed.newJobs
       + "</span><span>SEEK " + run.counters.seek.newJobs + '</span></div><div class="run-history-actions">'
@@ -1731,7 +1777,7 @@ function renderPreferenceLearningSettings() {
     && item.runId === model.sourceRunId) || null;
   const engine = reflection?.engine || model.engine;
   target.innerHTML = '<div class="learning-summary"><div><strong>学习摘要</strong>'
-    + '<span class="learning-version">v' + model.version + (model.updatedAt ? " · " + escapeHtml(dateTime(model.updatedAt)) : "") + "</span>"
+    + '<span class="learning-version">v' + model.version + (model.updatedAt ? " · " + escapeHtml(dateTime(model.updatedAt)) : "") + (model.implicitInterestCount ? " · 跳转弱信号 " + model.implicitInterestCount : "") + "</span>"
     + (engine === "ai" ? '<span class="badge ai-review-badge"><i data-lucide="sparkles"></i>AI 复盘</span>' : '<span class="badge status-badge">本地复盘</span>')
     + '</div><p>' + escapeHtml(model.summary) + "</p></div>"
     + (model.targetSignals?.length ? '<div class="learning-rule-row"><strong>优先信号</strong><div>' + learningChips(model.targetSignals, "is-target") + "</div></div>" : "")
@@ -1969,13 +2015,13 @@ async function reload() {
   render();
 }
 
-async function launchRun(routineTaskIds = null, profileId = null) {
+async function launchRun(routineTaskIds = null, profileId = null, aiReviewEnabled = true) {
   const launcher = window.open("about:blank", "job-agent-worker-launch");
   try {
     if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
     const result = await api("/api/runs", {
       method: "POST",
-      body: JSON.stringify({ ...(routineTaskIds ? { routineTaskIds } : {}), profileId })
+      body: JSON.stringify({ ...(routineTaskIds ? { routineTaskIds } : {}), profileId, aiReviewEnabled })
     });
     const firstLaunch = result.launchUrls[0];
     if (launcher && firstLaunch?.url) {
@@ -2056,7 +2102,9 @@ function requestRunConfirmation(routineTaskIds = null) {
   if (!state.data.profiles?.length) return toast("请先创建并确认至少一个职业画像。", "error");
   state.pendingRunTaskIds = routineTaskIds ? selected.map((task) => task.id) : null;
   state.pendingRunProfileId = state.data.activeProfile?.id || state.data.profiles[0].id;
+  state.pendingRunAiReviewEnabled = true;
   el("#run-profile-select").innerHTML = profileSelectOptions(state.pendingRunProfileId);
+  el('input[name="run-ai-review"][value="enabled"]').checked = true;
   renderRunProfileConfirmation(selected);
   el("#run-exclusion-confirmed").checked = false;
   el("#confirm-start-run").disabled = true;
@@ -2070,7 +2118,8 @@ function renderRunProfileConfirmation(selectedTasks = null) {
   const profile = state.data.profiles.find((item) => item.id === state.pendingRunProfileId) || state.data.profiles[0];
   const exclusions = contextForProfile(profile?.id).exclusionKeywords || [];
   el("#run-exclusion-review").innerHTML = '<div class="run-confirm-summary"><strong>本次 ' + selected.length + ' 项任务</strong><span>'
-    + escapeHtml([...new Set(selected.map((task) => names[task.platform]))].join(" / ")) + ' · ' + escapeHtml(profileLabel(profile)) + '</span></div>'
+    + escapeHtml([...new Set(selected.map((task) => names[task.platform]))].join(" / ")) + ' · ' + escapeHtml(profileLabel(profile)) + ' · '
+    + (state.pendingRunAiReviewEnabled ? "AI 审阅" : "仅采集") + '</span></div>'
     + (exclusions.length
       ? '<div class="run-confirm-keywords">' + exclusions.map((keyword) => '<span>' + escapeHtml(keyword) + '</span>').join("") + '</div>'
       : '<p class="exclusion-empty">当前没有生效的排除关键词，本次 Worker 不会按排除词跳过职位。</p>');
@@ -2082,7 +2131,7 @@ async function confirmStartRun(event) {
   const button = el("#confirm-start-run");
   button.disabled = true;
   const requestedIds = state.pendingRunTaskIds;
-  const result = await launchRun(requestedIds, state.pendingRunProfileId);
+  const result = await launchRun(requestedIds, state.pendingRunProfileId, state.pendingRunAiReviewEnabled);
   if (!result) {
     button.disabled = false;
     return;
@@ -2094,6 +2143,7 @@ async function confirmStartRun(event) {
   }
   state.pendingRunTaskIds = null;
   state.pendingRunProfileId = null;
+  state.pendingRunAiReviewEnabled = true;
 }
 
 async function uploadResume() {
@@ -4017,6 +4067,11 @@ document.addEventListener("click", (event) => {
   if (event.target.closest("#open-new-profile")) return openNewProfileDialog();
   const routinePane = event.target.closest("[data-routine-pane]");
   if (routinePane) return setRoutinePane(routinePane.dataset.routinePane);
+  const externalJobLink = event.target.closest("[data-track-job-open]");
+  if (externalJobLink) {
+    trackExternalJobOpen(externalJobLink.dataset.trackJobOpen);
+    return;
+  }
   const scoreDetails = event.target.closest("[data-score-details]");
   if (scoreDetails) return openScoreDetails(scoreDetails.dataset.scoreDetails);
   const rereview = event.target.closest("[data-rereview]");
@@ -4209,6 +4264,10 @@ document.addEventListener("change", (event) => {
     state.pendingRunProfileId = event.target.value;
     el("#run-exclusion-confirmed").checked = false;
     el("#confirm-start-run").disabled = true;
+    renderRunProfileConfirmation();
+  }
+  if (event.target.matches('input[name="run-ai-review"]')) {
+    state.pendingRunAiReviewEnabled = event.target.value !== "disabled";
     renderRunProfileConfirmation();
   }
   if (event.target.matches("#routine-task-platform")) syncRoutineJobTypeOptions();

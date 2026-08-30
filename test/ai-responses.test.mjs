@@ -69,6 +69,7 @@ test("Responses API adapter sends a bounded low-reasoning structured request", a
     assert.match(received.body.instructions, /workExperience/i);
     assert.match(received.body.instructions, /empty strings and empty arrays/i);
     const input = JSON.parse(received.body.input);
+    assert.equal(input.output_format, "json");
     assert.equal(input.externalCareerAnalysis, externalText);
     assert.equal(result.profile.projectExperience[0].name, "Automation project");
     assert.deepEqual(result.profile.projectExperience[0].technologies, ["Python"]);
@@ -432,7 +433,13 @@ test("review reflection sends active feedback and returns a bounded preference m
       legacyNotHelpfulFeedback: [
         { title: "Graduate Sales Engineer", feedbackReason: "NOT_RELEVANT" },
         ...Array.from({ length: 80 }, (_, index) => ({ title: "Long feedback " + index, userNote: "x".repeat(400) }))
-      ]
+      ],
+      implicitInterestSignals: [{
+        jobId: "job_clicked_1",
+        title: "Junior Backend Developer",
+        targetKeywords: ["Python", "backend APIs"],
+        externalOpenCount: 3
+      }]
     });
     assert.match(received.instructions, /REJECTION_CORRECT/);
     assert.match(received.instructions, /must contain at least one specific English role phrase/i);
@@ -441,12 +448,15 @@ test("review reflection sends active feedback and returns a bounded preference m
     assert.match(received.instructions, /targetSignals, deprioritizeSignals, avoidSignals, and titleExclusions item in English only/i);
     assert.match(received.instructions, /avoidSignals item must be exactly one lowercase English occupation or job-function word/i);
     assert.match(received.instructions, /Soft NOT_HELPFUL feedback must affect deprioritizeSignals instead/i);
+    assert.match(received.instructions, /weak behavioral evidence only/i);
+    assert.match(received.instructions, /link opens never equal HELPFUL feedback/i);
     assert.equal(received.max_output_tokens, 444);
     assert.match(received.instructions, /complete replacement model/i);
     assert.ok(received.input.length <= 4_000);
     assert.equal(JSON.parse(received.input).legacyNotHelpfulFeedback[0].feedbackReason, "NOT_RELEVANT");
     assert.equal(JSON.parse(received.input).confirmedNegativeEvidence[0].title, "Graduate Retail Assistant");
     assert.equal(JSON.parse(received.input).explicitNotHelpfulEvidence[0].title, "Graduate Sales Engineer");
+    assert.equal(JSON.parse(received.input).implicitInterestSignals[0].jobId, "job_clicked_1");
     assert.deepEqual(result.preferenceModel.deprioritizeSignals, ["documentation"]);
     assert.deepEqual(result.preferenceModel.avoidSignals, ["sales"]);
     assert.equal(result.usage.totalTokens, 79);
