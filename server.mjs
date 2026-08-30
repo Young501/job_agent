@@ -515,9 +515,29 @@ function migrateTaskJobTypes(state) {
   }
   for (const run of state.runs ?? []) {
     run.profileId ??= state.activeProfileId ?? null;
-    for (const task of run.tasks ?? []) task.jobType = String(task.jobType || "any");
+    run.aiReviewEnabled = run.aiReviewEnabled !== false;
+    for (const task of run.tasks ?? []) {
+      task.jobType = String(task.jobType || "any");
+      task.aiReviewEnabled = typeof task.aiReviewEnabled === "boolean" ? task.aiReviewEnabled : run.aiReviewEnabled;
+    }
   }
-  for (const job of state.jobs ?? []) job.searchJobType = String(job.searchJobType || "any");
+  for (const job of state.jobs ?? []) {
+    job.searchJobType = String(job.searchJobType || "any");
+    if (!job.engagement || typeof job.engagement !== "object") continue;
+    const externalOpenCount = Math.max(0, Math.floor(Number(job.engagement.externalOpenCount) || 0));
+    if (!externalOpenCount) {
+      delete job.engagement;
+      continue;
+    }
+    job.engagement = {
+      externalOpenCount,
+      firstExternalOpenedAt: job.engagement.firstExternalOpenedAt || job.engagement.lastExternalOpenedAt || null,
+      lastExternalOpenedAt: job.engagement.lastExternalOpenedAt || job.engagement.firstExternalOpenedAt || null,
+      lastSurface: ["current", "history", "overview"].includes(job.engagement.lastSurface)
+        ? job.engagement.lastSurface
+        : "current"
+    };
+  }
 }
 
 function sameRoutineTask(left, right) {
@@ -562,6 +582,23 @@ function isConfirmedRejection(job) {
 
 function isLegacyNegativeJobFeedback(job) {
   return job.feedback?.helpfulness === "NOT_HELPFUL" && job.feedback?.reason !== "CLASSIFICATION_WRONG";
+}
+
+function isImplicitInterestJob(job) {
+  const rejected = job.screening?.category === "REJECTED" || job.screening?.titleClassification === "CLEAR_REJECT";
+  return Number(job.engagement?.externalOpenCount) > 0 && !job.feedback && !rejected;
+}
+
+function uniqueImplicitInterestJobs(jobs) {
+  const byCanonicalJob = new Map();
+  for (const job of jobs.filter(isImplicitInterestJob)) {
+    const key = job.duplicateOf || job.id;
+    const current = byCanonicalJob.get(key);
+    if (!current || String(job.engagement?.lastExternalOpenedAt || "") > String(current.engagement?.lastExternalOpenedAt || "")) {
+      byCanonicalJob.set(key, job);
+    }
+  }
+  return [...byCanonicalJob.values()];
 }
 
 function isStrictExclusionFeedback(job) {
@@ -743,7 +780,7 @@ function backfillPreferenceExclusionSuggestions(state, profileId = state.activeP
 
 function feedbackFingerprint(jobs) {
   const source = jobs
-    .map((job) => `${job.id}:${job.feedback?.updatedAt ?? ""}:${job.feedback?.reason ?? ""}:${job.feedback?.note ?? ""}:${job.learningSignals?.generatedAt ?? ""}:${(job.learningSignals?.exclusionKeywords ?? []).join(",")}`)
+    .map((job) => `${job.id}:${job.feedback?.updatedAt ?? ""}:${job.feedback?.reason ?? ""}:${job.feedback?.note ?? ""}:${job.learningSignals?.generatedAt ?? ""}:${(job.learningSignals?.exclusionKeywords ?? []).join(",")}:${job.feedback ? "" : job.engagement?.externalOpenCount ?? 0}:${job.feedback ? "" : job.engagement?.lastExternalOpenedAt ?? ""}`)
     .sort()
     .join("|");
   return createHash("sha256").update(source).digest("hex");
@@ -769,6 +806,24 @@ function feedbackForAi(job) {
     feedbackReason: job.feedback?.reason,
     userNote: job.feedback?.note,
     targetKeywords: job.learningSignals?.targetKeywords ?? []
+  };
+}
+
+function implicitInterestForAi(job) {
+  return {
+    jobId: job.id,
+    title: job.title,
+    company: job.company,
+    location: job.location,
+    source: job.source,
+    searchKeyword: job.searchKeyword,
+    previousCategory: job.screening?.category,
+    previousScore: job.screening?.score,
+    previousReason: job.screening?.reason,
+    targetKeywords: job.learningSignals?.targetKeywords ?? [],
+    externalOpenCount: Math.min(3, Math.max(1, Number(job.engagement?.externalOpenCount) || 1)),
+    firstExternalOpenedAt: job.engagement?.firstExternalOpenedAt ?? null,
+    lastExternalOpenedAt: job.engagement?.lastExternalOpenedAt ?? null
   };
 }
 
@@ -1142,6 +1197,19 @@ function hasCompleteDescription(job) {
     || job.descriptionSource === "detail-page"
     || job.source === "manual"
     || !job.runTaskId;
+}
+
+function markCollectedWithoutAi(job) {
+  if (isRejectedBeforeJd(job) || hasAiJdReview(job)) return;
+  job.screening = {
+    ...job.screening,
+    jdReviewed: false,
+    screeningStatus: "COLLECTED_ONLY"
+  };
+  job.aiReview = {
+    status: "skipped",
+    reason: "run_ai_review_disabled"
+  };
 }
 
 function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
@@ -1703,13 +1771,14 @@ function recalculateRunCounters(state, run) {
   run.counters.ai.reflections = state.reviewReflections.filter((reflection) => reflection.runId === run.id).length;
 }
 
-function createRun(state, routineTaskIds = null, requestedProfileId = null) {
+function createRun(state, routineTaskIds = null, requestedProfileId = null, requestedAiReviewEnabled = true) {
   const settings = state.settings;
   const routineTasks = state.routineTasks;
   const profile = state.profiles.find((item) => item.id === requestedProfileId)
     ?? state.profiles.find((item) => item.id === state.activeProfileId);
   if (!profile) throw new Error("Choose a career profile before starting a run.");
   const context = profileContext(state, profile.id);
+  const aiReviewEnabled = requestedAiReviewEnabled !== false;
   const requestedIds = Array.isArray(routineTaskIds) && routineTaskIds.length
     ? new Set(routineTaskIds.map((id) => String(id)))
     : null;
@@ -1726,6 +1795,7 @@ function createRun(state, routineTaskIds = null, requestedProfileId = null) {
     priority: index + 1,
     postedWithinDays: task.postedWithinDays,
     jobType: task.jobType || "any",
+    aiReviewEnabled,
     exclusionKeywords: [...context.exclusionKeywords],
     workerTiming: { ...(settings.workerTiming ?? {}) },
     attempt: 1,
@@ -1746,6 +1816,7 @@ function createRun(state, routineTaskIds = null, requestedProfileId = null) {
     state: "WAITING_FOR_WORKERS",
     startedAt: new Date().toISOString(),
     completedAt: null,
+    aiReviewEnabled,
     profileId: profile.id,
     profileName: profile.name,
     profileSnapshot: cloneData(profile.profile),
@@ -2516,7 +2587,7 @@ async function handleApi(request, response, url) {
     const run = await storage.update((state) => {
       const active = state.runs.find((item) => ["WAITING_FOR_WORKERS", "NEEDS_USER_ACTION"].includes(item.state));
       if (active) throw new Error("A run is already active. Finish or clear it before starting another run.");
-      const run = createRun(state, body.routineTaskIds, body.profileId);
+      const run = createRun(state, body.routineTaskIds, body.profileId, body.aiReviewEnabled);
       state.runs.unshift(run);
       state.runs = state.runs.slice(0, 60);
       return run;
@@ -2656,6 +2727,7 @@ async function handleApi(request, response, url) {
       const task = run?.tasks.find((item) => item.id === body.taskId);
       if (!run || !task) throw new Error("Run task was not found.");
       if (task.status !== "running") throw new Error("Only a running task can submit discovered jobs.");
+      const aiReviewEnabled = run.aiReviewEnabled !== false;
       const jobs = rawJobs.length ? addJobsToState(state, rawJobs, {
         runId: run.id,
         label: `${task.platform} discovered candidates`,
@@ -2672,6 +2744,10 @@ async function handleApi(request, response, url) {
           if (isRejectedBeforeJd(job)) {
             return { index, jobId: job.id, action: "reject", reason: job.screening.reason };
           }
+          if (!aiReviewEnabled) {
+            markCollectedWithoutAi(job);
+            return { index, jobId: job.id, action: "skip_ai", existingJobId: job.duplicateOf, reason: "Automatic AI review is disabled for this run." };
+          }
           if (!job.deduplication?.sameProfileBasis) {
             return { index, jobId: job.id, action: "fetch", existingJobId: job.duplicateOf, reason: "This profile has not reviewed the historical job and no reusable JD is available." };
           }
@@ -2679,6 +2755,10 @@ async function handleApi(request, response, url) {
         }
         if (isRejectedBeforeJd(job)) {
           return { index, jobId: job.id, action: "reject", reason: job.screening.reason };
+        }
+        if (!aiReviewEnabled) {
+          markCollectedWithoutAi(job);
+          return { index, jobId: job.id, action: "skip_ai", reason: "Automatic AI review is disabled for this run." };
         }
         return { index, jobId: job.id, action: "fetch" };
       });
@@ -2689,7 +2769,8 @@ async function handleApi(request, response, url) {
         reusedReviews: plan.filter((item) => item.reuseKind === "review").length,
         reusedJds: plan.filter((item) => item.reuseKind === "jd").length,
         seen: plan.filter((item) => item.action === "skip_seen").length,
-        rejected: plan.filter((item) => item.action === "reject").length
+        rejected: plan.filter((item) => item.action === "reject").length,
+        skippedAi: plan.filter((item) => item.action === "skip_ai").length
       };
       task.pipelineStats = {
         discovered: counts.total,
@@ -2698,6 +2779,8 @@ async function handleApi(request, response, url) {
         reusedJds: counts.reusedJds,
         localRejected: counts.rejected,
         jdPlanned: counts.fetch,
+        aiReviewEnabled,
+        aiSkipped: counts.skippedAi,
         updatedAt: new Date().toISOString()
       };
       recalculateRunCounters(state, run);
@@ -2781,10 +2864,12 @@ async function handleApi(request, response, url) {
       const jobs = Array.isArray(body.jobs) && body.jobs.length
         ? mergeWorkerResultJobs(state, body.jobs, { run, task })
         : [];
-      const autoReviewJobIds = prepareAutoReviewJobs(state, jobs);
+      if (run.aiReviewEnabled === false) jobs.forEach(markCollectedWithoutAi);
+      const autoReviewJobIds = run.aiReviewEnabled === false ? [] : prepareAutoReviewJobs(state, jobs);
       task.pipelineStats = {
         ...(task.pipelineStats || {}),
         aiQueued: autoReviewJobIds.length,
+        aiReviewEnabled: run.aiReviewEnabled !== false,
         completedAt: new Date().toISOString()
       };
       if (autoReviewJobIds.length) {
@@ -2995,6 +3080,25 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { job });
   }
 
+  const engagementOpenMatch = /^\/api\/jobs\/([^/]+)\/engagement\/open$/.exec(path);
+  if (request.method === "POST" && engagementOpenMatch) {
+    const body = await readJson(request);
+    const job = await storage.update((state) => {
+      const job = state.jobs.find((item) => item.id === engagementOpenMatch[1]);
+      if (!job) throw new Error("Job was not found.");
+      const now = new Date().toISOString();
+      const previous = job.engagement && typeof job.engagement === "object" ? job.engagement : {};
+      job.engagement = {
+        externalOpenCount: Math.max(0, Math.floor(Number(previous.externalOpenCount) || 0)) + 1,
+        firstExternalOpenedAt: previous.firstExternalOpenedAt || now,
+        lastExternalOpenedAt: now,
+        lastSurface: ["current", "history", "overview"].includes(body.surface) ? body.surface : "current"
+      };
+      return job;
+    });
+    return sendJson(response, 200, { job });
+  }
+
   const runTaskViewedMatch = /^\/api\/runs\/([^/]+)\/tasks\/([^/]+)\/viewed$/.exec(path);
   if (request.method === "PUT" && runTaskViewedMatch) {
     const result = await storage.update((state) => {
@@ -3072,7 +3176,8 @@ async function handleApi(request, response, url) {
       const runRejected = state.jobs.filter((job) => job.runId === run.id
         && isAiRoleRejectedSignal(job));
       const runLegacy = state.jobs.filter((job) => job.runId === run.id && isLegacyNegativeJobFeedback(job));
-      const runEvidence = uniqueJobsById([...runHelpful, ...runRejected, ...runLegacy]);
+      const runImplicitInterest = uniqueImplicitInterestJobs(state.jobs.filter((job) => job.runId === run.id));
+      const runEvidence = uniqueJobsById([...runHelpful, ...runRejected, ...runLegacy, ...runImplicitInterest]);
       const previousReflection = state.reviewReflections.find((item) => item.runId === run.id) ?? null;
       if (!runEvidence.length && !previousReflection) throw new Error("Review at least one AI-screened job before completing the reflection.");
 
@@ -3090,9 +3195,14 @@ async function handleApi(request, response, url) {
         .filter(isLegacyNegativeJobFeedback)
         .sort((left, right) => String(right.feedback.updatedAt).localeCompare(String(left.feedback.updatedAt)))
         .slice(0, 120);
+      const activeImplicitInterest = uniqueImplicitInterestJobs(state.jobs
+        .filter(belongsToProfile))
+        .sort((left, right) => String(right.engagement?.lastExternalOpenedAt || "").localeCompare(String(left.engagement?.lastExternalOpenedAt || "")))
+        .slice(0, 120);
       const helpfulFeedback = activeHelpful.map(feedbackForAi);
       const rejectedJobSignals = activeRejected.map(rejectedSignalForAi);
       const legacyNotHelpfulFeedback = activeLegacy.map(feedbackForAi);
+      const implicitInterestSignals = activeImplicitInterest.map(implicitInterestForAi);
       const profile = run.profileSnapshot || profileRecord?.profile;
       const ai = aiStatus();
       const canUseAi = ai.configured && run.counters.ai.calls < ai.budget.maxAiCallsPerRun;
@@ -3103,18 +3213,18 @@ async function handleApi(request, response, url) {
       if (canUseAi) {
         run.counters.ai.calls += 1;
         try {
-          const evaluated = await reflectOnJobFeedback({ helpfulFeedback, rejectedJobSignals, legacyNotHelpfulFeedback, previousModel: context.preferenceModel, profile });
+          const evaluated = await reflectOnJobFeedback({ helpfulFeedback, rejectedJobSignals, legacyNotHelpfulFeedback, implicitInterestSignals, previousModel: context.preferenceModel, profile });
           generated = evaluated.preferenceModel;
           usage = evaluated.usage;
           recordAiUsage(run, usage);
           engine = "ai";
         } catch (error) {
           aiError = error.message;
-          generated = localPreferenceReflection({ helpfulJobs: activeHelpful, rejectedJobs: activeRejected, legacyNotHelpfulJobs: activeLegacy });
+          generated = localPreferenceReflection({ helpfulJobs: activeHelpful, rejectedJobs: activeRejected, legacyNotHelpfulJobs: activeLegacy, implicitInterestJobs: activeImplicitInterest });
           engine = "local-rules-fallback";
         }
       } else {
-        generated = localPreferenceReflection({ helpfulJobs: activeHelpful, rejectedJobs: activeRejected, legacyNotHelpfulJobs: activeLegacy });
+        generated = localPreferenceReflection({ helpfulJobs: activeHelpful, rejectedJobs: activeRejected, legacyNotHelpfulJobs: activeLegacy, implicitInterestJobs: activeImplicitInterest });
         if (ai.configured) aiError = "AI call budget reached; local reflection used.";
       }
       const now = new Date().toISOString();
@@ -3124,6 +3234,7 @@ async function handleApi(request, response, url) {
         feedbackCount: activeHelpful.length + activeRejected.length + activeLegacy.length,
         positiveFeedbackCount: activeHelpful.length,
         rejectedSignalCount: activeRejected.length,
+        implicitInterestCount: activeImplicitInterest.length,
         sourceRunId: run.id,
         engine,
         updatedAt: now
@@ -3139,7 +3250,10 @@ async function handleApi(request, response, url) {
         positiveFeedbackCount: runHelpful.length,
         rejectedSignalCount: runRejected.length,
         totalActiveFeedback: activeHelpful.length + activeRejected.length + activeLegacy.length,
+        totalActiveImplicitInterest: activeImplicitInterest.length,
         feedbackJobIds: runEvidence.map((job) => job.id),
+        implicitInterestCount: runImplicitInterest.length,
+        implicitInterestJobIds: runImplicitInterest.map((job) => job.id),
         feedbackFingerprint: feedbackFingerprint(runEvidence),
         engine,
         aiError,

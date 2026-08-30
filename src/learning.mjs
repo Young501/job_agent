@@ -65,6 +65,7 @@ export function validatePreferenceModel(input = {}, metadata = {}) {
     feedbackCount: Math.max(0, Number(metadata.feedbackCount ?? input.feedbackCount) || 0),
     positiveFeedbackCount: Math.max(0, Number(metadata.positiveFeedbackCount ?? input.positiveFeedbackCount) || 0),
     rejectedSignalCount: Math.max(0, Number(metadata.rejectedSignalCount ?? input.rejectedSignalCount) || 0),
+    implicitInterestCount: Math.max(0, Number(metadata.implicitInterestCount ?? input.implicitInterestCount) || 0),
     sourceRunId: metadata.sourceRunId ?? input.sourceRunId ?? null,
     engine: normalizeText(metadata.engine ?? input.engine) || "local-rules",
     updatedAt: metadata.updatedAt ?? input.updatedAt ?? null
@@ -110,16 +111,36 @@ export function localPreferenceReflection(input, metadata = {}) {
   const suppliedUseful = legacy ? [] : Array.isArray(input?.helpfulJobs) ? input.helpfulJobs : [];
   const rejected = legacy ? [] : Array.isArray(input?.rejectedJobs) ? input.rejectedJobs : [];
   const suppliedLegacy = legacy ? input : Array.isArray(input?.legacyNotHelpfulJobs) ? input.legacyNotHelpfulJobs : [];
+  const implicitInterest = legacy ? [] : Array.isArray(input?.implicitInterestJobs)
+    ? input.implicitInterestJobs.filter((item) => !item.feedback)
+    : [];
   const correctedLegacy = suppliedLegacy.filter((item) => item.feedback?.reason === "CLASSIFICATION_WRONG");
   const useful = [...suppliedUseful, ...correctedLegacy];
   const oldNegative = suppliedLegacy.filter((item) => item.feedback?.reason !== "CLASSIFICATION_WRONG");
   const explicitExclusions = oldNegative.filter((item) => item.feedback?.reason === "NOT_RELEVANT");
   const deprioritized = oldNegative.filter((item) => item.feedback?.reason !== "NOT_RELEVANT");
   const notes = unique([...useful, ...oldNegative].map((item) => item.feedback?.note)).slice(0, 8);
-  const targetSignals = unique(useful.flatMap((item) => [
+  const implicitTargetCounts = new Map();
+  for (const job of implicitInterest) {
+    for (const signal of machineSignalList(job.learningSignals?.targetKeywords, 12)) {
+      const key = signal.toLowerCase();
+      const current = implicitTargetCounts.get(key) || { signal, count: 0 };
+      current.count += 1;
+      implicitTargetCounts.set(key, current);
+    }
+  }
+  const implicitTargets = [...implicitTargetCounts.values()]
+    .filter((item) => item.count >= 2)
+    .sort((left, right) => right.count - left.count || left.signal.localeCompare(right.signal))
+    .map((item) => item.signal)
+    .slice(0, 8);
+  const targetSignals = unique([
+    ...useful.flatMap((item) => [
     ...(item.learningSignals?.targetKeywords ?? []),
     item.title
-  ])).slice(0, 24);
+    ]),
+    ...implicitTargets
+  ]).slice(0, 24);
   const deprioritizeSignals = compactMachineKeywords(deprioritized.flatMap((item) => [
     ...(item.learningSignals?.targetKeywords ?? []),
     item.title
@@ -133,11 +154,12 @@ export function localPreferenceReflection(input, metadata = {}) {
     ...explicitExclusions.map((item) => item.title),
     ...confirmedRejected.map((item) => item.title)
   ]).slice(0, 50);
-  const evidenceCount = useful.length + rejected.length + oldNegative.length;
+  const evidenceCount = useful.length + rejected.length + oldNegative.length + implicitInterest.length;
   const details = [
     useful.length ? `${useful.length} 条明确有用` : "",
     rejected.length ? `${rejected.length} 条 AI 或人工确认的不匹配` : "",
-    oldNegative.length ? `${oldNegative.length} 条明确没用` : ""
+    oldNegative.length ? `${oldNegative.length} 条明确没用` : "",
+    implicitInterest.length ? `${implicitInterest.length} 条职位跳转（弱兴趣）` : ""
   ].filter(Boolean);
   return validatePreferenceModel({
     summary: evidenceCount
@@ -150,6 +172,7 @@ export function localPreferenceReflection(input, metadata = {}) {
     screeningGuidance: evidenceCount
       ? [
           "优先参考用户明确标记为有用的职位特征。",
+          ...(implicitInterest.length ? ["职位跳转只作为弱兴趣信号；单次或重复打开同一职位都不等同于人工“有用”反馈。"] : []),
           "AI 排除信号只用于辅助匹配；脚本排除词必须由用户在搜索设置中批准。",
           ...notes.map((note) => `用户补充：${note}`)
         ]
@@ -158,7 +181,8 @@ export function localPreferenceReflection(input, metadata = {}) {
     ...metadata,
     feedbackCount: metadata.feedbackCount ?? evidenceCount,
     positiveFeedbackCount: metadata.positiveFeedbackCount ?? useful.length,
-    rejectedSignalCount: metadata.rejectedSignalCount ?? rejected.length
+    rejectedSignalCount: metadata.rejectedSignalCount ?? rejected.length,
+    implicitInterestCount: metadata.implicitInterestCount ?? implicitInterest.length
   });
 }
 

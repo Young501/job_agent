@@ -148,6 +148,35 @@ test("local reflection separates useful targets from AI exclusion suggestions", 
   assert.match(model.screeningGuidance.join(" "), /用户在搜索设置中批准/);
 });
 
+test("job-link opens remain weak and only recurring signals reinforce local targets", () => {
+  const singleOpen = localPreferenceReflection({
+    implicitInterestJobs: [{
+      id: "job_1",
+      engagement: { externalOpenCount: 4 },
+      learningSignals: { targetKeywords: ["React", "frontend development"] }
+    }]
+  });
+  assert.deepEqual(singleOpen.targetSignals, []);
+  assert.equal(singleOpen.implicitInterestCount, 1);
+
+  const recurringOpens = localPreferenceReflection({
+    implicitInterestJobs: [{
+      id: "job_1",
+      engagement: { externalOpenCount: 4 },
+      learningSignals: { targetKeywords: ["React", "frontend development"] }
+    }, {
+      id: "job_2",
+      engagement: { externalOpenCount: 1 },
+      learningSignals: { targetKeywords: ["React", "TypeScript"] }
+    }]
+  });
+  assert.deepEqual(recurringOpens.targetSignals, ["React"]);
+  assert.deepEqual(recurringOpens.avoidSignals, []);
+  assert.deepEqual(recurringOpens.deprioritizeSignals, []);
+  assert.equal(recurringOpens.implicitInterestCount, 2);
+  assert.match(recurringOpens.summary, /职位跳转（弱兴趣）/);
+});
+
 test("a human-confirmed rejection becomes exclusion evidence, not a target", () => {
   const model = localPreferenceReflection({
     helpfulJobs: [],

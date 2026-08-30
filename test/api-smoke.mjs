@@ -202,8 +202,8 @@ try {
   assert.equal(workerResponse.ok, true);
   assert.match(workerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(workerScript, /Job Agent Worker - SEEK/);
-  assert.match(workerScript, /@version\s+1\.1\.0/);
-  assert.match(workerScript, /const APP_VERSION = "1\.1\.0"/);
+  assert.match(workerScript, /@version\s+1\.1\.1/);
+  assert.match(workerScript, /const APP_VERSION = "1\.1\.1"/);
   assert.match(workerScript, /function agentShowNaturalSeekKeyword/);
   assert.match(workerScript, /Do not dispatch an input event/);
   const naturalKeywordFunction = extractNamedFunction(workerScript, "agentShowNaturalSeekKeyword");
@@ -257,6 +257,7 @@ try {
   assert.match(workerScript, /window\.name === "job-agent-history-migration"/);
   assert.match(workerScript, /!agentTask && isSeen\(job\)/);
   assert.match(workerScript, /action === "skip_seen"/);
+  assert.match(workerScript, /action === "skip_ai"/);
   assert.match(workerScript, /job\.agentJobId = planItem\.jobId/);
   assert.match(workerScript, /data-automation=\"jobAdDetails\"/);
   assert.match(workerScript, /@match\s+https:\/\/au\.seek\.com\/job\/\*/);
@@ -352,8 +353,8 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+1\.1\.1/);
-  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.1"/);
+  assert.match(indeedWorkerScript, /@version\s+1\.1\.2/);
+  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.2"/);
   assert.match(indeedWorkerScript, /agentWaitForSearchResults/);
   assert.match(indeedWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(indeedWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
@@ -363,6 +364,7 @@ try {
   assert.match(indeedWorkerScript, /\/api\/worker\/history\/import/);
   assert.match(indeedWorkerScript, /!agentTask && isSeen\(job\)/);
   assert.match(indeedWorkerScript, /action === "skip_seen"/);
+  assert.match(indeedWorkerScript, /action === "skip_ai"/);
   assert.match(indeedWorkerScript, /jobDescriptionText/);
   assert.match(indeedWorkerScript, /agentRunJdChild/);
   assert.match(indeedWorkerScript, /jobAgentJdRequest/);
@@ -426,8 +428,8 @@ try {
   assert.match(linkedInWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(linkedInWorkerScript, /@name\s+Job Agent Worker - LinkedIn/);
   assert.match(linkedInWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(linkedInWorkerScript, /@version\s+1\.1\.0/);
-  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.1\.0"/);
+  assert.match(linkedInWorkerScript, /@version\s+1\.1\.1/);
+  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.1\.1"/);
   assert.match(linkedInWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(linkedInWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
   assert.match(linkedInWorkerScript, /Job Agent 访问节奏/);
@@ -436,6 +438,7 @@ try {
   assert.match(linkedInWorkerScript, /\/api\/worker\/history\/import/);
   assert.match(linkedInWorkerScript, /!agentTask && isSeen\(candidate\)/);
   assert.match(linkedInWorkerScript, /action === "skip_seen"/);
+  assert.match(linkedInWorkerScript, /action === "skip_ai"/);
   assert.match(linkedInWorkerScript, /jobs-description-content__text/);
   assert.match(linkedInWorkerScript, /@match\s+https:\/\/www\.linkedin\.com\/jobs\/view\/\*/);
   assert.match(linkedInWorkerScript, /@match\s+https:\/\/www\.linkedin\.com\/authwall\*/);
@@ -545,6 +548,8 @@ try {
   assert.match(dashboardHtml, /value="WOULD_NOT_APPLY"/);
   assert.match(dashboardHtml, /id="exclusion-suggestions"/);
   assert.match(dashboardHtml, /id="run-confirmation-dialog"/);
+  assert.match(dashboardHtml, /name="run-ai-review"/);
+  assert.match(dashboardHtml, /仅采集职位/);
   assert.match(dashboardHtml, /明确不符合/);
   assert.match(dashboardHtml, /id="open-clear-all-history"/);
   assert.match(dashboardHtml, /id="clear-all-history-dialog"/);
@@ -576,18 +581,20 @@ try {
   assert.match(dashboardScript, /function openScoreDetails/);
   assert.match(dashboardScript, /AI 根据完整 JD 与职业画像进行语义综合评分/);
   assert.match(dashboardScript, /安装 \/ 更新/);
-  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.1"/);
-  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.0"/);
+  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.2"/);
+  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.1"/);
+  assert.match(dashboardScript, /pendingRunAiReviewEnabled/);
+  assert.match(dashboardScript, /aiReviewEnabled/);
   assert.match(dashboardScript, /function selectRoutineTaskRange/);
   assert.match(dashboardScript, /data-routine-platform-select/);
   assert.match(dashboardScript, /\/workers\/install\//);
   assert.match(dashboardScript, /agent-worker-/);
-  const installerResponse = await fetch("http://127.0.0.1:" + port + "/workers/install/indeed-agent-worker-v1.1.1.user.js");
+  const installerResponse = await fetch("http://127.0.0.1:" + port + "/workers/install/indeed-agent-worker-v1.1.2.user.js");
   const installerScript = await installerResponse.text();
   assert.equal(installerResponse.ok, true);
   assert.match(installerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(installerScript, /@name\s+Job Agent Worker - Indeed/);
-  assert.match(installerScript, /@version\s+1\.1\.1/);
+  assert.match(installerScript, /@version\s+1\.1\.2/);
   assert.match(dashboardScript, /data-copy-worker/);
   assert.match(dashboardScript, /loadWorkerScripts/);
   assert.match(dashboardScript, /job-agent:view/);
@@ -922,6 +929,8 @@ try {
   await validateRoutineTask("linkedin", 1);
   const run = await request("/api/runs", { profileId: casualProfile.profile.id });
   assert.equal(run.run.profileId, casualProfile.profile.id);
+  assert.equal(run.run.aiReviewEnabled, true);
+  assert.ok(run.run.tasks.every((task) => task.aiReviewEnabled === true));
   assert.equal(run.run.profileName, "Casual hospitality");
   assert.equal(run.run.tasks.length, 4);
   assert.ok(run.run.tasks.some((task) => task.platform === "indeed" && task.jobType === "part-time"));
@@ -1401,6 +1410,16 @@ try {
   const restoredUnread = await request("/api/jobs/" + imported.jobs[0].id + "/viewed", { viewed: false }, "PUT");
   assert.equal(restoredUnread.job.viewedAt, null);
 
+  const firstExternalOpen = await request("/api/jobs/" + imported.jobs[0].id + "/engagement/open", { surface: "current" });
+  assert.equal(firstExternalOpen.job.engagement.externalOpenCount, 1);
+  assert.equal(firstExternalOpen.job.engagement.lastSurface, "current");
+  assert.equal(firstExternalOpen.job.viewedAt, null);
+  const secondExternalOpen = await request("/api/jobs/" + imported.jobs[0].id + "/engagement/open", { surface: "history" });
+  assert.equal(secondExternalOpen.job.engagement.externalOpenCount, 2);
+  assert.equal(secondExternalOpen.job.engagement.lastSurface, "history");
+  const openedBootstrap = await request("/api/bootstrap");
+  assert.equal(openedBootstrap.jobs.find((job) => job.id === imported.jobs[0].id).engagement.externalOpenCount, 2);
+
   const feedback = await request("/api/jobs/" + imported.jobs[0].id + "/feedback", {
     helpful: true,
     reason: "ROLE_RELEVANT",
@@ -1412,6 +1431,7 @@ try {
 
   const reflection = await request("/api/runs/" + run.run.id + "/reflection", {});
   assert.equal(reflection.reflection.feedbackCount, 1);
+  assert.equal(reflection.reflection.implicitInterestCount, 0);
   assert.equal(reflection.reflection.engine, "ai");
   assert.equal(reflection.preferenceModel.version, 1);
   assert.ok(reflection.preferenceModel.titleExclusions.includes("Graduate Analyst"));
@@ -1552,18 +1572,41 @@ try {
   assert.equal(afterRecordClear.preferenceModel, null);
 
   const removableDailyTask = await validateRoutineTask("seek", 3);
-  const removableRun = await request("/api/runs", { routineTaskIds: [removableDailyTask.routineTask.id] });
+  const removableRun = await request("/api/runs", {
+    routineTaskIds: [removableDailyTask.routineTask.id],
+    aiReviewEnabled: false
+  });
+  assert.equal(removableRun.run.aiReviewEnabled, false);
+  assert.equal(removableRun.run.tasks[0].aiReviewEnabled, false);
   const removableClaim = await request("/api/worker/next?runId=" + removableRun.run.id + "&platform=seek&workerId=remove-test-worker");
   assert.equal(removableClaim.task.id, removableRun.run.tasks[0].id);
+  const collectOnlyPlan = await request("/api/worker/title-plan", {
+    runId: removableRun.run.id,
+    taskId: removableClaim.task.id,
+    jobs: [{ source: "seek", sourceJobId: "remove-test-job", title: "Museum Digitisation Coordinator", location: "Melbourne VIC" }]
+  });
+  assert.equal(collectOnlyPlan.plan[0].action, "skip_ai");
+  assert.equal(collectOnlyPlan.counts.fetch, 0);
+  assert.equal(collectOnlyPlan.counts.skippedAi, 1);
   const removableResult = await request("/api/worker/result", {
     runId: removableRun.run.id,
     taskId: removableClaim.task.id,
     taskAttempt: removableClaim.task.attempt,
     workerId: "remove-test-worker",
     status: "completed",
-    jobs: [{ source: "seek", sourceJobId: "remove-test-job", title: "Museum Digitisation Coordinator", location: "Melbourne VIC" }]
+    jobs: [{
+      source: "seek",
+      sourceJobId: "remove-test-job",
+      agentJobId: collectOnlyPlan.plan[0].jobId,
+      title: "Museum Digitisation Coordinator",
+      location: "Melbourne VIC",
+      descriptionFetchStatus: "skipped-ai"
+    }]
   });
   assert.equal(removableResult.jobs.length, 1);
+  assert.equal(removableResult.autoReviewQueued, 0);
+  assert.equal(removableResult.jobs[0].screening.screeningStatus, "COLLECTED_ONLY");
+  assert.equal(removableResult.jobs[0].aiReview.reason, "run_ai_review_disabled");
   const duplicateRun = await request("/api/runs", { routineTaskIds: [removableDailyTask.routineTask.id] });
   const duplicateClaim = await request("/api/worker/next?runId=" + duplicateRun.run.id + "&platform=seek&workerId=duplicate-test-worker");
   const duplicateResult = await request("/api/worker/result", {

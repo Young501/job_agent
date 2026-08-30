@@ -972,6 +972,17 @@ h3 { margin: 0; font: 700 14px/1.3 var(--font-display); }
 .button-remove-feedback { color: #8a3b35; }
 .confirm-dialog { width: min(560px, calc(100vw - 32px)); }
 .run-confirmation-dialog { width: min(640px, calc(100vw - 32px)); }
+.run-mode-fieldset { padding: 0; margin: 0 0 16px; border: 0; }
+.run-mode-fieldset legend { margin-bottom: 7px; color: var(--text); font-size: 12px; font-weight: 800; }
+.run-mode-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.run-mode-option { position: relative; display: block; min-width: 0; cursor: pointer; }
+.run-mode-option input { position: absolute; opacity: 0; pointer-events: none; }
+.run-mode-option > span { display: block; min-height: 88px; padding: 13px; background: #fff; border: 1px solid var(--line-strong); border-radius: 4px; transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease; }
+.run-mode-option strong { display: flex; align-items: center; gap: 7px; color: var(--text); font-size: 13px; }
+.run-mode-option strong svg { width: 16px; height: 16px; color: var(--accent); }
+.run-mode-option small { display: block; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.run-mode-option input:checked + span { background: var(--accent-soft); border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.run-mode-option input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
 .run-exclusion-review { margin-top: 15px; padding: 13px; background: #f7f9fa; border: 1px solid var(--line-strong); border-radius: 3px; }
 .run-confirm-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
 .run-confirm-summary strong { font-size: 13px; }
@@ -980,6 +991,7 @@ h3 { margin: 0; font: 700 14px/1.3 var(--font-display); }
 .run-confirm-keywords span { padding: 5px 8px; color: #57342f; font-size: 11px; font-weight: 700; background: #fff; border: 1px solid #e1bdb7; border-radius: 2px; }
 .run-confirm-checkbox { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; color: #344a65; font-size: 12px; font-weight: 700; cursor: pointer; }
 .run-confirm-checkbox input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+@media (max-width: 560px) { .run-mode-options { grid-template-columns: 1fr; } .run-mode-option > span { min-height: 0; } }
 .confirm-copy { margin: 0; color: #384d68; font-size: 13px; line-height: 1.65; }
 .form-note { margin: 10px 0 0; color: var(--muted); font-size: 12px; }
 .warning-note { color: #925b00; }
