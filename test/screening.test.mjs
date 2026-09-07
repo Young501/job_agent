@@ -7,6 +7,7 @@ import {
   localProfileDraft,
   normalizeEducationEntries,
   normalizeJob,
+  profileForMatching,
   screenTitle,
   suggestProfileSection,
   strongSourceKey,
@@ -389,6 +390,36 @@ test("structured profiles preserve complete optional experience records", () => 
   assert.equal(profile.education[0].institution, "University of Melbourne");
   assert.equal(profile.education[0].degree, "Master of IT");
   assert.deepEqual(profile.projectExperience[0].technologies, ["JavaScript", "Node.js"]);
+});
+
+test("part-time profiles keep hidden records while excluding them from AI context", () => {
+  const stored = validateProfileDraft({
+    schemaVersion: 2,
+    profileLayout: {
+      preset: "part-time",
+      purpose: "part-time",
+      includedSections: ["basicInfo", "jobPreferences", "visa", "workExperience", "languages", "skills", "customSections"]
+    },
+    basicInfo: { name: "Candidate", location: "Melbourne VIC" },
+    jobPreferences: { notes: "Weekend cafe or retail work.\nCommute under 35 minutes." },
+    education: [{ institution: "Example University", degree: "Master of IT" }],
+    workExperience: [{ company: "Cafe Example", role: "Barista" }],
+    skills: ["Customer service"]
+  });
+  const matching = profileForMatching(stored);
+
+  assert.equal(stored.education[0].degree, "Master of IT");
+  assert.equal(matching.education, undefined);
+  assert.equal(matching.workExperience[0].role, "Barista");
+  assert.equal(matching.jobPreferences.notes, "Weekend cafe or retail work.\nCommute under 35 minutes.");
+  assert.equal(matching.profileLayout.purpose, "part-time");
+});
+
+test("part-time title screening does not apply career-only rejection rules", () => {
+  const result = screenTitle("Weekend Barista", { thresholds, profilePurpose: "part-time" });
+  assert.equal(result.titleClassification, "AMBIGUOUS");
+  assert.equal(result.screeningStatus, "NEEDS_JD_REVIEW");
+  assert.notEqual(result.category, "REJECTED");
 });
 
 test("local resume extraction separates personal, LinkedIn, and GitHub URLs", () => {

@@ -1,4 +1,4 @@
-const validViews = new Set(["overview", "jobs", "routine", "profile", "settings", "setup"]);
+const validViews = new Set(["overview", "jobs", "routine", "profile", "exclusions", "settings", "setup"]);
 
 function initialView() {
   const requested = new URL(window.location.href).searchParams.get("view");
@@ -50,6 +50,7 @@ const state = {
   profilePointerDrag: null,
   suppressProfileChipClick: false,
   settingsProfileId: null,
+  exclusionsProfileId: null,
   coverLetterJobId: null,
   coverLetterCurrent: null
 };
@@ -159,13 +160,14 @@ const externalGptProfilePrompt = [
   "Extract only facts explicitly supported by the resume. Never invent missing contact details, dates, work rights, achievements, or preferences.",
   "Empty strings and empty arrays are valid. Keep each work, project, education, activity, certification, language, and honor as one complete entry.",
   "Return JSON only, with exactly this shape:",
-  '{"schemaVersion":2,"basicInfo":{"name":"","location":"","phone":"","email":"","linkedinUrl":"","githubUrl":"","websiteUrl":""},"visa":{"visaType":"","visaName":"","grantedDate":"","expiryDate":"","details":"","forceKeepRequirements":[]},"workExperience":[{"company":"","role":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}],"projectExperience":[{"name":"","role":"","startDate":"","endDate":"","url":"","description":"","technologies":[],"highlights":[]}],"education":[{"institution":"","location":"","degree":"","field":"","startDate":"","endDate":"","description":""}],"extracurricular":[{"organization":"","role":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}],"certifications":[{"name":"","issuer":"","issuedDate":"","expiryDate":"","credentialId":"","url":""}],"languages":[{"language":"","proficiency":""}],"skills":[],"honors":[{"title":"","issuer":"","date":"","description":""}],"customSections":[{"title":"","entries":[{"title":"","subtitle":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}]}]}'
+  '{"schemaVersion":2,"profileLayout":{"preset":"career","purpose":"career","includedSections":["basicInfo","jobPreferences","visa","workExperience","projectExperience","education","extracurricular","certifications","languages","skills","honors","customSections"]},"basicInfo":{"name":"","location":"","phone":"","email":"","linkedinUrl":"","githubUrl":"","websiteUrl":""},"jobPreferences":{"notes":""},"visa":{"visaType":"","visaName":"","grantedDate":"","expiryDate":"","details":"","forceKeepRequirements":[]},"workExperience":[{"company":"","role":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}],"projectExperience":[{"name":"","role":"","startDate":"","endDate":"","url":"","description":"","technologies":[],"highlights":[]}],"education":[{"institution":"","location":"","degree":"","field":"","startDate":"","endDate":"","description":""}],"extracurricular":[{"organization":"","role":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}],"certifications":[{"name":"","issuer":"","issuedDate":"","expiryDate":"","credentialId":"","url":""}],"languages":[{"language":"","proficiency":""}],"skills":[],"honors":[{"title":"","issuer":"","date":"","description":""}],"customSections":[{"title":"","entries":[{"title":"","subtitle":"","location":"","startDate":"","endDate":"","description":"","highlights":[]}]}]}'
 ].join("\n\n");
 const pages = {
   overview: ["今日工作区", "职位概览"],
   jobs: ["组合清单", "职位审阅"],
   routine: ["例行搜索", "每日任务"],
   profile: ["候选人资料", "职业画像"],
+  exclusions: ["筛选规则", "排除关键词"],
   settings: ["共用配置", "搜索设置"],
   setup: ["浏览器连接", "安装设置"]
 };
@@ -188,6 +190,7 @@ const formalProfileTagSections = profileTagSections.slice(1);
 const formalProfileTagKeys = new Set(formalProfileTagSections.map((definition) => definition.key));
 const structuredProfileSections = [
   { key: "basicInfo", label: "基本信息", icon: "contact", singular: true },
+  { key: "jobPreferences", label: "求职偏好", icon: "sliders-horizontal", singular: true },
   { key: "visa", label: "身份与签证", icon: "badge-check", singular: true },
   { key: "workExperience", label: "工作经历", icon: "briefcase-business", addLabel: "添加工作经历" },
   { key: "projectExperience", label: "项目经历", icon: "blocks", addLabel: "添加项目经历" },
@@ -198,6 +201,15 @@ const structuredProfileSections = [
   { key: "skills", label: "技能", icon: "code-2", skills: true, addLabel: "添加技能" },
   { key: "honors", label: "荣誉", icon: "award", addLabel: "添加荣誉" }
 ];
+const profileSectionOptions = [
+  ...structuredProfileSections,
+  { key: "customSections", label: "自定义板块", icon: "folder-cog" }
+];
+const requiredProfileSections = new Set(["basicInfo", "jobPreferences", "visa"]);
+const profileLayoutPresets = {
+  career: profileSectionOptions.map((definition) => definition.key),
+  "part-time": ["basicInfo", "jobPreferences", "visa", "workExperience", "languages", "skills", "customSections"]
+};
 const profileEntryFields = {
   workExperience: [["company", "公司"], ["role", "职位"], ["location", "地点"], ["startDate", "开始时间"], ["endDate", "结束时间"], ["description", "经历说明", "textarea"], ["highlights", "职责与成果（一行一项）", "lines"]],
   projectExperience: [["name", "项目名称"], ["role", "担任角色"], ["startDate", "开始时间"], ["endDate", "结束时间"], ["url", "项目网址", "url"], ["description", "项目说明", "textarea"], ["technologies", "技术（一行一项）", "lines"], ["highlights", "成果（一行一项）", "lines"]],
@@ -224,6 +236,13 @@ const profileEngineLabel = (engine) => ({
   manual: "手动创建",
   copied: "复制创建"
 }[engine] || "画像草稿");
+
+function profileLifecycleLabel(record, activeId = "") {
+  if (record?.id === activeId) return "默认";
+  if (record?.status === "approved") return "已确认";
+  if (record?.updatedAt) return "已保存";
+  return "草稿";
+}
 
 function persistView() {
   if (!validViews.has(state.view)) state.view = "overview";
@@ -1668,9 +1687,47 @@ function profileCandidatePanelMarkup(profile) {
 
 function profileEntryCount(profile, key) {
   if (key === "basicInfo") return Object.values(profile.basicInfo || {}).filter(Boolean).length;
+  if (key === "jobPreferences") return Number(Boolean(String(profile.jobPreferences?.notes || "").trim()));
   if (key === "visa") return Object.entries(profile.visa || {}).reduce((count, [field, value]) => count + (field === "forceKeepRequirements" ? (value || []).length : Number(Boolean(value))), 0);
   if (key === "skills") return (profile.skills || []).length;
   return (profile[key] || []).length;
+}
+
+function selectedExclusionsProfile() {
+  return state.data.profiles.find((profile) => profile.id === state.exclusionsProfileId)
+    || activeProfile()
+    || state.data.profiles[0]
+    || null;
+}
+
+function profileLayoutFor(profile) {
+  const raw = profile?.profileLayout && typeof profile.profileLayout === "object" ? profile.profileLayout : {};
+  const preset = ["career", "part-time", "custom"].includes(raw.preset) ? raw.preset : "career";
+  const purpose = ["career", "part-time"].includes(raw.purpose) ? raw.purpose : preset === "part-time" ? "part-time" : "career";
+  const supplied = Array.isArray(raw.includedSections) ? raw.includedSections : profileLayoutPresets[preset] || profileLayoutPresets.career;
+  const valid = new Set(profileSectionOptions.map((definition) => definition.key));
+  return {
+    preset,
+    purpose,
+    includedSections: [...new Set([...requiredProfileSections, ...supplied])].filter((key) => valid.has(key))
+  };
+}
+
+function profileLayoutMarkup(profile) {
+  const layout = profileLayoutFor(profile);
+  const included = new Set(layout.includedSections);
+  const sectionOptions = profileSectionOptions.map((definition) => {
+    const required = requiredProfileSections.has(definition.key);
+    return '<label class="profile-layout-option"><input type="checkbox" data-profile-layout-section="' + definition.key + '" '
+      + (included.has(definition.key) ? "checked " : "") + (required ? "disabled " : "") + '><i data-lucide="' + definition.icon
+      + '"></i><span>' + definition.label + '</span>' + (required ? '<small>固定</small>' : "") + "</label>";
+  }).join("");
+  return '<section class="profile-layout-strip"><div class="profile-layout-copy"><i data-lucide="panel-left-close"></i><div><strong>本画像使用的板块</strong><span>未启用的内容会保留，但不会参与 AI 匹配。</span></div></div>'
+    + '<label class="profile-layout-preset"><span>画像用途</span><select id="profile-layout-preset"><option value="career"' + (layout.preset === "career" ? " selected" : "")
+    + '>职业求职 · 完整</option><option value="part-time"' + (layout.preset === "part-time" ? " selected" : "")
+    + '>兼职求职 · 精简</option><option value="custom"' + (layout.preset === "custom" ? " selected" : "") + '>自定义 · ' + (layout.purpose === "part-time" ? "兼职" : "职业") + '</option></select></label>'
+    + '<details class="profile-layout-manager"><summary><i data-lucide="list-checks"></i><span>选择板块</span><small>' + included.size + ' / ' + profileSectionOptions.length
+    + '</small><i data-lucide="chevron-down"></i></summary><div class="profile-layout-options">' + sectionOptions + "</div></details></section>";
 }
 
 function profileEntrySummary(section, entry, index) {
@@ -1712,6 +1769,11 @@ function basicInfoMarkup(profile) {
   return '<div class="profile-basic-grid">' + fields.map(([field, label, type]) => profileFieldMarkup("basicInfo", field, label, type, profile.basicInfo?.[field])).join("") + "</div>";
 }
 
+function jobPreferencesMarkup(profile) {
+  return '<label class="field profile-preferences-field"><span>偏好说明</span><textarea rows="13" maxlength="4000" data-profile-entry-field="notes" placeholder="例如：寻找周末或晚班兼职；偏好咖啡店、零售或活动岗位；单程通勤不超过 35 分钟；希望每周工作 15–20 小时。">'
+    + escapeHtml(profile.jobPreferences?.notes || "") + '</textarea><small>可填写岗位、排班、通勤、行业、时薪，以及明确不考虑的条件。</small></label>';
+}
+
 function visaMarkup(profile) {
   const visa = profile.visa || {};
   const fields = [
@@ -1745,6 +1807,7 @@ function customSectionMarkup(section) {
 
 function profileSectionEditor(profile) {
   if (state.profileSection === "basicInfo") return basicInfoMarkup(profile);
+  if (state.profileSection === "jobPreferences") return jobPreferencesMarkup(profile);
   if (state.profileSection === "visa") return visaMarkup(profile);
   if (state.profileSection === "skills") return skillsMarkup(profile);
   if (state.profileSection === "customSections") {
@@ -1771,30 +1834,35 @@ function renderProfile() {
     : "本地规则模式；配置 AI 后可获得语义画像与 JD 审阅。";
   el("#profile-versions").innerHTML = state.data.profiles.map((record) =>
     '<button class="profile-version ' + (record.id === state.profileId ? "is-selected" : "") + '" data-profile="' + record.id + '"><span>'
-    + escapeHtml(profileLabel(record)) + "</span><small>" + (record.id === active?.id ? "默认" : record.status === "approved" ? "已确认" : "草稿") + "</small></button>").join("")
+    + escapeHtml(profileLabel(record)) + "</span><small>" + profileLifecycleLabel(record, active?.id) + "</small></button>").join("")
     || '<span class="muted">暂无版本</span>';
   if (!selected) {
     el("#profile-fields").innerHTML = '<div class="profile-empty"><i data-lucide="contact-round"></i><p>尚未生成画像草稿。</p><button class="button button-primary" type="button" data-profile-pane="upload"><i data-lucide="file-up"></i><span>上传简历</span></button></div>';
     return;
   }
   const p = selected.profile;
+  const layout = profileLayoutFor(p);
+  p.profileLayout = layout;
+  p.jobPreferences ||= { notes: "" };
+  const includedSections = new Set(layout.includedSections);
   const activeButton = selected.id === active?.id
     ? '<button class="button button-quiet" disabled><i data-lucide="circle-check"></i><span>默认画像</span></button>'
     : '<button class="button button-primary" data-activate="' + selected.id + '"><i data-lucide="circle-check"></i><span>设为默认</span></button>';
   const deleteButton = state.data.profiles.length > 1
     ? '<button class="button button-danger" data-delete-profile="' + selected.id + '"><i data-lucide="trash-2"></i><span>删除画像</span></button>'
     : "";
-  const sectionExists = structuredProfileSections.some((item) => item.key === state.profileSection) || state.profileSection === "customSections";
-  if (!sectionExists) state.profileSection = "basicInfo";
-  const sectionTabs = structuredProfileSections.map((definition) => '<button type="button" class="profile-section-tab ' + (state.profileSection === definition.key ? "is-active" : "")
+  const sectionExists = includedSections.has(state.profileSection);
+  if (!sectionExists) state.profileSection = "jobPreferences";
+  const sectionTabs = structuredProfileSections.filter((definition) => includedSections.has(definition.key)).map((definition) => '<button type="button" class="profile-section-tab ' + (state.profileSection === definition.key ? "is-active" : "")
     + '" data-profile-section="' + definition.key + '"><i data-lucide="' + definition.icon + '"></i><span>' + definition.label + '</span><small>' + profileEntryCount(p, definition.key) + "</small></button>").join("")
-    + '<button type="button" class="profile-section-tab ' + (state.profileSection === "customSections" ? "is-active" : "")
-    + '" data-profile-section="customSections"><i data-lucide="folder-cog"></i><span>自定义板块</span><small>' + (p.customSections || []).length + "</small></button>";
+    + (includedSections.has("customSections") ? '<button type="button" class="profile-section-tab ' + (state.profileSection === "customSections" ? "is-active" : "")
+      + '" data-profile-section="customSections"><i data-lucide="folder-cog"></i><span>自定义板块</span><small>' + (p.customSections || []).length + "</small></button>" : "");
   const activeDefinition = structuredProfileSections.find((item) => item.key === state.profileSection);
   const editorTitle = activeDefinition?.label || "自定义板块";
   el("#profile-fields").innerHTML = '<section class="profile-record-header"><div class="profile-badges">' + badge("v" + selected.version, "version-badge")
-    + badge(selected.status, selected.id === active?.id ? "active-badge" : "status-badge")
-    + badge(profileEngineLabel(selected.engine), "status-badge") + '</div><label class="field profile-name-field"><span>画像名称</span><input id="profile-record-name" maxlength="80" value="' + escapeHtml(profileLabel(selected)) + '"></label><p>每个画像拥有独立的评分偏好和排除词；空白板块不会影响保存。</p></section><div class="profile-record-workspace"><nav class="profile-section-nav" aria-label="画像板块">'
+    + badge(profileLifecycleLabel(selected, active?.id), selected.id === active?.id ? "active-badge" : "status-badge")
+    + badge(profileEngineLabel(selected.engine), "status-badge") + '</div><label class="field profile-name-field"><span>画像名称</span><input id="profile-record-name" maxlength="80" value="' + escapeHtml(profileLabel(selected)) + '"></label><p>评分偏好、排除词与画像绑定。</p></section>'
+    + profileLayoutMarkup(p) + '<div class="profile-record-workspace"><nav class="profile-section-nav" aria-label="画像板块">'
     + sectionTabs + '</nav><section class="profile-section-editor"><div class="profile-section-heading"><div><p>当前板块</p><h3>' + editorTitle + '</h3></div></div>'
     + profileSectionEditor(p) + '</section></div><div class="editor-actions"><button class="button button-secondary" data-save-profile="' + selected.id
     + '"><i data-lucide="save"></i><span>保存画像</span></button>' + activeButton + deleteButton + "</div>";
@@ -1839,21 +1907,6 @@ function renderSettings() {
     + '<div><strong>' + Number(history.migratedWorkerRecords || 0).toLocaleString() + '</strong><span>旧 Worker 已迁移</span></div>'
     + '<p><i data-lucide="shield-check"></i>同平台按 ID / 规范链接精确判重；跨平台仅在公司、完整职位名和地点同时一致时跳过。</p>';
   renderPreferenceLearningSettings();
-  const profileLearning = contextForProfile(settingsProfile?.id);
-  const activeExclusions = profileLearning.exclusionKeywords || [];
-  const pendingSuggestions = (profileLearning.exclusionSuggestions || []).filter((suggestion) => suggestion.status === "pending"
-    && !exclusionKeywordCovered(suggestion.keyword, activeExclusions));
-  el("#active-exclusion-count").textContent = activeExclusions.length + " 项";
-  el("#active-exclusion-keywords").innerHTML = activeExclusions.map((keyword) => '<span class="exclusion-chip"><span>' + escapeHtml(keyword)
-    + '</span><button class="icon-button" type="button" data-remove-active-exclusion="' + encodeURIComponent(keyword) + '" title="停止使用这个排除词"><i data-lucide="x"></i></button></span>').join("")
-    || '<p class="exclusion-empty">当前没有生效的排除关键词。</p>';
-  el("#pending-exclusion-count").textContent = pendingSuggestions.length + " 项";
-  el("#exclusion-suggestions").innerHTML = pendingSuggestions.map((suggestion) => '<article class="exclusion-suggestion">'
-    + '<div><strong>' + escapeHtml(suggestion.keyword) + '</strong><p>' + escapeHtml(suggestion.reason || "AI 根据明确不匹配的完整 JD 提出此建议。") + '</p>'
-    + (suggestion.sourceTitles?.length ? '<small>来源：' + escapeHtml(suggestion.sourceTitles.slice(0, 3).join("；")) + '</small>' : '') + '</div>'
-    + '<div><button class="button button-secondary" type="button" data-approve-exclusion-suggestion="' + suggestion.id + '"><i data-lucide="check"></i><span>批准</span></button>'
-    + '<button class="icon-button" type="button" data-dismiss-exclusion-suggestion="' + suggestion.id + '" title="忽略此建议"><i data-lucide="x"></i></button></div></article>').join("")
-    || '<p class="exclusion-empty">暂无待审核建议。AI 不会自行启用排除词。</p>';
   if (!state.aiConfigDirty) {
     const ai = state.data.ai;
     el("#ai-base-url").value = ai.baseUrl || "";
@@ -1869,6 +1922,28 @@ function renderSettings() {
     : "尚未配置完整的 Base URL 与模型";
   status.classList.toggle("is-configured", ai.configured);
   el("#clear-ai-key").disabled = !ai.hasApiKey;
+}
+
+function renderExclusions() {
+  const profile = selectedExclusionsProfile();
+  if (profile && state.exclusionsProfileId !== profile.id) state.exclusionsProfileId = profile.id;
+  el("#exclusions-profile-select").innerHTML = profileSelectOptions(profile?.id);
+  el("#exclusion-profile-name").textContent = profile ? profileLabel(profile) : "尚无画像";
+  const profileLearning = contextForProfile(profile?.id);
+  const activeExclusions = profileLearning.exclusionKeywords || [];
+  const pendingSuggestions = (profileLearning.exclusionSuggestions || []).filter((suggestion) => suggestion.status === "pending"
+    && !exclusionKeywordCovered(suggestion.keyword, activeExclusions));
+  el("#active-exclusion-count").textContent = activeExclusions.length + " 项";
+  el("#active-exclusion-keywords").innerHTML = activeExclusions.map((keyword) => '<span class="exclusion-chip"><span>' + escapeHtml(keyword)
+    + '</span><button class="icon-button" type="button" data-remove-active-exclusion="' + encodeURIComponent(keyword) + '" title="停止使用这个排除词"><i data-lucide="x"></i></button></span>').join("")
+    || '<p class="exclusion-empty">当前没有生效的排除关键词。</p>';
+  el("#pending-exclusion-count").textContent = pendingSuggestions.length + " 项";
+  el("#exclusion-suggestions").innerHTML = pendingSuggestions.map((suggestion) => '<article class="exclusion-suggestion">'
+    + '<div><strong>' + escapeHtml(suggestion.keyword) + '</strong><p>' + escapeHtml(suggestion.reason || "AI 根据明确不匹配的完整 JD 提出此建议。") + '</p>'
+    + (suggestion.sourceTitles?.length ? '<small>来源：' + escapeHtml(suggestion.sourceTitles.slice(0, 3).join("；")) + '</small>' : '') + '</div>'
+    + '<div><button class="button button-secondary" type="button" data-approve-exclusion-suggestion="' + suggestion.id + '"><i data-lucide="check"></i><span>批准</span></button>'
+    + '<button class="icon-button" type="button" data-dismiss-exclusion-suggestion="' + suggestion.id + '" title="忽略此建议"><i data-lucide="x"></i></button></div></article>').join("")
+    || '<p class="exclusion-empty">暂无待审核建议。AI 不会自行启用排除词。</p>';
 }
 
 function renderPreferenceLearningSettings() {
@@ -1896,7 +1971,7 @@ async function addExclusionKeyword() {
   const keyword = input.value.trim();
   if (!keyword) return toast("请输入排除关键词。", "error");
   try {
-    await api("/api/settings/exclusion-keywords", { method: "POST", body: JSON.stringify({ keyword, profileId: selectedSettingsProfile()?.id }) });
+    await api("/api/settings/exclusion-keywords", { method: "POST", body: JSON.stringify({ keyword, profileId: selectedExclusionsProfile()?.id }) });
     input.value = "";
     await reload();
     toast("排除词已启用；启动任务前仍会再次要求确认。", "success");
@@ -1907,7 +1982,7 @@ async function addExclusionKeyword() {
 
 async function approveExclusionSuggestion(id) {
   try {
-    await api("/api/exclusion-suggestions/" + id, { method: "POST", body: JSON.stringify({ profileId: selectedSettingsProfile()?.id }) });
+    await api("/api/exclusion-suggestions/" + id, { method: "POST", body: JSON.stringify({ profileId: selectedExclusionsProfile()?.id }) });
     await reload();
     toast("建议已批准并加入生效排除词。", "success");
   } catch (error) {
@@ -1917,7 +1992,7 @@ async function approveExclusionSuggestion(id) {
 
 async function dismissExclusionSuggestion(id) {
   try {
-    await api("/api/exclusion-suggestions/" + id + "?profileId=" + encodeURIComponent(selectedSettingsProfile()?.id || ""), { method: "DELETE" });
+    await api("/api/exclusion-suggestions/" + id + "?profileId=" + encodeURIComponent(selectedExclusionsProfile()?.id || ""), { method: "DELETE" });
     await reload();
     toast("已忽略这条排除建议。");
   } catch (error) {
@@ -1927,7 +2002,7 @@ async function dismissExclusionSuggestion(id) {
 
 async function removeActiveExclusion(encodedKeyword) {
   try {
-    await api("/api/settings/exclusion-keywords/" + encodedKeyword + "?profileId=" + encodeURIComponent(selectedSettingsProfile()?.id || ""), { method: "DELETE" });
+    await api("/api/settings/exclusion-keywords/" + encodedKeyword + "?profileId=" + encodeURIComponent(selectedExclusionsProfile()?.id || ""), { method: "DELETE" });
     await reload();
     toast("这个排除词已停止生效。", "success");
   } catch (error) {
@@ -2103,6 +2178,7 @@ function render() {
   renderJobs();
   renderRoutine();
   renderProfile();
+  renderExclusions();
   renderSettings();
   renderSetup();
   renderImportOptions();
@@ -2115,6 +2191,7 @@ async function reload() {
   if (!state.profileId && state.data.profiles.length) state.profileId = state.data.activeProfile?.id || state.data.profiles[0].id;
   if (!state.data.profiles.some((profile) => profile.id === state.profileId)) state.profileId = state.data.activeProfile?.id || state.data.profiles[0]?.id || null;
   if (!state.data.profiles.some((profile) => profile.id === state.settingsProfileId)) state.settingsProfileId = state.data.activeProfile?.id || state.data.profiles[0]?.id || null;
+  if (!state.data.profiles.some((profile) => profile.id === state.exclusionsProfileId)) state.exclusionsProfileId = state.data.activeProfile?.id || state.data.profiles[0]?.id || null;
   el("#api-status").textContent = "本地服务已连接";
   el("#api-status-dot").classList.add("is-online");
   render();
@@ -2614,10 +2691,23 @@ function profileForm() {
   const selected = selectedProfile();
   const profile = JSON.parse(JSON.stringify(selected?.profile || { schemaVersion: 2 }));
   profile.schemaVersion = 2;
+  const currentLayout = profileLayoutFor(profile);
+  const presetInput = el("#profile-layout-preset");
+  const includedInputs = [...document.querySelectorAll("#profile-fields [data-profile-layout-section]:checked")];
+  profile.profileLayout = presetInput ? {
+    preset: presetInput.value,
+    purpose: presetInput.value === "part-time" ? "part-time" : presetInput.value === "career" ? "career" : currentLayout.purpose,
+    includedSections: [...new Set([...requiredProfileSections, ...includedInputs.map((input) => input.dataset.profileLayoutSection)])]
+  } : currentLayout;
   if (state.profileSection === "basicInfo") {
     profile.basicInfo ||= {};
     document.querySelectorAll("#profile-fields [data-profile-entry-field]").forEach((input) => {
       profile.basicInfo[input.dataset.profileEntryField] = input.value.trim();
+    });
+  } else if (state.profileSection === "jobPreferences") {
+    profile.jobPreferences ||= {};
+    document.querySelectorAll("#profile-fields [data-profile-entry-field]").forEach((input) => {
+      profile.jobPreferences[input.dataset.profileEntryField] = input.value.trim();
     });
   } else if (state.profileSection === "visa") {
     profile.visa ||= {};
@@ -2638,6 +2728,33 @@ function profileForm() {
     profile[state.profileSection] = [...document.querySelectorAll("#profile-fields [data-profile-record]")].map(profileRecordFromNode);
   }
   return profile;
+}
+
+function setProfileLayoutPreset(preset) {
+  const profile = commitProfileEditor();
+  if (!profile) return;
+  const nextPreset = ["career", "part-time"].includes(preset) ? preset : "custom";
+  profile.profileLayout = {
+    preset: nextPreset,
+    purpose: nextPreset === "part-time" ? "part-time" : nextPreset === "career" ? "career" : profileLayoutFor(profile).purpose,
+    includedSections: [...(profileLayoutPresets[nextPreset] || profileLayoutFor(profile).includedSections)]
+  };
+  if (!profile.profileLayout.includedSections.includes(state.profileSection)) state.profileSection = "jobPreferences";
+  renderProfile();
+  refreshIcons();
+}
+
+function setProfileLayoutSection(section, enabled) {
+  if (requiredProfileSections.has(section)) return;
+  const profile = commitProfileEditor();
+  if (!profile) return;
+  const included = new Set(profileLayoutFor(profile).includedSections);
+  if (enabled) included.add(section);
+  else included.delete(section);
+  profile.profileLayout = { preset: "custom", purpose: profileLayoutFor(profile).purpose, includedSections: [...included] };
+  if (!included.has(state.profileSection)) state.profileSection = "jobPreferences";
+  renderProfile();
+  refreshIcons();
 }
 
 function commitProfileEditor() {
@@ -3836,8 +3953,8 @@ async function completeRunReview() {
       render();
     }
     toast(result.reflection.engine === "ai"
-      ? "AI 已完成本次审阅复盘；学习偏好和候选排除词已更新至搜索设置。"
-      : "本地复盘已完成；学习偏好和候选排除词已更新至搜索设置。");
+      ? "AI 已完成本次审阅复盘；学习偏好和候选排除词已更新。"
+      : "本地复盘已完成；学习偏好和候选排除词已更新。");
   } catch (error) {
     label.textContent = original;
     button.disabled = false;
@@ -3974,7 +4091,7 @@ async function rereviewJob(id, button) {
 function renderCoverLetterRecord(record) {
   state.coverLetterCurrent = record || null;
   el("#cover-letter-result").hidden = !record;
-  el("#cover-letter-version").textContent = record ? `版本 ${record.version} · ${profileLabel(state.data.profiles.find((item) => item.id === record.profileId))}` : "";
+  el("#cover-letter-version").textContent = record ? `版本 ${record.version} · ${record.profileName || profileLabel(state.data.profiles.find((item) => item.id === record.profileId))}` : "";
   el("#cover-letter-overview").textContent = record?.overview || "";
   el("#cover-letter-subject").value = record?.subject || "";
   el("#cover-letter-salutation").value = record?.salutation || "";
@@ -4003,10 +4120,21 @@ async function openCoverLetter(jobId) {
   state.coverLetterJobId = jobId;
   state.coverLetterCurrent = null;
   const run = runForJob(job);
-  const profileId = job.profileId || run?.profileId || state.data.activeProfile?.id || state.data.profiles[0]?.id;
+  const profileId = run?.profileId || job.profileId || state.data.activeProfile?.id || state.data.profiles[0]?.id;
+  const profileSelect = el("#cover-letter-profile");
   el("#cover-letter-title").textContent = job.title;
   el("#cover-letter-job-meta").textContent = [job.company, job.location, names[job.source]].filter(Boolean).join(" · ");
-  el("#cover-letter-profile").innerHTML = profileSelectOptions(profileId);
+  if (run?.profileSnapshot) {
+    profileSelect.innerHTML = '<option value="' + escapeHtml(profileId) + '">' + escapeHtml(run.profileName || "Archived profile") + " · 任务启动快照</option>";
+    profileSelect.disabled = true;
+    profileSelect.title = "Cover Letter 使用任务启动时选择的画像快照";
+    el("#cover-letter-profile-label").textContent = "画像（任务启动快照）";
+  } else {
+    profileSelect.innerHTML = profileSelectOptions(profileId);
+    profileSelect.disabled = false;
+    profileSelect.title = "";
+    el("#cover-letter-profile-label").textContent = "画像";
+  }
   el("#cover-letter-pages").value = String(state.data.settings.coverLetter?.maxPages ?? 1);
   el("#cover-letter-instructions").value = state.data.settings.coverLetter?.prompt || "";
   renderCoverLetterRecord(null);
@@ -4016,7 +4144,7 @@ async function openCoverLetter(jobId) {
     const result = await api(`/api/jobs/${jobId}/cover-letters`);
     const latest = result.coverLetters?.[0] || null;
     if (latest) {
-      el("#cover-letter-profile").value = latest.profileId;
+      if (!profileSelect.disabled) profileSelect.value = latest.profileId;
       el("#cover-letter-pages").value = String(latest.maxPages || el("#cover-letter-pages").value);
       el("#cover-letter-instructions").value = latest.customInstructions || el("#cover-letter-instructions").value;
       renderCoverLetterRecord(latest);
@@ -4081,7 +4209,10 @@ function exportCoverLetterPdf() {
   const printWindow = window.open("about:blank", "_blank");
   if (!printWindow) return toast("浏览器阻止了导出窗口，请允许本站打开弹窗。", "error");
   const job = state.data.jobs.find((item) => item.id === state.coverLetterJobId);
-  const profile = state.data.profiles.find((item) => item.id === el("#cover-letter-profile").value)?.profile || {};
+  const run = runForJob(job);
+  const profile = run?.profileSnapshot
+    || state.data.profiles.find((item) => item.id === el("#cover-letter-profile").value)?.profile
+    || {};
   const draft = coverLetterDraftFromForm();
   const basic = profile.basicInfo || {};
   const contact = [basic.location, basic.phone, basic.email, basic.linkedinUrl, basic.websiteUrl].filter(Boolean).map(escapeHtml).join(" · ");
@@ -4385,9 +4516,18 @@ document.addEventListener("pointerup", finishProfileChipPointerDrag);
 document.addEventListener("pointercancel", finishProfileChipPointerDrag);
 document.addEventListener("change", (event) => {
   if (event.target.matches("#job-category, #job-source, #job-status, #job-viewed, #job-sort")) renderJobs();
+  if (event.target.matches("#profile-layout-preset")) return setProfileLayoutPreset(event.target.value);
+  if (event.target.matches("[data-profile-layout-section]")) {
+    return setProfileLayoutSection(event.target.dataset.profileLayoutSection, event.target.checked);
+  }
   if (event.target.matches("#settings-profile-select")) {
     state.settingsProfileId = event.target.value;
     renderSettings();
+    refreshIcons();
+  }
+  if (event.target.matches("#exclusions-profile-select")) {
+    state.exclusionsProfileId = event.target.value;
+    renderExclusions();
     refreshIcons();
   }
   if (event.target.matches("#run-profile-select")) {

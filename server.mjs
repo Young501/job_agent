@@ -21,6 +21,7 @@ import {
 import {
   localJdScreen,
   normalizeJob,
+  profileForMatching,
   validateProfileDraft
 } from "./src/screening.mjs";
 import {
@@ -265,7 +266,7 @@ function profileBundleForJob(state, job) {
   return {
     profileId,
     record,
-    profile: cloneData(run?.profileSnapshot || record?.profile || null),
+    profile: cloneData(profileForMatching(run?.profileSnapshot || record?.profile || null)),
     preferenceModel: cloneData(run?.preferenceModelSnapshot || profileContext(state, profileId).preferenceModel || null)
   };
 }
@@ -1061,12 +1062,18 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
   if (runId && !run) throw new Error("Run was not found.");
   if (run) ensureRunCounterShape(run);
   const profileId = run?.profileId || state.activeProfileId || null;
+  const profilePurposeById = new Map(state.profiles.map((record) => [
+    record.id,
+    profileForMatching(record.profile)?.profileLayout?.purpose || "career"
+  ]));
+  const runProfilePurpose = profileForMatching(run?.profileSnapshot)?.profileLayout?.purpose || null;
   const preferenceModel = run?.preferenceModelSnapshot || profileContext(state, profileId).preferenceModel;
   const existingPool = [...(state.legacyWorkerHistory ?? []), ...state.jobs];
   const jobs = [];
   let addedCount = 0;
 
   for (const rawJob of rawJobs) {
+    const candidateProfileId = task ? profileId : rawJob.profileId || profileId;
     const candidate = normalizeJob(task ? {
       ...rawJob,
       runTaskId: task.id,
@@ -1075,8 +1082,13 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
       searchLocation: task.location,
       searchPostedWithinDays: task.postedWithinDays,
       searchJobType: task.jobType || "any",
-      profileId
-    } : { ...rawJob, profileId: rawJob.profileId || profileId }, { thresholds: state.settings.thresholds, runId, preferenceModel });
+      profileId: candidateProfileId
+    } : { ...rawJob, profileId: candidateProfileId }, {
+      thresholds: state.settings.thresholds,
+      runId,
+      preferenceModel,
+      profilePurpose: runProfilePurpose || profilePurposeById.get(candidateProfileId) || "career"
+    });
     const candidateKeys = strongIdentityKeys(candidate);
     const existingInTask = task && candidateKeys.length
       ? state.jobs.find((job) => job.runId === runId && job.runTaskId === task.id
@@ -2001,9 +2013,12 @@ async function handleApi(request, response, url) {
     const job = state.jobs.find((item) => item.id === jobCoverLettersMatch[1]);
     if (!job) throw new Error("Job was not found.");
     if (!hasCompleteDescription(job)) throw new Error("Fetch the complete JD before generating a cover letter.");
-    const requestedProfileId = String(body.profileId || job.profileId || runForJob(state, job)?.profileId || state.activeProfileId || "");
-    const profileRecord = state.profiles.find((item) => item.id === requestedProfileId);
-    if (!profileRecord) throw new Error("Choose a valid career profile for this cover letter.");
+    const run = runForJob(state, job);
+    const requestedProfileId = String(run?.profileId || body.profileId || job.profileId || state.activeProfileId || "");
+    const profileRecord = state.profiles.find((item) => item.id === requestedProfileId) ?? null;
+    const profileSnapshot = run?.profileSnapshot || profileRecord?.profile || null;
+    if (!profileSnapshot) throw new Error("Choose a valid career profile for this cover letter.");
+    const profileName = run?.profileName || profileRecord?.name || "Archived profile";
     const defaults = state.settings.coverLetter ?? {};
     const maxPages = Math.max(1, Math.min(3, Math.round(Number(body.maxPages ?? defaults.maxPages ?? 1) || 1)));
     const customInstructions = String(body.customInstructions ?? defaults.prompt ?? "").trim().slice(0, 2_000);
@@ -2012,7 +2027,7 @@ async function handleApi(request, response, url) {
       : null;
     const generated = await generateCoverLetter({
       job,
-      profile: profileRecord.profile,
+      profile: profileForMatching(profileSnapshot),
       customInstructions,
       maxPages,
       previousDraft: previous,
@@ -2024,8 +2039,10 @@ async function handleApi(request, response, url) {
       const created = {
         id: newId("cover_letter"),
         jobId: job.id,
-        profileId: profileRecord.id,
-        profileName: profileRecord.name,
+        runId: run?.id || null,
+        profileId: requestedProfileId,
+        profileName,
+        profileSource: run?.profileSnapshot ? "run-snapshot" : "current-profile",
         version: Math.max(0, ...versions) + 1,
         maxPages,
         customInstructions,
@@ -2067,7 +2084,7 @@ async function handleApi(request, response, url) {
     const jobs = requestedIds.map((id) => jobsById.get(id)).filter(Boolean);
     if (!jobs.length) throw new Error("The current review view does not contain any jobs for the assistant.");
     const requestedProfileId = String(body.profileId || jobs[0]?.profileId || runForJob(state, jobs[0])?.profileId || state.activeProfileId || "");
-    const profile = state.profiles.find((item) => item.id === requestedProfileId)?.profile ?? null;
+    const profile = profileForMatching(state.profiles.find((item) => item.id === requestedProfileId)?.profile ?? null);
     const result = await answerJobQuestions({
       question,
       conversation: body.conversation,
@@ -3294,7 +3311,7 @@ async function handleApi(request, response, url) {
       const rejectedJobSignals = activeRejected.map(rejectedSignalForAi);
       const legacyNotHelpfulFeedback = activeLegacy.map(feedbackForAi);
       const implicitInterestSignals = activeImplicitInterest.map(implicitInterestForAi);
-      const profile = run.profileSnapshot || profileRecord?.profile;
+      const profile = profileForMatching(run.profileSnapshot || profileRecord?.profile);
       const ai = aiStatus();
       const canUseAi = ai.configured && run.counters.ai.calls < ai.budget.maxAiCallsPerRun;
       let generated;

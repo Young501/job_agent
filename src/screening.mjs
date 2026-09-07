@@ -52,6 +52,15 @@ const TECHNOLOGY_TERMS = [
 const normalizeText = (value, fallback = "") =>
   String(value ?? fallback).replace(/\s+/g, " ").trim();
 
+const normalizeMultilineText = (value, limit = 4_000) => String(value ?? "")
+  .replace(/\r\n?/g, "\n")
+  .split("\n")
+  .map((line) => line.trimEnd())
+  .join("\n")
+  .replace(/\n{3,}/g, "\n\n")
+  .trim()
+  .slice(0, limit);
+
 const unique = (items) => [...new Set(items.filter(Boolean))];
 
 export function categoryForScore(score, thresholds) {
@@ -62,9 +71,10 @@ export function categoryForScore(score, thresholds) {
   return "REJECTED";
 }
 
-export function screenTitle(title, { thresholds, preferenceModel = null }) {
+export function screenTitle(title, { thresholds, preferenceModel = null, profilePurpose = "career" }) {
   const cleanTitle = normalizeText(title);
-  const reject = DIRECT_REJECTS.find(([, expression]) => expression.test(cleanTitle));
+  const useCareerRules = profilePurpose !== "part-time";
+  const reject = useCareerRules ? DIRECT_REJECTS.find(([, expression]) => expression.test(cleanTitle)) : null;
   if (reject) {
     return {
       titleClassification: "CLEAR_REJECT",
@@ -79,7 +89,7 @@ export function screenTitle(title, { thresholds, preferenceModel = null }) {
     };
   }
 
-  const matchedAreas = DIRECT_MATCHES
+  const matchedAreas = (useCareerRules ? DIRECT_MATCHES : [])
     .filter(([, expression]) => expression.test(cleanTitle))
     .map(([area]) => area);
   const learnedAvoid = matchingPreferenceSignal(cleanTitle, preferenceModel, "avoid");
@@ -110,8 +120,8 @@ export function screenTitle(title, { thresholds, preferenceModel = null }) {
     };
   }
 
-  const earlyCareer = /\b(graduate|intern|junior|entry[- ]?level|cadet|associate)\b/i.test(cleanTitle);
-  const score = Math.max(0, Math.min(100, (earlyCareer ? 58 : 45) + (learnedTarget ? 18 : 0)
+  const earlyCareer = useCareerRules && /\b(graduate|intern|junior|entry[- ]?level|cadet|associate)\b/i.test(cleanTitle);
+  const score = Math.max(0, Math.min(100, (useCareerRules ? (earlyCareer ? 58 : 45) : 55) + (learnedTarget ? 18 : 0)
     - (learnedAvoid ? 40 : 0) - (learnedDeprioritize ? 12 : 0)));
   return {
     titleClassification: "AMBIGUOUS",
@@ -125,10 +135,10 @@ export function screenTitle(title, { thresholds, preferenceModel = null }) {
           ? `职位标题命中已学习的偏好“${learnedTarget}”，需要读取 JD 确认具体匹配度。`
           : earlyCareer
             ? "初级职位标题范围较宽，需要读取 JD 后再判断。"
-            : "职位标题无法确认是否属于目标技术方向，需要读取 JD。",
+            : useCareerRules ? "职位标题无法确认是否属于目标技术方向，需要读取 JD。" : "职位标题需要结合兼职画像与 JD 进一步判断。",
     matchedAreas: [],
     concerns: [
-      "职位标题没有明确说明岗位方向",
+      useCareerRules ? "职位标题没有明确说明岗位方向" : "需要结合兼职偏好确认具体岗位条件",
       ...(learnedAvoid ? [`已确认不相关的职业类别：${learnedAvoid}`] : []),
       ...(learnedDeprioritize ? [`用户偏好中降低优先级：${learnedDeprioritize}`] : [])
     ],
@@ -139,8 +149,9 @@ export function screenTitle(title, { thresholds, preferenceModel = null }) {
   };
 }
 
-function applyPreviewScreen(screening, preview) {
+function applyPreviewScreen(screening, preview, profilePurpose = "career") {
   const text = normalizeText(preview);
+  if (profilePurpose === "part-time") return screening;
   if (!text || screening.titleClassification !== "AMBIGUOUS" || screening.screeningStatus !== "NEEDS_JD_REVIEW") return screening;
   const unrelated = PREVIEW_REJECTS.some((expression) => expression.test(text));
   if (!unrelated || PREVIEW_TECH.test(text)) return screening;
@@ -156,7 +167,7 @@ function applyPreviewScreen(screening, preview) {
   };
 }
 
-export function normalizeJob(input, { thresholds, runId = null, duplicateOf = null, preferenceModel = null } = {}) {
+export function normalizeJob(input, { thresholds, runId = null, duplicateOf = null, preferenceModel = null, profilePurpose = "career" } = {}) {
   const source = ["linkedin", "indeed", "seek", "manual"].includes(String(input.source).toLowerCase())
     ? String(input.source).toLowerCase()
     : "manual";
@@ -191,7 +202,7 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
     routineTaskId: normalizeText(input.routineTaskId) || null,
     runId,
     duplicateOf,
-    screening: applyPreviewScreen(screenTitle(title, { thresholds, preferenceModel }), input.description),
+    screening: applyPreviewScreen(screenTitle(title, { thresholds, preferenceModel, profilePurpose }), input.description, profilePurpose),
     feedback: null,
     viewedAt: null,
     reviewedAt: null,
@@ -236,6 +247,37 @@ export function localProfileDraft(resumeText, sourceName = "resume") {
 
 const stringArray = (value, limit = 30) =>
   unique((Array.isArray(value) ? value : []).map((item) => normalizeText(item)).filter(Boolean)).slice(0, limit);
+
+export const PROFILE_SECTION_KEYS = [
+  "basicInfo",
+  "jobPreferences",
+  "visa",
+  "workExperience",
+  "projectExperience",
+  "education",
+  "extracurricular",
+  "certifications",
+  "languages",
+  "skills",
+  "honors",
+  "customSections"
+];
+
+const REQUIRED_PROFILE_SECTION_KEYS = ["basicInfo", "jobPreferences", "visa"];
+const PROFILE_LAYOUT_PRESETS = {
+  career: PROFILE_SECTION_KEYS,
+  "part-time": ["basicInfo", "jobPreferences", "visa", "workExperience", "languages", "skills", "customSections"]
+};
+
+function profileLayout(source) {
+  const raw = source?.profileLayout && typeof source.profileLayout === "object" ? source.profileLayout : {};
+  const preset = ["career", "part-time", "custom"].includes(raw.preset) ? raw.preset : "career";
+  const purpose = ["career", "part-time"].includes(raw.purpose) ? raw.purpose : preset === "part-time" ? "part-time" : "career";
+  const supplied = Array.isArray(raw.includedSections) ? raw.includedSections : PROFILE_LAYOUT_PRESETS[preset] || PROFILE_LAYOUT_PRESETS.career;
+  const includedSections = unique([...REQUIRED_PROFILE_SECTION_KEYS, ...supplied])
+    .filter((key) => PROFILE_SECTION_KEYS.includes(key));
+  return { preset, purpose, includedSections };
+}
 
 const PROFILE_SUGGESTION_SECTIONS = new Set([
   "targetRoles",
@@ -409,13 +451,15 @@ function migrateLegacyProfile(input) {
 
 export function validateProfileDraft(input) {
   if (!input || typeof input !== "object") throw new Error("Profile draft must be an object.");
-  const source = Number(input.schemaVersion) >= 2 || input.basicInfo || input.workExperience || input.projectExperience || input.customSections
+  const source = Number(input.schemaVersion) >= 2 || input.basicInfo || input.jobPreferences || input.profileLayout || input.workExperience || input.projectExperience || input.customSections
     ? input
     : migrateLegacyProfile(input);
   const basic = source.basicInfo && typeof source.basicInfo === "object" ? source.basicInfo : {};
+  const preferences = source.jobPreferences && typeof source.jobPreferences === "object" ? source.jobPreferences : {};
   const visa = source.visa && typeof source.visa === "object" ? source.visa : {};
   return {
     schemaVersion: 2,
+    profileLayout: profileLayout(source),
     basicInfo: {
       name: textField(basic, "name"),
       location: textField(basic, "location", "region"),
@@ -424,6 +468,9 @@ export function validateProfileDraft(input) {
       linkedinUrl: textField(basic, "linkedinUrl", "linkedin"),
       githubUrl: textField(basic, "githubUrl", "github"),
       websiteUrl: textField(basic, "websiteUrl", "website", "personalWebsite", "portfolioUrl")
+    },
+    jobPreferences: {
+      notes: normalizeMultilineText(preferences.notes ?? preferences.description ?? preferences.text)
     },
     visa: {
       visaType: textField(visa, "visaType", "type") || textField(basic, "visaType", "workRights"),
@@ -476,11 +523,30 @@ export function validateProfileDraft(input) {
   };
 }
 
+export function profileForMatching(input) {
+  if (!input || typeof input !== "object") return null;
+  const profile = validateProfileDraft(input);
+  const included = new Set(profile.profileLayout.includedSections);
+  const result = {
+    schemaVersion: profile.schemaVersion,
+    profileLayout: profile.profileLayout,
+    basicInfo: profile.basicInfo,
+    jobPreferences: profile.jobPreferences,
+    visa: profile.visa
+  };
+  for (const key of PROFILE_SECTION_KEYS) {
+    if (REQUIRED_PROFILE_SECTION_KEYS.includes(key) || !included.has(key)) continue;
+    result[key] = profile[key];
+  }
+  return result;
+}
+
 export function localJdScreen(job, profile, thresholds, preferenceModel = null) {
   const description = normalizeText(job.description);
   if (!description) throw new Error("A job description is required for JD review.");
-  const lower = ` ${description.toLowerCase()} `;
-  const jdAreas = Object.entries(AREA_TERMS)
+  const partTimeProfile = profile?.profileLayout?.purpose === "part-time";
+  const lower = ` ${normalizeText(`${job.title || ""} ${description}`).toLowerCase()} `;
+  const jdAreas = (partTimeProfile ? [] : Object.entries(AREA_TERMS))
     .filter(([, terms]) => terms.some((term) => lower.includes(term)))
     .map(([area]) => area);
   const profileText = normalizeText(JSON.stringify(profile || {})).toLowerCase();
@@ -489,9 +555,12 @@ export function localJdScreen(job, profile, thresholds, preferenceModel = null) 
     .map(([area]) => area);
   const matchedAreas = jdAreas.filter((area) => profileAreas.includes(area));
   const profileSkills = (profile?.skills ?? []).filter((skill) => lower.includes(skill.toLowerCase()));
+  const preferenceTerms = unique(String(profile?.jobPreferences?.notes || "").toLowerCase().match(/[a-z][a-z-]{3,}/g) || [])
+    .filter((term) => !["with", "from", "work", "working", "hours", "looking", "prefer"].includes(term));
+  const matchedPreferences = partTimeProfile ? preferenceTerms.filter((term) => lower.includes(term)).slice(0, 6) : [];
   const concerns = [];
   if (/\b([5-9]|10)\+? years?\b|\bextensive leadership\b/i.test(description)) concerns.push("经验年限要求可能超过初级职位范围");
-  if (/\b(nursing|teaching|civil engineering|accounting|construction)\b/i.test(description)) concerns.push("JD 可能属于非目标技术领域");
+  if (!partTimeProfile && /\b(nursing|teaching|civil engineering|accounting|construction)\b/i.test(description)) concerns.push("JD 可能属于非目标技术领域");
   const learnedAvoid = matchingPreferenceSignal(job.title, preferenceModel, "avoid");
   const learnedDeprioritize = matchingPreferenceSignal(job.title, preferenceModel, "deprioritize");
   const learnedTarget = matchingPreferenceSignal(job.title, preferenceModel, "target");
@@ -499,9 +568,10 @@ export function localJdScreen(job, profile, thresholds, preferenceModel = null) 
   if (learnedAvoid) concerns.push(`已确认不相关的职业类别：${learnedAvoid}`);
   if (learnedDeprioritize) concerns.push(`用户偏好中降低优先级：${learnedDeprioritize}`);
 
-  let score = 50 + Math.min(30, matchedAreas.length * 10) + Math.min(20, profileSkills.length * 5) - concerns.length * 12
+  let score = (partTimeProfile ? 55 : 50) + Math.min(30, matchedAreas.length * 10)
+    + Math.min(20, profileSkills.length * 5) + Math.min(20, matchedPreferences.length * 4) - concerns.length * 12
     + (learnedTarget ? 10 : 0) - (learnedAvoid ? 20 : 0) - (learnedDeprioritize ? 8 : 0);
-  if (!matchedAreas.length) score -= 20;
+  if (!partTimeProfile && !matchedAreas.length) score -= 20;
   score = Math.max(0, Math.min(100, score));
   const category = categoryForScore(score, thresholds);
 
@@ -509,10 +579,14 @@ export function localJdScreen(job, profile, thresholds, preferenceModel = null) 
     titleClassification: job.screening?.titleClassification ?? "AMBIGUOUS",
     score,
     category,
-    reason: matchedAreas.length
+    reason: partTimeProfile
+      ? matchedPreferences.length
+        ? `JD 命中兼职画像中的偏好词 ${matchedPreferences.slice(0, 3).join("、")}，仍建议结合完整要求人工确认。`
+        : "本地规则未发现足够的兼职偏好证据，保留职位供人工确认。"
+      : matchedAreas.length
       ? `JD 与${matchedAreas.join("、")}方向匹配${profileSkills.length ? `，并提到技能 ${profileSkills.slice(0, 3).join("、")}` : ""}。`
       : "JD 中没有足够的目标技术方向证据，暂不判定为更高匹配。",
-    matchedAreas: unique([...matchedAreas, ...profileSkills]),
+    matchedAreas: unique([...matchedAreas, ...profileSkills, ...matchedPreferences]),
     concerns,
     jdReviewed: true,
     screeningStatus: "JD_SCREENED",

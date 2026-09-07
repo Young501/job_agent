@@ -12,6 +12,7 @@ const aiPort = await availablePort();
 let serverOutput = "";
 let transientReviewFailures = 0;
 let manualReviewFailures = 0;
+const coverLetterInputs = [];
 const aiServer = createHttpServer(async (request, response) => {
   let body = "";
   for await (const chunk of request) body += chunk;
@@ -31,6 +32,7 @@ const aiServer = createHttpServer(async (request, response) => {
   const isReflection = /Consolidate a candidate's job-screening preferences/i.test(payload.instructions || "");
   const isJobAssistant = /Answer questions about the supplied job-review context/i.test(payload.instructions || "");
   const isCoverLetter = /Write or revise a professional cover letter/i.test(payload.instructions || "");
+  if (isCoverLetter) coverLetterInputs.push(JSON.parse(payload.input || "{}"));
   const reflectionInput = isReflection ? JSON.parse(payload.input || "{}") : null;
   const assistantInput = isJobAssistant ? JSON.parse(payload.input || "{}") : null;
   const hasConfirmedRejection = reflectionInput?.rejectedJobSignals?.some((item) => item.humanConfirmed
@@ -496,6 +498,9 @@ try {
   const dashboardHtml = await dashboardResponse.text();
   assert.equal(dashboardResponse.ok, true);
   assert.match(dashboardHtml, /id="view-setup"/);
+  assert.match(dashboardHtml, /id="view-exclusions"/);
+  assert.match(dashboardHtml, /data-view="exclusions"/);
+  assert.match(dashboardHtml, /id="exclusions-profile-select"/);
   assert.match(dashboardHtml, /安装设置/);
   assert.match(dashboardHtml, /id="migrate-worker-history"/);
   assert.match(dashboardHtml, /id="profile-upload-pane"/);
@@ -573,6 +578,10 @@ try {
   assert.match(dashboardHtml, /id="unified-history-summary"/);
   const dashboardScriptResponse = await fetch("http://127.0.0.1:" + port + "/app.js");
   const dashboardScript = await dashboardScriptResponse.text();
+  assert.match(dashboardScript, /jobPreferences/);
+  assert.match(dashboardScript, /profile-layout-preset/);
+  assert.match(dashboardScript, /兼职求职 · 精简/);
+  assert.match(dashboardScript, /function profileLifecycleLabel/);
   assert.match(dashboardScript, /data-install-worker/);
   assert.match(dashboardScript, /data-score-details/);
   assert.match(dashboardScript, /function retryFailedJds/);
@@ -702,6 +711,7 @@ try {
   assert.match(dashboardScript, /function requestRunConfirmation/);
   assert.match(dashboardScript, /settings\/exclusion-keywords/);
   assert.match(dashboardScript, /exclusion-suggestions/);
+  assert.match(dashboardScript, /selectedExclusionsProfile/);
 
   const normalizedKeywordValidation = await request("/api/task-validations", {
     platform: "linkedin",
@@ -795,6 +805,23 @@ try {
   assert.equal(blankProfile.profile.engine, "manual");
   assert.equal(blankProfile.profile.profile.basicInfo.name, "");
   assert.deepEqual(blankProfile.profile.profile.skills, []);
+  assert.equal(blankProfile.profile.profile.profileLayout.preset, "career");
+  assert.equal(blankProfile.profile.profile.jobPreferences.notes, "");
+  const partTimeProfile = await request("/api/profiles/" + blankProfile.profile.id, {
+    name: "Weekend cafe work",
+    profile: {
+      ...blankProfile.profile.profile,
+      profileLayout: {
+        preset: "part-time",
+        purpose: "part-time",
+        includedSections: ["basicInfo", "jobPreferences", "visa", "workExperience", "languages", "skills", "customSections"]
+      },
+      jobPreferences: { notes: "Weekend cafe shifts near home." }
+    }
+  }, "PUT");
+  assert.equal(partTimeProfile.profile.profile.profileLayout.purpose, "part-time");
+  assert.equal(partTimeProfile.profile.profile.jobPreferences.notes, "Weekend cafe shifts near home.");
+  assert.ok(partTimeProfile.profile.updatedAt);
   const copiedProfile = await request("/api/profiles", {
     name: "Software profile copy",
     copyFromProfileId: replacement.profile.id,
@@ -1286,12 +1313,23 @@ try {
   assert.equal(reviewedJob.screening.engine, "ai");
   assert.equal(reviewedJob.screening.score, 88);
 
+  const runProfileName = run.run.profileSnapshot.basicInfo.name;
+  await request("/api/profiles/" + casualProfile.profile.id, {
+    name: casualProfile.profile.name,
+    profile: {
+      ...casualProfile.profile.profile,
+      basicInfo: { ...casualProfile.profile.profile.basicInfo, name: "Edited after run" }
+    }
+  }, "PUT");
   const generatedCoverLetter = await request("/api/jobs/" + reviewedJob.id + "/cover-letters", {
-    profileId: run.run.profileId,
+    profileId: "profile_must_not_override_run_snapshot",
     maxPages: 2,
     customInstructions: "Use a direct, evidence-led tone and Australian English."
   });
   assert.equal(generatedCoverLetter.coverLetter.profileId, run.run.profileId);
+  assert.equal(generatedCoverLetter.coverLetter.profileSource, "run-snapshot");
+  assert.equal(coverLetterInputs.at(-1).candidateProfile.basicInfo.name, runProfileName);
+  assert.notEqual(coverLetterInputs.at(-1).candidateProfile.basicInfo.name, "Edited after run");
   assert.equal(generatedCoverLetter.coverLetter.maxPages, 2);
   assert.equal(generatedCoverLetter.coverLetter.version, 1);
   assert.match(generatedCoverLetter.coverLetter.body, /Python/);

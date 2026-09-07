@@ -151,13 +151,14 @@ test("AI JD review semantically compares visa requirements and honors user reten
       company: "Example",
       location: "Melbourne",
       description: "Applicants must be an Australian citizen, permanent resident, or hold full working rights."
-    }, externalProfile, { strongMatch: 85, goodMatch: 70, maybe: 50, lowMatch: 30 });
+    }, { ...externalProfile, jobPreferences: { notes: "Prefer hybrid roles with flexible hours." } }, { strongMatch: 85, goodMatch: 70, maybe: 50, lowMatch: 30 });
     assert.match(received.instructions, /AND, OR, alternatives/i);
     assert.match(received.instructions, /forceKeepRequirements/i);
     assert.match(received.instructions, /Simplified Chinese/i);
     assert.match(received.instructions, /targetKeywords and preferenceSignals\.exclusionKeywords in English only/i);
     const input = JSON.parse(received.input);
     assert.deepEqual(input.candidateProfile.visa.forceKeepRequirements, ["Australian permanent resident"]);
+    assert.equal(input.candidateProfile.jobPreferences.notes, "Prefer hybrid roles with flexible hours.");
     assert.equal(result.screening.workRights.assessment, "OVERRIDE_KEEP");
     assert.equal(result.screening.category, "GOOD_MATCH");
   } finally {

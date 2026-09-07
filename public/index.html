@@ -23,6 +23,7 @@
           <button class="nav-item" data-view="jobs"><i data-lucide="briefcase-business"></i><span>职位审阅</span></button>
           <button class="nav-item" data-view="routine"><i data-lucide="list-todo"></i><span>每日任务</span></button>
           <button class="nav-item" data-view="profile"><i data-lucide="contact-round"></i><span>职业画像</span></button>
+          <button class="nav-item" data-view="exclusions"><i data-lucide="ban"></i><span>排除关键词</span></button>
           <button class="nav-item" data-view="settings"><i data-lucide="sliders-horizontal"></i><span>搜索设置</span></button>
           <button class="nav-item" data-view="setup"><i data-lucide="wrench"></i><span>安装设置</span></button>
         </nav>
@@ -246,13 +247,37 @@
           </div>
         </section>
 
+        <section class="view" id="view-exclusions">
+          <div class="section-heading">
+            <div>
+              <h2>按画像管理</h2>
+              <p>每个求职方向使用独立的排除规则，不会影响其他画像</p>
+            </div>
+          </div>
+          <div class="exclusion-scope-bar">
+            <div class="exclusion-scope-copy"><i data-lucide="scan-search"></i><div><strong id="exclusion-profile-name">当前画像</strong><span>只有已批准的英文关键词会在该画像运行任务时传给三个平台 Worker。</span></div></div>
+            <label class="compact-select"><span>管理画像</span><select id="exclusions-profile-select" aria-label="排除关键词对应画像"></select></label>
+          </div>
+          <div class="exclusion-settings-panel">
+            <div class="exclusion-setting-block">
+              <div class="exclusion-setting-heading"><div><h4>已启用</h4><p>扫描时会跳过标题、公司、地点或摘要中命中这些词的职位。</p></div><span id="active-exclusion-count">0 项</span></div>
+              <div class="exclusion-chip-list" id="active-exclusion-keywords"></div>
+              <div class="exclusion-add-row"><input id="manual-exclusion-keyword" maxlength="80" placeholder="Add one clear English keyword"><button class="button button-secondary" id="add-exclusion-keyword" type="button"><i data-lucide="plus"></i><span>添加</span></button></div>
+            </div>
+            <div class="exclusion-setting-block">
+              <div class="exclusion-setting-heading"><div><h4>AI 待审核建议</h4><p>根据该画像的完整 JD 审阅结果生成；可批准或忽略。</p></div><span id="pending-exclusion-count">0 项</span></div>
+              <div class="exclusion-suggestion-list" id="exclusion-suggestions"></div>
+            </div>
+          </div>
+        </section>
+
         <section class="view" id="view-settings">
           <div class="section-heading">
             <div>
               <h2>运行与匹配</h2>
               <p>运行方式、AI 服务和匹配阈值</p>
             </div>
-            <div class="topbar-actions"><label class="compact-select"><span>画像</span><select id="settings-profile-select" aria-label="设置对应画像"></select></label><button class="button button-secondary" id="install-workers"><i data-lucide="wrench"></i><span>Worker 安装</span></button><button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button></div>
+            <div class="topbar-actions"><label class="compact-select"><span>学习画像</span><select id="settings-profile-select" aria-label="AI 学习偏好对应画像"></select></label><button class="button button-secondary" id="install-workers"><i data-lucide="wrench"></i><span>Worker 安装</span></button><button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button></div>
           </div>
           <section class="settings-section" id="distance-settings-section">
             <div class="setting-label"><h3>工作距离</h3><p>可选 · 直线距离，不代表通勤路程或时间</p></div>
@@ -305,20 +330,6 @@
           <section class="settings-section preference-learning-settings-section">
             <div class="setting-label"><h3>AI 学习偏好</h3><p>展示最近一次人工审阅复盘形成的匹配偏好；机器信号保持英文。</p></div>
             <div class="preference-learning-panel" id="settings-learning-content"></div>
-          </section>
-          <section class="settings-section exclusion-settings-section">
-            <div class="setting-label"><h3>排除关键词</h3><p>AI 只能提出建议；批准后才会传给三个平台 Worker</p></div>
-            <div class="exclusion-settings-panel">
-              <div class="exclusion-setting-block">
-                <div class="exclusion-setting-heading"><div><h4>已启用</h4><p>扫描时会跳过标题、公司、地点或摘要中命中这些词的职位。</p></div><span id="active-exclusion-count">0 项</span></div>
-                <div class="exclusion-chip-list" id="active-exclusion-keywords"></div>
-                <div class="exclusion-add-row"><input id="manual-exclusion-keyword" maxlength="80" placeholder="手动添加一个明确的排除词"><button class="button button-secondary" id="add-exclusion-keyword" type="button"><i data-lucide="plus"></i><span>添加</span></button></div>
-              </div>
-              <div class="exclusion-setting-block">
-                <div class="exclusion-setting-heading"><div><h4>AI 待审核建议</h4><p>根据完整 JD 中明确不相关的岗位生成；可批准或忽略。</p></div><span id="pending-exclusion-count">0 项</span></div>
-                <div class="exclusion-suggestion-list" id="exclusion-suggestions"></div>
-              </div>
-            </div>
           </section>
           <section class="settings-section">
             <div class="setting-label"><h3>AI 服务</h3><p>密钥仅保存在本机后端，不会回显到页面</p></div>
@@ -513,7 +524,7 @@
         <div class="dialog-heading"><div><p class="eyebrow">Application document</p><h2 id="cover-letter-title">Cover Letter</h2></div><button class="icon-button" type="button" data-close-dialog="cover-letter-dialog" title="关闭"><i data-lucide="x"></i></button></div>
         <p class="feedback-copy" id="cover-letter-job-meta"></p>
         <div class="cover-letter-controls">
-          <label class="field"><span>画像</span><select id="cover-letter-profile"></select></label>
+          <label class="field"><span id="cover-letter-profile-label">画像</span><select id="cover-letter-profile"></select></label>
           <label class="field"><span>最多页数</span><select id="cover-letter-pages"><option value="1">1 页</option><option value="2">2 页</option><option value="3">3 页</option></select></label>
         </div>
         <label class="field full"><span>生成 Prompt</span><textarea id="cover-letter-instructions" rows="3" maxlength="2000"></textarea></label>
