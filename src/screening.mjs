@@ -173,6 +173,7 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
     title,
     company: normalizeText(input.company) || null,
     location: normalizeText(input.location) || null,
+    workAddress: typeof input.workAddress === "string" ? normalizeText(input.workAddress).slice(0, 300) : null,
     jobUrl,
     description: normalizeText(input.description) || null,
     descriptionSource: normalizeText(input.descriptionSource) || null,

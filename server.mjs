@@ -32,6 +32,7 @@ import {
 import { normalizeKeywordAlternatives, primarySearchKeyword } from "./src/task-keywords.mjs";
 import { createStorage, newId } from "./src/storage.mjs";
 import { findDuplicate, strongIdentityKeys } from "./src/job-identity.mjs";
+import { createDistanceService } from "./src/distance.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -58,11 +59,14 @@ const platformJobTypes = {
 await loadDotEnv(join(root, ".env"));
 await loadSavedAiConfig();
 const storage = createStorage({ dataDirectory, defaultSettings, defaultTaskCategories });
+const distanceService = await createDistanceService({ dataDirectory });
 const autoReviewQueue = [];
 const queuedAutoReviewIds = new Set();
+const queuedDistanceJobIds = new Set();
 const jdRetryBatches = new Map();
 let autoReviewRunning = false;
 let autoReviewCooldownTimer = null;
+let automaticDistanceRunning = false;
 await storage.ensureState();
 await storage.update((state) => {
   state.settings = safeSettings(state.settings);
@@ -276,6 +280,7 @@ function buildBootstrap(state) {
   state.runs.forEach(ensureRunCounterShape);
   return {
     settings: state.settings,
+    distance: distanceService.snapshot(state.jobs),
     profiles: state.profiles.map(publicProfile),
     activeProfile: activeProfile ? publicProfile(activeProfile) : null,
     jobs: state.jobs,
@@ -1305,13 +1310,24 @@ function markJobJdFetching(job) {
   job.aiReview = { status: "fetching_jd", startedAt: new Date().toISOString() };
 }
 
-function retryableFailedJd(job) {
+function jobRunUsesAiReview(state, job) {
+  const run = job?.runId ? state.runs.find((item) => item.id === job.runId) : null;
+  if (!run) return job?.screening?.screeningStatus !== "COLLECTED_ONLY";
+  if (run.aiReviewEnabled === false) return false;
+  const task = run.tasks.find((item) => item.id === job.runTaskId);
+  return task?.aiReviewEnabled !== false;
+}
+
+function retryableMissingAiJd(state, job) {
+  const fetchStartedAt = Date.parse(job?.aiReview?.startedAt || "");
   const staleFetch = job?.screening?.screeningStatus === "JD_FETCHING"
-    && Date.now() - Date.parse(job.aiReview?.startedAt || 0) > 30_000;
+    && (!Number.isFinite(fetchStartedAt) || Date.now() - fetchStartedAt > 30_000);
   return Boolean(job
     && !isRejectedBeforeJd(job)
     && ["linkedin", "indeed", "seek"].includes(job.source)
-    && (job.descriptionFetchStatus === "failed" || job.screening?.screeningStatus === "JD_FETCH_FAILED" || staleFetch));
+    && jobRunUsesAiReview(state, job)
+    && !hasCompleteDescription(job)
+    && (job.screening?.screeningStatus !== "JD_FETCHING" || staleFetch));
 }
 
 function retryableFailedAiReview(job) {
@@ -1334,7 +1350,7 @@ async function advanceJdRetryBatch(batchId) {
     batch.cursor += 1;
     const prepared = await storage.update((state) => {
       const job = state.jobs.find((item) => item.id === jobId);
-      if (!retryableFailedJd(job)) return null;
+      if (!retryableMissingAiJd(state, job)) return null;
       let launchUrl;
       try {
         launchUrl = buildOnDemandJdUrl(job, batch.id);
@@ -1771,7 +1787,7 @@ function recalculateRunCounters(state, run) {
   run.counters.ai.reflections = state.reviewReflections.filter((reflection) => reflection.runId === run.id).length;
 }
 
-function createRun(state, routineTaskIds = null, requestedProfileId = null, requestedAiReviewEnabled = true) {
+function createRun(state, routineTaskIds = null, requestedProfileId = null, requestedAiReviewEnabled = true, requestedDistanceEnabled = false) {
   const settings = state.settings;
   const routineTasks = state.routineTasks;
   const profile = state.profiles.find((item) => item.id === requestedProfileId)
@@ -1779,6 +1795,7 @@ function createRun(state, routineTaskIds = null, requestedProfileId = null, requ
   if (!profile) throw new Error("Choose a career profile before starting a run.");
   const context = profileContext(state, profile.id);
   const aiReviewEnabled = requestedAiReviewEnabled !== false;
+  const distanceEnabled = requestedDistanceEnabled === true;
   const requestedIds = Array.isArray(routineTaskIds) && routineTaskIds.length
     ? new Set(routineTaskIds.map((id) => String(id)))
     : null;
@@ -1796,6 +1813,7 @@ function createRun(state, routineTaskIds = null, requestedProfileId = null, requ
     postedWithinDays: task.postedWithinDays,
     jobType: task.jobType || "any",
     aiReviewEnabled,
+    distanceEnabled,
     exclusionKeywords: [...context.exclusionKeywords],
     workerTiming: { ...(settings.workerTiming ?? {}) },
     attempt: 1,
@@ -1817,6 +1835,7 @@ function createRun(state, routineTaskIds = null, requestedProfileId = null, requ
     startedAt: new Date().toISOString(),
     completedAt: null,
     aiReviewEnabled,
+    distanceEnabled,
     profileId: profile.id,
     profileName: profile.name,
     profileSnapshot: cloneData(profile.profile),
@@ -1825,6 +1844,40 @@ function createRun(state, routineTaskIds = null, requestedProfileId = null, requ
     tasks,
     counters
   };
+}
+
+function enqueueAutomaticDistances(jobIds) {
+  for (const id of jobIds || []) if (id) queuedDistanceJobIds.add(id);
+  if (!automaticDistanceRunning && queuedDistanceJobIds.size) void drainAutomaticDistances();
+}
+
+async function drainAutomaticDistances() {
+  if (automaticDistanceRunning) return;
+  automaticDistanceRunning = true;
+  try {
+    while (queuedDistanceJobIds.size) {
+      if (distanceService.snapshot().batch?.status === "RUNNING") {
+        setTimeout(() => { automaticDistanceRunning = false; void drainAutomaticDistances(); }, 2000);
+        return;
+      }
+      const ids = [...queuedDistanceJobIds].slice(0, 500);
+      ids.forEach((id) => queuedDistanceJobIds.delete(id));
+      const state = await storage.ensureState();
+      const byId = new Map(state.jobs.map((job) => [job.id, job]));
+      const jobs = ids.map((id) => byId.get(id)).filter(Boolean);
+      if (!jobs.length) continue;
+      const result = await distanceService.start(jobs);
+      await result.completion;
+      if (["FAILED", "CANCELLED"].includes(distanceService.snapshot(jobs).batch?.status)) {
+        queuedDistanceJobIds.clear();
+        break;
+      }
+    }
+  } catch {
+    queuedDistanceJobIds.clear();
+  } finally {
+    automaticDistanceRunning = false;
+  }
 }
 
 function updateRunState(run) {
@@ -1901,6 +1954,37 @@ async function handleApi(request, response, url) {
   }
   if (request.method === "GET" && path === "/api/bootstrap") {
     return sendJson(response, 200, buildBootstrap(await storage.ensureState()));
+  }
+  if (request.method === "PUT" && path === "/api/distance/config") {
+    return sendJson(response, 200, await distanceService.saveConfig(await readJson(request)));
+  }
+  if (request.method === "POST" && path === "/api/distance/origin/search") {
+    return sendJson(response, 200, await distanceService.findOrigin());
+  }
+  if (request.method === "POST" && path === "/api/distance/origin/confirm") {
+    const body = await readJson(request);
+    return sendJson(response, 200, await distanceService.confirmOrigin(body.index));
+  }
+  if (request.method === "POST" && path === "/api/distance/cancel") {
+    return sendJson(response, 200, distanceService.cancel());
+  }
+  if (request.method === "POST" && path === "/api/distance/calculate") {
+    const body = await readJson(request);
+    const ids = [...new Set(Array.isArray(body.jobIds) ? body.jobIds : [])];
+    if (!ids.length || ids.length > 500) throw new Error("Choose between 1 and 500 jobs for a distance lookup.");
+    const state = await storage.ensureState();
+    const byId = new Map(state.jobs.map((job) => [job.id, job]));
+    if (ids.some((id) => !byId.has(id))) throw new Error("Some jobs no longer exist. Refresh the list.");
+    const result = await distanceService.start(ids.map((id) => byId.get(id)));
+    return sendJson(response, 202, { batch: result.batch });
+  }
+  const distanceAddressMatch = /^\/api\/jobs\/([^/]+)\/work-address$/.exec(path);
+  if (request.method === "PUT" && distanceAddressMatch) {
+    const body = await readJson(request);
+    const state = await storage.ensureState();
+    const job = state.jobs.find((item) => item.id === distanceAddressMatch[1]);
+    if (!job) throw new Error("Job was not found.");
+    return sendJson(response, 200, await distanceService.setOverride(job, body.address));
   }
   const jobCoverLettersMatch = /^\/api\/jobs\/([^/]+)\/cover-letters$/.exec(path);
   if (request.method === "GET" && jobCoverLettersMatch) {
@@ -2584,10 +2668,16 @@ async function handleApi(request, response, url) {
 
   if (request.method === "POST" && path === "/api/runs") {
     const body = await readJson(request);
+    if (body.distanceEnabled === true) {
+      const distance = distanceService.snapshot();
+      if (!distance.enabled || !distance.hasApiKey || !distance.origin) {
+        throw new Error("Enable distance lookup, save a Geoapify API key, and confirm the origin before starting this run.");
+      }
+    }
     const run = await storage.update((state) => {
       const active = state.runs.find((item) => ["WAITING_FOR_WORKERS", "NEEDS_USER_ACTION"].includes(item.state));
       if (active) throw new Error("A run is already active. Finish or clear it before starting another run.");
-      const run = createRun(state, body.routineTaskIds, body.profileId, body.aiReviewEnabled);
+      const run = createRun(state, body.routineTaskIds, body.profileId, body.aiReviewEnabled, body.distanceEnabled);
       state.runs.unshift(run);
       state.runs = state.runs.slice(0, 60);
       return run;
@@ -2884,6 +2974,7 @@ async function handleApi(request, response, url) {
       return { run, task, jobs, autoReviewJobIds };
     });
     enqueueAutoReviews(result.autoReviewJobIds || []);
+    if (result.run?.distanceEnabled) enqueueAutomaticDistances((result.jobs || []).filter((job) => !job.duplicateOf).map((job) => job.id));
     return sendJson(response, 200, {
       ...result,
       autoReviewQueued: result.autoReviewJobIds?.length || 0,
@@ -3335,10 +3426,11 @@ async function handleApi(request, response, url) {
   if (request.method === "POST" && path === "/api/jobs/retry-failed-jd") {
     const body = await readJson(request);
     const requestedIds = [...new Set((Array.isArray(body.jobIds) ? body.jobIds : [])
-      .map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 100);
-    if (!requestedIds.length) throw new Error("Choose at least one failed JD to retry.");
+      .map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 1_000);
+    if (!requestedIds.length) throw new Error("Choose at least one missing JD to retrieve.");
     const currentState = await storage.ensureState();
-    const eligibleIds = requestedIds.filter((id) => retryableFailedJd(
+    const eligibleIds = requestedIds.filter((id) => retryableMissingAiJd(
+      currentState,
       currentState.jobs.find((job) => job.id === id)
     ));
     if (!eligibleIds.length) throw new Error("None of the selected jobs still need JD retrieval.");
@@ -3358,7 +3450,7 @@ async function handleApi(request, response, url) {
   if (request.method === "POST" && path === "/api/jobs/retry-failed-ai") {
     const body = await readJson(request);
     const requestedIds = [...new Set((Array.isArray(body.jobIds) ? body.jobIds : [])
-      .map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 100);
+      .map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 1_000);
     if (!requestedIds.length) throw new Error("Choose at least one failed AI review to retry.");
     if (!aiStatus().configured) throw new Error("Configure AI before retrying failed reviews.");
     const result = await storage.update((state) => {

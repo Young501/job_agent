@@ -19,6 +19,7 @@ const state = {
   pendingRunTaskIds: null,
   pendingRunProfileId: null,
   pendingRunAiReviewEnabled: true,
+  pendingRunDistanceEnabled: false,
   resumeSource: "",
   editingValidationId: null,
   notifiedTaskIds: new Set(),
@@ -595,20 +596,34 @@ function jobsInSelectedPane() {
   return selectedHistoryTaskEntry()?.jobs || [];
 }
 
-function failedJdJobsInSelectedPane() {
-  return jobsInSelectedPane().filter((job) => {
+function currentPendingReviewJobs() {
+  return pendingReviewJobs(pendingReviewTaskEntries());
+}
+
+function jobRunUsesAiReview(job) {
+  const run = runForJob(job);
+  if (!run) return job.screening?.screeningStatus !== "COLLECTED_ONLY";
+  if (run.aiReviewEnabled === false) return false;
+  const task = matchingRunTask(run, job);
+  return task?.aiReviewEnabled !== false;
+}
+
+function missingJdJobsInCurrentReview() {
+  return currentPendingReviewJobs().filter((job) => {
+    const fetchStartedAt = Date.parse(job.aiReview?.startedAt || "");
     const staleFetch = job.screening?.screeningStatus === "JD_FETCHING"
-      && Date.now() - new Date(job.aiReview?.startedAt || 0).getTime() > 30_000;
+      && (!Number.isFinite(fetchStartedAt) || Date.now() - fetchStartedAt > 30_000);
     return ["linkedin", "indeed", "seek"].includes(job.source)
+      && jobRunUsesAiReview(job)
       && job.screening?.category !== "REJECTED"
-      && (job.descriptionFetchStatus === "failed"
-        || job.screening?.screeningStatus === "JD_FETCH_FAILED"
-        || staleFetch);
+      && job.screening?.titleClassification !== "CLEAR_REJECT"
+      && !hasCompleteJobJd(job)
+      && (job.screening?.screeningStatus !== "JD_FETCHING" || staleFetch);
   });
 }
 
-function failedAiReviewJobsInSelectedPane() {
-  return jobsInSelectedPane().filter((job) => job.screening?.screeningStatus === "AI_ERROR"
+function failedAiReviewJobsInCurrentReview() {
+  return currentPendingReviewJobs().filter((job) => job.screening?.screeningStatus === "AI_ERROR"
     && hasCompleteJobJd(job));
 }
 
@@ -689,6 +704,12 @@ function renderPendingReviewTasks() {
 
 function sortJobs(jobs, sort) {
   return [...jobs].sort((a, b) => {
+    if (sort === "distance" && state.data.distance?.enabled) {
+      const records = state.data.distance.results || {};
+      const distance = (job) => records[job.id]?.status === "READY" ? records[job.id].km : Infinity;
+      const order = distance(a) - distance(b);
+      if (order && !Number.isNaN(order)) return order;
+    }
     if (sort === "priority") {
       const rank = { STRONG_MATCH: 0, GOOD_MATCH: 1, MAYBE: 2, LOW_MATCH: 3, REJECTED: 4 };
       const categoryOrder = (rank[effectiveJobCategory(a)] ?? 5) - (rank[effectiveJobCategory(b)] ?? 5);
@@ -947,6 +968,89 @@ function hasCompleteJobJd(job) {
   ));
 }
 
+const distanceStatusLabels = { REMOTE: "远程 · 无固定通勤", MISSING: "缺少工作地点", AMBIGUOUS: "地点不明确，请补充地址", TOO_BROAD: "地点范围太大", NOT_FOUND: "未找到地址" };
+
+function jobDistanceBadge(job) {
+  if (!state.data.distance?.enabled) return "";
+  const result = state.data.distance.results?.[job.id];
+  const label = result?.status === "READY"
+    ? `约 ${result.km.toFixed(1)} km · ${result.approximate ? "区域估算" : "直线距离"}`
+    : distanceStatusLabels[result?.status] || "距离未计算";
+  return '<button class="job-distance" type="button" data-distance-job="' + escapeHtml(job.id) + '" title="查看或修正工作地址"><i data-lucide="map-pin"></i><span>' + escapeHtml(label) + '</span></button>';
+}
+
+function renderDistanceToolbar() {
+  const distance = state.data.distance || {};
+  const batch = distance.batch;
+  const running = batch?.status === "RUNNING";
+  el("#distance-sort-option").hidden = !distance.enabled;
+  el("#distance-sort-option").disabled = !distance.enabled;
+  if (!distance.enabled && el("#job-sort").value === "distance") el("#job-sort").value = "priority";
+  el("#distance-calculate").hidden = !distance.enabled;
+  el("#distance-calculate").disabled = running || !distance.origin || !distance.hasApiKey || !visibleJobs().length;
+  el("#distance-cancel").hidden = !running;
+  el("#distance-progress").textContent = !distance.enabled ? "距离查询未启用"
+    : running ? `距离查询 ${batch.completed} / ${batch.total} · ${batch.currentTitle}`
+    : batch?.status === "FAILED" ? `距离查询已暂停：${batch.error}`
+    : !distance.hasApiKey ? "请在距离设置中配置 Geoapify API Key"
+    : !distance.origin ? "请在距离设置中确认出发位置"
+    : batch ? `距离查询${batch.status === "CANCELLED" ? "已停止" : "已完成"} ${batch.completed} / ${batch.total} · 直线距离`
+    : "按需查询 · 直线距离";
+}
+
+function renderDistanceSettings() {
+  const distance = state.data.distance || {};
+  el("#distance-enabled").checked = distance.enabled === true;
+  el("#distance-home").value = distance.homeAddress || "";
+  el("#distance-country").value = distance.country || "au";
+  el("#distance-api-key").placeholder = distance.hasApiKey ? "已保存 Key；留空保留" : "填写 Geoapify API Key";
+  el("#distance-origin-status").textContent = distance.origin
+    ? `已确认：${distance.origin.label}${distance.origin.precise ? "" : "（出发点为区域估算）"}`
+    : "尚未确认出发位置";
+}
+
+async function saveDistanceSettings(refresh = true, clearApiKey = false) {
+  const body = { enabled: el("#distance-enabled").checked, homeAddress: el("#distance-home").value.trim(), country: el("#distance-country").value,
+    apiKey: el("#distance-api-key").value.trim(), clearApiKey };
+  const previous = state.data.distance || {};
+  if (!clearApiKey && !body.apiKey && body.enabled === previous.enabled && body.homeAddress === previous.homeAddress && body.country === previous.country) return;
+  await api("/api/distance/config", { method: "PUT", body: JSON.stringify(body) });
+  el("#distance-api-key").value = "";
+  el("#distance-candidates-panel").hidden = true;
+  if (refresh) { await reload(); toast("距离设置已保存。"); }
+}
+
+async function findHomeAddress() {
+  const button = el("#distance-find-home");
+  button.disabled = true;
+  try {
+    await saveDistanceSettings(false);
+    el("#distance-origin-status").textContent = "正在定位地址…";
+    const result = await api("/api/distance/origin/search", { method: "POST", body: "{}" });
+    el("#distance-candidates").innerHTML = result.candidates.map((item, index) => '<option value="' + index + '">' + escapeHtml(item.label) + '</option>').join("");
+    el("#distance-candidates-panel").hidden = !result.candidates.length;
+    el("#distance-origin-status").textContent = result.candidates.length ? "请选择正确的出发位置。" : "未找到地址，请补充街道、城区和邮编。";
+  } catch (error) { el("#distance-origin-status").textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function calculateDistances(jobIds = visibleJobs().map((job) => job.id)) {
+  try {
+    await api("/api/distance/calculate", { method: "POST", body: JSON.stringify({ jobIds }) });
+    await reload();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function saveWorkAddress(calculate = false) {
+  const id = el("#distance-job-id").value;
+  try {
+    await api("/api/jobs/" + encodeURIComponent(id) + "/work-address", { method: "PUT", body: JSON.stringify({ address: el("#distance-job-address").value.trim() }) });
+    el("#distance-address-dialog").close();
+    if (calculate) await calculateDistances([id]);
+    else await reload();
+  } catch (error) { toast(error.message, "error"); }
+}
+
 function jobRow(job, compact = false, includeBatch = false) {
   const duplicate = job.duplicateOf ? '<span class="tiny-note">重复导入</span>' : "";
   const search = compact ? "" : '<td class="muted">' + escapeHtml(job.searchKeyword || "-") + "</td>";
@@ -961,7 +1065,7 @@ function jobRow(job, compact = false, includeBatch = false) {
   const scoreReason = escapeHtml(job.screening?.reason || "尚无评分说明");
   return '<tr' + (rowClasses ? ' class="' + rowClasses + '"' : "") + '>'
     + '<td><strong>' + escapeHtml(job.title) + "</strong>" + duplicate + reviewMeta + "</td>"
-    + '<td><span>' + escapeHtml(job.company || "-") + "</span><small>" + escapeHtml(job.location || "-") + "</small></td>"
+    + '<td><span>' + escapeHtml(job.company || "-") + "</span><small>" + escapeHtml(job.location || "-") + "</small>" + jobDistanceBadge(job) + "</td>"
     + '<td>' + badge(names[job.source] || job.source, "source-" + job.source) + "</td>"
     + search
     + '<td><button class="score score-trigger" type="button" data-score-details="' + job.id + '" title="点击查看分数构成：' + scoreReason + '" aria-label="查看评分 ' + job.screening.score + ' 的构成">' + job.screening.score + "</button>" + badge(effectiveJobCategory(job), "category-" + effectiveJobCategory(job).toLowerCase()) + "</td>"
@@ -1087,6 +1191,7 @@ function renderReviewLearning() {
 }
 
 function renderJobs() {
+  renderDistanceToolbar();
   const pendingEntries = pendingReviewTaskEntries();
   const currentJobs = pendingReviewJobs(pendingEntries);
   const historyEntries = historicalTaskEntries();
@@ -1115,28 +1220,27 @@ function renderJobs() {
   }
   const selectedRun = historyEntry?.run || null;
   el("#delete-selected-history-run").disabled = !selectedRun || !["COMPLETED", "COMPLETED_WITH_ERRORS"].includes(selectedRun.state);
-  const failedJdJobs = failedJdJobsInSelectedPane();
-  const paneJobIds = new Set(jobsInSelectedPane().map((job) => job.id));
-  const activeJdRetry = (state.data.jdRetryBatches || []).find((batch) => batch.jobIds.some((id) => paneJobIds.has(id)));
+  const missingJdJobs = missingJdJobsInCurrentReview();
+  const currentReviewJobIds = new Set(currentPendingReviewJobs().map((job) => job.id));
+  const activeJdRetry = (state.data.jdRetryBatches || []).find((batch) => batch.jobIds.some((id) => currentReviewJobIds.has(id)));
   const retryFailedButton = el("#retry-failed-jds");
-  retryFailedButton.hidden = !activeJdRetry && !failedJdJobs.length;
-  retryFailedButton.disabled = Boolean(activeJdRetry) || !failedJdJobs.length;
+  retryFailedButton.hidden = state.jobsPane !== "current" || (!activeJdRetry && !missingJdJobs.length);
+  retryFailedButton.disabled = Boolean(activeJdRetry) || !missingJdJobs.length;
   retryFailedButton.classList.toggle("is-busy", Boolean(activeJdRetry));
-  if (historyIndex) retryFailedButton.hidden = true;
   retryFailedButton.innerHTML = activeJdRetry
     ? '<i data-lucide="loader-circle" class="button-spinner"></i><span>获取 JD ' + activeJdRetry.completed + '/' + activeJdRetry.total + '</span>'
-    : '<i data-lucide="files"></i><span>重试失败 JD (' + failedJdJobs.length + ')</span>';
-  const failedAiJobs = failedAiReviewJobsInSelectedPane();
+    : '<i data-lucide="files"></i><span>获取全部缺失 JD (' + missingJdJobs.length + ')</span>';
+  const failedAiJobs = failedAiReviewJobsInCurrentReview();
   const retryFailedAiButton = el("#retry-failed-ai-reviews");
   const canRetryFailedAi = Boolean(state.data.ai?.configured && state.data.activeProfile);
-  retryFailedAiButton.hidden = historyIndex || !failedAiJobs.length;
+  retryFailedAiButton.hidden = state.jobsPane !== "current" || !failedAiJobs.length;
   retryFailedAiButton.disabled = !canRetryFailedAi;
   retryFailedAiButton.title = !state.data.activeProfile
     ? "请先激活职业画像"
     : !state.data.ai?.configured
       ? "请先配置 AI 服务"
-      : `使用已保存的完整 JD 重新审阅 ${failedAiJobs.length} 个失败职位`;
-  retryFailedAiButton.innerHTML = '<i data-lucide="refresh-cw"></i><span>重新审阅 AI 失败项 (' + failedAiJobs.length + ')</span>';
+      : `重新审阅当前待审阅任务中 ${failedAiJobs.length} 个 AI 失败职位`;
+  retryFailedAiButton.innerHTML = '<i data-lucide="refresh-cw"></i><span>重审全部 AI 失败项 (' + failedAiJobs.length + ')</span>';
   if (state.jobsPane === "current") renderPendingReviewTasks();
   const selectedPendingEntry = state.jobsPane === "current" ? selectedPendingReviewTaskEntry(pendingEntries) : null;
   const selectedTask = selectedPendingEntry?.task || null;
@@ -1709,6 +1813,7 @@ function settingsRow(kind, item) {
 }
 
 function renderSettings() {
+  renderDistanceSettings();
   const settings = state.data.settings;
   const settingsProfile = selectedSettingsProfile();
   if (settingsProfile && state.settingsProfileId !== settingsProfile.id) state.settingsProfileId = settingsProfile.id;
@@ -2015,13 +2120,13 @@ async function reload() {
   render();
 }
 
-async function launchRun(routineTaskIds = null, profileId = null, aiReviewEnabled = true) {
+async function launchRun(routineTaskIds = null, profileId = null, aiReviewEnabled = true, distanceEnabled = false) {
   const launcher = window.open("about:blank", "job-agent-worker-launch");
   try {
     if ("Notification" in window && Notification.permission === "default") Notification.requestPermission().catch(() => {});
     const result = await api("/api/runs", {
       method: "POST",
-      body: JSON.stringify({ ...(routineTaskIds ? { routineTaskIds } : {}), profileId, aiReviewEnabled })
+      body: JSON.stringify({ ...(routineTaskIds ? { routineTaskIds } : {}), profileId, aiReviewEnabled, distanceEnabled })
     });
     const firstLaunch = result.launchUrls[0];
     if (launcher && firstLaunch?.url) {
@@ -2103,8 +2208,15 @@ function requestRunConfirmation(routineTaskIds = null) {
   state.pendingRunTaskIds = routineTaskIds ? selected.map((task) => task.id) : null;
   state.pendingRunProfileId = state.data.activeProfile?.id || state.data.profiles[0].id;
   state.pendingRunAiReviewEnabled = true;
+  state.pendingRunDistanceEnabled = false;
   el("#run-profile-select").innerHTML = profileSelectOptions(state.pendingRunProfileId);
   el('input[name="run-ai-review"][value="enabled"]').checked = true;
+  el('input[name="run-distance"][value="disabled"]').checked = true;
+  const distanceReady = Boolean(state.data.distance?.enabled && state.data.distance?.hasApiKey && state.data.distance?.origin);
+  el('input[name="run-distance"][value="enabled"]').disabled = !distanceReady;
+  el("#run-distance-status").textContent = distanceReady
+    ? `已就绪：${state.data.distance.origin.label}。本次开启后会自动计算。`
+    : "尚未配置完成；请先在搜索设置中启用距离查询、保存 Geoapify Key 并确认出发位置。";
   renderRunProfileConfirmation(selected);
   el("#run-exclusion-confirmed").checked = false;
   el("#confirm-start-run").disabled = true;
@@ -2119,7 +2231,8 @@ function renderRunProfileConfirmation(selectedTasks = null) {
   const exclusions = contextForProfile(profile?.id).exclusionKeywords || [];
   el("#run-exclusion-review").innerHTML = '<div class="run-confirm-summary"><strong>本次 ' + selected.length + ' 项任务</strong><span>'
     + escapeHtml([...new Set(selected.map((task) => names[task.platform]))].join(" / ")) + ' · ' + escapeHtml(profileLabel(profile)) + ' · '
-    + (state.pendingRunAiReviewEnabled ? "AI 审阅" : "仅采集") + '</span></div>'
+    + (state.pendingRunAiReviewEnabled ? "AI 审阅" : "仅采集") + ' · '
+    + (state.pendingRunDistanceEnabled ? "自动查询距离" : "不查询距离") + '</span></div>'
     + (exclusions.length
       ? '<div class="run-confirm-keywords">' + exclusions.map((keyword) => '<span>' + escapeHtml(keyword) + '</span>').join("") + '</div>'
       : '<p class="exclusion-empty">当前没有生效的排除关键词，本次 Worker 不会按排除词跳过职位。</p>');
@@ -2131,7 +2244,7 @@ async function confirmStartRun(event) {
   const button = el("#confirm-start-run");
   button.disabled = true;
   const requestedIds = state.pendingRunTaskIds;
-  const result = await launchRun(requestedIds, state.pendingRunProfileId, state.pendingRunAiReviewEnabled);
+  const result = await launchRun(requestedIds, state.pendingRunProfileId, state.pendingRunAiReviewEnabled, state.pendingRunDistanceEnabled);
   if (!result) {
     button.disabled = false;
     return;
@@ -2144,6 +2257,7 @@ async function confirmStartRun(event) {
   state.pendingRunTaskIds = null;
   state.pendingRunProfileId = null;
   state.pendingRunAiReviewEnabled = true;
+  state.pendingRunDistanceEnabled = false;
 }
 
 async function uploadResume() {
@@ -3287,6 +3401,7 @@ async function addValidationTask(id) {
 
 async function saveSettings() {
   try {
+    await saveDistanceSettings(false);
     await api("/api/settings", { method: "PUT", body: JSON.stringify(settingPayload()) });
     await reload();
     toast("搜索设置已保存。");
@@ -3746,8 +3861,8 @@ async function toggleJobViewed(id, viewed) {
 }
 
 async function retryFailedJds() {
-  const jobs = failedJdJobsInSelectedPane();
-  if (!jobs.length) return toast("当前批次没有需要重新获取的 JD。", "error");
+  const jobs = missingJdJobsInCurrentReview();
+  if (!jobs.length) return toast("当前待审阅任务没有缺失的 JD。", "error");
   const platformCounts = jobs.reduce((counts, job) => {
     counts[job.source] = (counts[job.source] || 0) + 1;
     return counts;
@@ -3755,7 +3870,7 @@ async function retryFailedJds() {
   const breakdown = Object.entries(platformCounts)
     .map(([platform, count]) => `${names[platform] || platform} ${count}`)
     .join(" · ");
-  if (!window.confirm(`按顺序重新获取 ${jobs.length} 个失败 JD？\n\n${breakdown}\n\n只会使用一个 Worker 窗口；普通失败会继续下一项，遇到登录或机器人验证时会暂停。`)) return;
+  if (!window.confirm(`按顺序获取当前待审阅任务中 ${jobs.length} 个缺失 JD？\n\n${breakdown}\n\n只会使用一个 Worker 窗口，并沿用访问节奏与休息设置；普通失败会继续下一项，遇到登录或机器人验证时会暂停。历史任务不会参与。`)) return;
   const launcher = window.open("about:blank", "job-agent-jd-retry");
   if (!launcher) return toast("浏览器阻止了 JD 获取窗口，请允许本站打开弹窗后重试。", "error");
   const button = el("#retry-failed-jds");
@@ -3773,7 +3888,7 @@ async function retryFailedJds() {
     await reload();
     state.view = "jobs";
     render();
-    toast(`已开始按顺序重新获取 ${result.total} 个 JD；Agent 会自动同步结果。`);
+    toast(`已开始按顺序获取 ${result.total} 个缺失 JD；获取成功后会自动进入 AI 审阅。`);
   } catch (error) {
     launcher.close();
     button.disabled = false;
@@ -3783,9 +3898,9 @@ async function retryFailedJds() {
 }
 
 async function retryFailedAiReviews() {
-  const jobs = failedAiReviewJobsInSelectedPane();
-  if (!jobs.length) return toast("当前任务没有可重新审阅的 AI 失败职位。", "error");
-  if (!window.confirm(`重新审阅 ${jobs.length} 个 AI 失败职位？\n\n将直接复用已保存的完整 JD，每个职位会产生一次新的 AI 调用，不会重新打开招聘平台。`)) return;
+  const jobs = failedAiReviewJobsInCurrentReview();
+  if (!jobs.length) return toast("当前待审阅任务没有可重新审阅的 AI 失败职位。", "error");
+  if (!window.confirm(`重新审阅当前待审阅任务中的 ${jobs.length} 个 AI 失败职位？\n\n将直接复用已保存的完整 JD，每个职位会产生新的 AI 调用；历史任务不会参与，也不会重新打开招聘平台。`)) return;
   const button = el("#retry-failed-ai-reviews");
   button.disabled = true;
   button.classList.add("is-busy");
@@ -3991,6 +4106,21 @@ function exportCoverLetterPdf() {
 }
 
 document.addEventListener("click", (event) => {
+  const distanceJob = event.target.closest("[data-distance-job]");
+  if (distanceJob) {
+    const job = state.data.jobs.find((item) => item.id === distanceJob.dataset.distanceJob);
+    if (!job) return;
+    const result = state.data.distance?.results?.[job.id];
+    el("#distance-job-id").value = job.id;
+    el("#distance-job-title").textContent = job.title;
+    el("#distance-job-address").value = state.data.distance?.overrides?.[job.id] || "";
+    el("#distance-job-detail").textContent = result?.point
+      ? `使用地点：${result.point.label}。${result.approximate ? "按区域中心估算；" : ""}直线距离不是通勤路程。`
+      : `职位地点：${job.workAddress || job.location || "未提供"}。可填写招聘方确认的实际工作地址。`;
+    el("#distance-calculate-one").disabled = !state.data.distance?.enabled || !state.data.distance?.hasApiKey || !state.data.distance?.origin || state.data.distance?.batch?.status === "RUNNING";
+    el("#distance-address-dialog").showModal();
+    return;
+  }
   if (event.target.closest("#toggle-job-assistant")) {
     state.jobAssistantOpen = !state.jobAssistantOpen;
     renderJobAssistant();
@@ -4270,6 +4400,10 @@ document.addEventListener("change", (event) => {
     state.pendingRunAiReviewEnabled = event.target.value !== "disabled";
     renderRunProfileConfirmation();
   }
+  if (event.target.matches('input[name="run-distance"]')) {
+    state.pendingRunDistanceEnabled = event.target.value === "enabled";
+    renderRunProfileConfirmation();
+  }
   if (event.target.matches("#routine-task-platform")) syncRoutineJobTypeOptions();
   if (event.target.matches('[data-category-task-field="platform"]')) {
     const row = event.target.closest(".category-task-editor-row");
@@ -4356,6 +4490,30 @@ window.addEventListener("message", (event) => {
   reload().catch((error) => toast(error.message, "error"));
 });
 
+el("#distance-save").addEventListener("click", () => saveDistanceSettings().catch((error) => toast(error.message, "error")));
+el("#distance-clear-key").addEventListener("click", () => saveDistanceSettings(true, true).catch((error) => toast(error.message, "error")));
+el("#distance-find-home").addEventListener("click", findHomeAddress);
+el("#distance-home").addEventListener("input", () => { el("#distance-candidates-panel").hidden = true; });
+el("#distance-country").addEventListener("change", () => { el("#distance-candidates-panel").hidden = true; });
+el("#distance-confirm-home").addEventListener("click", async () => {
+  try {
+    await api("/api/distance/origin/confirm", { method: "POST", body: JSON.stringify({ index: Number(el("#distance-candidates").value) }) });
+    el("#distance-candidates-panel").hidden = true;
+    await reload();
+  } catch (error) { toast(error.message, "error"); }
+});
+el("#distance-open-settings").addEventListener("click", () => {
+  state.view = "settings";
+  render();
+  el("#distance-settings-section").scrollIntoView({ block: "start" });
+});
+el("#distance-calculate").addEventListener("click", () => calculateDistances());
+el("#distance-cancel").addEventListener("click", async () => {
+  try { await api("/api/distance/cancel", { method: "POST", body: "{}" }); await reload(); }
+  catch (error) { toast(error.message, "error"); }
+});
+el("#distance-address-form").addEventListener("submit", (event) => { event.preventDefault(); void saveWorkAddress(); });
+el("#distance-calculate-one").addEventListener("click", () => saveWorkAddress(true));
 el("#start-run").addEventListener("click", createRun);
 el("#start-run-secondary").addEventListener("click", createRun);
 el("#run-selected-routine-tasks").addEventListener("click", runSelectedRoutineTasks);
@@ -4420,7 +4578,7 @@ let lastAutoReloadAt = 0;
 function agentDataIsChanging() {
   const latestRunIsActive = state.data?.runs?.[0]?.tasks?.some((task) => ["queued", "running"].includes(task.status));
   const aiIsWorking = state.data?.jobs?.some((job) => ["JD_FETCHING", "AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus));
-  return Boolean(latestRunIsActive || aiIsWorking || state.data?.jdRetryBatches?.length);
+  return Boolean(latestRunIsActive || aiIsWorking || state.data?.jdRetryBatches?.length || state.data?.distance?.batch?.status === "RUNNING");
 }
 
 async function autoReload() {

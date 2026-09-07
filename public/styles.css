@@ -24,6 +24,22 @@
 
 [hidden] { display: none !important; }
 
+.distance-settings-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; min-width: 0; }
+.distance-settings-fields .full { grid-column: 1 / -1; }
+.distance-settings-fields input, .distance-settings-fields select { width: 100%; min-width: 0; }
+.distance-settings-fields .profile-copy-option input { width: auto; }
+.distance-settings-fields p { margin: 0; overflow-wrap: anywhere; }
+.distance-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 12px 0; flex-wrap: wrap; }
+.distance-toolbar > span { flex: 1 1 240px; min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
+.distance-toolbar .inline-actions, .distance-settings-fields .inline-actions { flex-wrap: wrap; }
+.distance-settings-fields .inline-actions { justify-content: flex-start; gap: 8px; }
+.job-distance { display: flex; align-items: flex-start; gap: 4px; max-width: 100%; margin-top: 8px; padding: 0; border: 0; background: transparent; color: var(--accent-dark); font-size: 12px; line-height: 16px; text-align: left; }
+.job-distance span { overflow-wrap: anywhere; }
+.job-distance svg { width: 14px; height: 14px; }
+.job-distance:hover { color: var(--teal); text-decoration: underline; }
+#distance-job-title, #distance-job-detail { overflow-wrap: anywhere; }
+@media (max-width: 640px) { .distance-settings-fields { grid-template-columns: minmax(0, 1fr); } }
+
 * { box-sizing: border-box; }
 body {
   min-width: 320px;
@@ -983,6 +999,8 @@ h3 { margin: 0; font: 700 14px/1.3 var(--font-display); }
 .run-mode-option small { display: block; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.55; }
 .run-mode-option input:checked + span { background: var(--accent-soft); border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .run-mode-option input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+.run-mode-option:has(input:disabled) { cursor: not-allowed; }
+.run-mode-option input:disabled + span { color: var(--muted); background: #f4f6f7; border-color: var(--line); opacity: .72; }
 .run-exclusion-review { margin-top: 15px; padding: 13px; background: #f7f9fa; border: 1px solid var(--line-strong); border-radius: 3px; }
 .run-confirm-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
 .run-confirm-summary strong { font-size: 13px; }

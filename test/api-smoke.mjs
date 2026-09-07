@@ -515,6 +515,8 @@ try {
   assert.match(dashboardHtml, /id="run-selected-routine-tasks"/);
   assert.match(dashboardHtml, /id="retry-failed-jds"/);
   assert.match(dashboardHtml, /id="retry-failed-ai-reviews"/);
+  assert.match(dashboardHtml, /获取全部缺失 JD/);
+  assert.match(dashboardHtml, /重审全部 AI 失败项/);
   assert.match(dashboardHtml, /id="routine-task-job-type"/);
   assert.match(dashboardHtml, /id="run-profile-select"/);
   assert.match(dashboardHtml, /id="open-new-profile"/);
@@ -577,6 +579,10 @@ try {
   assert.match(dashboardScript, /\/api\/jobs\/retry-failed-jd/);
   assert.match(dashboardScript, /function retryFailedAiReviews/);
   assert.match(dashboardScript, /\/api\/jobs\/retry-failed-ai/);
+  assert.match(dashboardScript, /function missingJdJobsInCurrentReview/);
+  assert.match(dashboardScript, /function failedAiReviewJobsInCurrentReview/);
+  assert.match(dashboardScript, /currentPendingReviewJobs\(\)/);
+  assert.doesNotMatch(dashboardScript, /failedAiReviewJobsInSelectedPane/);
   assert.match(dashboardScript, /setInterval\(autoReload, 2500\)/);
   assert.match(dashboardScript, /function openScoreDetails/);
   assert.match(dashboardScript, /AI 根据完整 JD 与职业画像进行语义综合评分/);
@@ -585,6 +591,8 @@ try {
   assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.1"/);
   assert.match(dashboardScript, /pendingRunAiReviewEnabled/);
   assert.match(dashboardScript, /aiReviewEnabled/);
+  assert.match(dashboardScript, /pendingRunDistanceEnabled/);
+  assert.match(dashboardHtml, /name="run-distance"/);
   assert.match(dashboardScript, /function selectRoutineTaskRange/);
   assert.match(dashboardScript, /data-routine-platform-select/);
   assert.match(dashboardScript, /\/workers\/install\//);
@@ -705,6 +713,16 @@ try {
   await request("/api/task-validations/" + normalizedKeywordValidation.validation.id, undefined, "DELETE");
 
   const keywordBootstrap = await request("/api/bootstrap");
+  assert.equal(keywordBootstrap.distance.enabled, false);
+  assert.equal(keywordBootstrap.distance.hasApiKey, false);
+  await assert.rejects(request("/api/distance/origin/search", {}), /Distance lookup is disabled/);
+  await request("/api/distance/config", { enabled: false, homeAddress: "Melbourne VIC", country: "au", apiKey: "distance-private-key" }, "PUT");
+  const distanceBootstrap = await request("/api/bootstrap");
+  assert.equal(distanceBootstrap.distance.homeAddress, "Melbourne VIC");
+  assert.equal(distanceBootstrap.distance.hasApiKey, true);
+  assert.ok(!JSON.stringify(distanceBootstrap).includes("distance-private-key"));
+  assert.equal(distanceBootstrap.settings.distance, undefined);
+  await request("/api/distance/config", { enabled: false, homeAddress: "", clearApiKey: true }, "PUT");
   assert.ok(keywordBootstrap.taskCategories.flatMap((category) => category.tasks)
     .every((task) => !/\sOR\s/i.test(task.keyword)));
 
@@ -927,9 +945,15 @@ try {
   assert.ok(!separatedProfiles.profileContexts[replacement.profile.id].exclusionKeywords.includes("software architect"));
   assert.ok(separatedProfiles.profileContexts[casualProfile.profile.id].exclusionKeywords.includes("software architect"));
   await validateRoutineTask("linkedin", 1);
+  await assert.rejects(
+    request("/api/runs", { profileId: casualProfile.profile.id, distanceEnabled: true }),
+    /Enable distance lookup/
+  );
   const run = await request("/api/runs", { profileId: casualProfile.profile.id });
   assert.equal(run.run.profileId, casualProfile.profile.id);
   assert.equal(run.run.aiReviewEnabled, true);
+  assert.equal(run.run.distanceEnabled, false);
+  assert.ok(run.run.tasks.every((task) => task.distanceEnabled === false));
   assert.ok(run.run.tasks.every((task) => task.aiReviewEnabled === true));
   assert.equal(run.run.profileName, "Casual hospitality");
   assert.equal(run.run.tasks.length, 4);
@@ -1607,6 +1631,10 @@ try {
   assert.equal(removableResult.autoReviewQueued, 0);
   assert.equal(removableResult.jobs[0].screening.screeningStatus, "COLLECTED_ONLY");
   assert.equal(removableResult.jobs[0].aiReview.reason, "run_ai_review_disabled");
+  await assert.rejects(
+    request("/api/jobs/retry-failed-jd", { jobIds: [removableResult.jobs[0].id] }),
+    /None of the selected jobs still need JD retrieval/
+  );
   const duplicateRun = await request("/api/runs", { routineTaskIds: [removableDailyTask.routineTask.id] });
   const duplicateClaim = await request("/api/worker/next?runId=" + duplicateRun.run.id + "&platform=seek&workerId=duplicate-test-worker");
   const duplicateResult = await request("/api/worker/result", {

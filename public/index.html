@@ -68,8 +68,8 @@
               <p id="jobs-summary">目前没有未审阅完成的任务</p>
             </div>
             <div class="jobs-heading-actions">
-              <button class="button button-secondary" id="retry-failed-ai-reviews" type="button" hidden><i data-lucide="refresh-cw"></i><span>重新审阅 AI 失败项</span></button>
-              <button class="button button-secondary" id="retry-failed-jds" type="button" hidden><i data-lucide="files"></i><span>重试失败 JD</span></button>
+              <button class="button button-secondary" id="retry-failed-ai-reviews" type="button" hidden><i data-lucide="refresh-cw"></i><span>重审全部 AI 失败项</span></button>
+              <button class="button button-secondary" id="retry-failed-jds" type="button" hidden><i data-lucide="files"></i><span>获取全部缺失 JD</span></button>
               <button class="button button-secondary" id="open-import"><i data-lucide="file-input"></i><span>导入职位结果</span></button>
             </div>
           </div>
@@ -135,7 +135,11 @@
             <label><span>平台</span><select id="job-source"><option value="">全部平台</option><option value="linkedin">LinkedIn</option><option value="indeed">Indeed</option><option value="seek">SEEK</option><option value="manual">手动</option></select></label>
               <label><span>筛查状态</span><select id="job-status"><option value="">全部</option><option value="COLLECTED_ONLY">仅采集，未启用 AI</option><option value="JD_FETCHING">正在获取 JD</option><option value="AI_QUEUED">AI 排队中</option><option value="AI_REVIEWING">AI 审阅中</option><option value="AI_RETRY_WAIT">AI 稍后重试</option><option value="JD_FETCH_FAILED">JD 获取失败</option><option value="AI_NOT_CONFIGURED">等待 AI 配置</option><option value="PROFILE_REQUIRED">等待职业画像</option><option value="NEEDS_JD_REVIEW">待 JD 审阅</option><option value="JD_SCREENED">已审阅 JD</option><option value="TITLE_SCREENED">标题已筛查</option><option value="AI_ERROR">AI 错误</option></select></label>
             <label><span>查看进度</span><select id="job-viewed"><option value="unviewed">未看（默认）</option><option value="viewed">已看</option><option value="all">全部</option></select></label>
-            <label><span>排序</span><select id="job-sort"><option value="priority">Strong 优先</option><option value="discoveredAt">最新发现</option><option value="score">匹配分数</option><option value="source">平台</option><option value="company">公司</option><option value="title">职位名称</option></select></label>
+            <label><span>排序</span><select id="job-sort"><option value="priority">Strong 优先</option><option value="discoveredAt">最新发现</option><option value="distance" id="distance-sort-option" hidden>距离最近</option><option value="score">匹配分数</option><option value="source">平台</option><option value="company">公司</option><option value="title">职位名称</option></select></label>
+          </div>
+          <div class="distance-toolbar" id="distance-toolbar">
+            <span id="distance-progress" role="status" aria-live="polite"></span>
+            <div class="inline-actions"><button class="button button-secondary" id="distance-calculate" type="button" hidden><i data-lucide="map-pin"></i><span>计算当前列表距离</span></button><button class="button button-quiet" id="distance-cancel" type="button" hidden><i data-lucide="square"></i><span>停止</span></button><button class="button button-quiet" id="distance-open-settings" type="button"><i data-lucide="settings-2"></i><span>距离设置</span></button></div>
           </div>
           <div class="data-table-wrap" id="jobs-list-table">
             <table class="data-table jobs-table">
@@ -250,6 +254,20 @@
             </div>
             <div class="topbar-actions"><label class="compact-select"><span>画像</span><select id="settings-profile-select" aria-label="设置对应画像"></select></label><button class="button button-secondary" id="install-workers"><i data-lucide="wrench"></i><span>Worker 安装</span></button><button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button></div>
           </div>
+          <section class="settings-section" id="distance-settings-section">
+            <div class="setting-label"><h3>工作距离</h3><p>可选 · 直线距离，不代表通勤路程或时间</p></div>
+            <div class="distance-settings-fields">
+              <label class="profile-copy-option"><input id="distance-enabled" type="checkbox"><span>启用距离查询</span></label>
+              <label class="field full"><span>家庭地址 / 出发地址</span><input id="distance-home" maxlength="300" autocomplete="off" placeholder="Street address, suburb, state, postcode"></label>
+              <label class="field"><span>地址国家</span><select id="distance-country"><option value="au">Australia</option><option value="nz">New Zealand</option></select></label>
+              <label class="field"><span>Geoapify API Key</span><input id="distance-api-key" type="password" autocomplete="new-password" maxlength="300" placeholder="填写新 Key；留空保留已保存 Key"></label>
+              <p class="form-note full">地址保存在本机。点击定位或计算时，会将地址发送至 Geoapify；不发送简历，不消耗 AI token。<a href="https://myprojects.geoapify.com/" target="_blank" rel="noopener noreferrer">获取 API Key</a></p>
+              <div class="inline-actions full"><button class="button button-secondary" id="distance-find-home" type="button"><i data-lucide="map-pin"></i><span>保存并定位地址</span></button><button class="button button-quiet" id="distance-save" type="button">保存距离设置</button><button class="button button-quiet" id="distance-clear-key" type="button">移除 Key</button></div>
+              <div id="distance-candidates-panel" class="full" hidden><label class="field"><span>确认出发位置</span><select id="distance-candidates"></select></label><button class="button button-secondary" id="distance-confirm-home" type="button"><i data-lucide="check"></i><span>使用此位置</span></button></div>
+              <p class="form-note full" id="distance-origin-status" role="status"></p>
+              <p class="form-note full">Geocoding by <a href="https://www.geoapify.com/" target="_blank" rel="noopener noreferrer">Geoapify</a> · <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors</a></p>
+            </div>
+          </section>
           <section class="settings-section">
             <div class="setting-label"><h3>执行方式</h3><p>同一平台始终只执行一项任务</p></div>
             <div class="agent-schedule-fields">
@@ -467,13 +485,21 @@
     <dialog id="run-confirmation-dialog" class="dialog run-confirmation-dialog">
       <form id="run-confirmation-form">
         <div class="dialog-heading"><div><p class="eyebrow">启动前检查</p><h2>确认本次运行方式</h2></div><button class="icon-button" type="button" data-close-dialog="run-confirmation-dialog" title="关闭"><i data-lucide="x"></i></button></div>
-        <p class="confirm-copy">选择本次是否自动获取 JD 并进行 AI 审阅。运行方式、画像和排除词会固定保存在本次运行中。</p>
+        <p class="confirm-copy">选择本次是否启用 AI 审阅和距离查询。运行方式、画像和排除词会固定保存在本次运行中。</p>
         <fieldset class="run-mode-fieldset">
           <legend>AI 审阅</legend>
           <div class="run-mode-options">
             <label class="run-mode-option"><input type="radio" name="run-ai-review" value="enabled" checked><span><strong><i data-lucide="sparkles"></i>启用 AI 审阅</strong><small>本地筛查后获取候选职位的完整 JD，并使用所选画像评分。</small></span></label>
             <label class="run-mode-option"><input type="radio" name="run-ai-review" value="disabled"><span><strong><i data-lucide="inbox"></i>仅采集职位</strong><small>只执行搜索、统一去重和本地标题筛查；不获取 JD，也不调用 AI。</small></span></label>
           </div>
+        </fieldset>
+        <fieldset class="run-mode-fieldset">
+          <legend>工作距离</legend>
+          <div class="run-mode-options">
+            <label class="run-mode-option"><input type="radio" name="run-distance" value="disabled" checked><span><strong><i data-lucide="map-pin-off"></i>本次不查询距离</strong><small>默认选项；不发送地址，也不调用地图服务。</small></span></label>
+            <label class="run-mode-option"><input type="radio" name="run-distance" value="enabled"><span><strong><i data-lucide="map-pin"></i>本次自动查询距离</strong><small>职位回传并去重后，按已确认的出发点计算直线距离。</small></span></label>
+          </div>
+          <p class="form-note" id="run-distance-status"></p>
         </fieldset>
         <label class="field full"><span>本次使用的画像</span><select id="run-profile-select"></select></label>
         <div class="run-exclusion-review" id="run-exclusion-review"></div>
@@ -527,5 +553,15 @@
     </dialog>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <dialog id="distance-address-dialog" class="dialog confirm-dialog">
+      <form id="distance-address-form">
+        <div class="dialog-heading"><h2>工作地址</h2><button class="icon-button" type="button" data-close-dialog="distance-address-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+        <p id="distance-job-title"></p>
+        <p id="distance-job-detail" class="form-note"></p>
+        <label class="field full"><span>实际工作地址</span><input id="distance-job-address" maxlength="300" placeholder="留空则使用职位中提供的地点"></label>
+        <input id="distance-job-id" type="hidden">
+        <div class="dialog-actions"><button class="button button-secondary" id="distance-calculate-one" type="button"><i data-lucide="map-pin"></i><span>保存并计算距离</span></button><button class="button button-primary" type="submit"><i data-lucide="save"></i><span>保存地址</span></button></div>
+      </form>
+    </dialog>
   </body>
 </html>
