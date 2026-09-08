@@ -302,6 +302,54 @@ test("AI data is validated and category is derived from the configured threshold
   assert.equal(categoryForScore(29, thresholds), "REJECTED");
 });
 
+test("standard scoring protocol recomputes the total from fixed dimensions", () => {
+  const screening = validateScreening({
+    scoreProtocolVersion: 1,
+    titleClassification: "CLEAR_MATCH",
+    score: 99,
+    reason: "岗位方向明确，技能与项目证据较充分。",
+    matchedAreas: ["Python", "backend development"],
+    concerns: ["商业经验仍有限"],
+    jdReviewed: true,
+    scoreBreakdown: {
+      roleAlignment: { score: 28, maxScore: 999, reason: "岗位方向符合。", evidence: ["Graduate Software Engineer"] },
+      skillsMatch: { score: 23, maxScore: 1, reason: "核心技能匹配。", evidence: ["Python", "SQL", "Python"] },
+      experienceEvidence: { score: 17, reason: "项目提供相关证据。", evidence: ["后端项目"] },
+      requirementsFit: { score: 14, reason: "主要要求符合。", evidence: ["相关学位"] },
+      preferenceFit: { score: 9, reason: "符合明确偏好。", evidence: ["Hybrid"] }
+    },
+    workRights: { assessment: "NOT_STATED", reason: "JD 未说明工作权利要求。", requirements: [] }
+  }, { thresholds });
+
+  assert.equal(screening.score, 91);
+  assert.equal(screening.roleFitScore, 91);
+  assert.equal(screening.scoreProtocolVersion, 1);
+  assert.equal(screening.category, "STRONG_MATCH");
+  assert.equal(screening.scoreBreakdown.roleAlignment.maxScore, 30);
+  assert.equal(screening.scoreBreakdown.skillsMatch.maxScore, 25);
+  assert.deepEqual(screening.scoreBreakdown.skillsMatch.evidence, ["Python", "SQL"]);
+});
+
+test("standard scoring protocol clamps dimension scores and requires every dimension", () => {
+  const input = {
+    score: 50,
+    reason: "评分已完成。",
+    scoreBreakdown: {
+      skillsMatch: { score: 40, reason: "技能符合。", evidence: [] },
+      experienceEvidence: { score: -4, reason: "缺少证据。", evidence: [] },
+      requirementsFit: { score: 15, reason: "要求符合。", evidence: [] },
+      preferenceFit: { score: 10, reason: "偏好符合。", evidence: [] }
+    }
+  };
+  assert.throws(() => validateScreening(input, { thresholds }), /roleAlignment/);
+
+  input.scoreBreakdown.roleAlignment = { score: 30, reason: "岗位方向符合。", evidence: [] };
+  const screening = validateScreening(input, { thresholds });
+  assert.equal(screening.scoreBreakdown.skillsMatch.score, 25);
+  assert.equal(screening.scoreBreakdown.experienceEvidence.score, 0);
+  assert.equal(screening.score, 80);
+});
+
 test("AI work-rights conclusions reject only explicit incompatibility", () => {
   const screening = validateScreening({
     titleClassification: "CLEAR_MATCH",

@@ -8,6 +8,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   aiPrivateConfig,
+  aiConcurrencyLimit,
   aiStatus,
   answerJobQuestions,
   configureAi,
@@ -15,8 +16,10 @@ import {
   generateCoverLetter,
   generateProfile,
   isTransientAiError,
+  prepareAiReviewConnections,
   reflectOnJobFeedback,
-  testAiConnection
+  testAiConnection,
+  testSavedAiConnection
 } from "./src/ai.mjs";
 import {
   localJdScreen,
@@ -56,6 +59,11 @@ const platformJobTypes = {
     "temp-to-perm", "fixed-term", "graduate", "seasonal", "contract", "subcontract", "student-job"
   ])
 };
+const platformSearchRadiiKm = {
+  linkedin: new Set(),
+  seek: new Set([0, 2, 5, 10, 25, 30, 50, 100]),
+  indeed: new Set([0, 5, 10, 15, 25, 50, 100])
+};
 
 await loadDotEnv(join(root, ".env"));
 await loadSavedAiConfig();
@@ -81,6 +89,7 @@ await storage.update((state) => {
   state.coverLetters ??= [];
   migrateKeywordAlternatives(state);
   migrateTaskJobTypes(state);
+  migrateTaskSearchRadii(state);
   for (const profile of state.profiles) {
     backfillPreferenceExclusionSuggestions(state, profile.id);
     compactPendingExclusionSuggestions(state, profile.id);
@@ -126,15 +135,168 @@ async function loadSavedAiConfig() {
 function mergedAiConfig(input = {}, clearApiKey = false) {
   const current = aiPrivateConfig();
   const suppliedKey = String(input.apiKey ?? "").trim();
+  const apiKeys = clearApiKey
+    ? []
+    : Array.isArray(input.apiKeys)
+      ? input.apiKeys
+      : suppliedKey
+        ? [...(current.apiKeys ?? []), {
+            id: `key-${randomUUID()}`,
+            label: `Key ${(current.apiKeys?.length || 0) + 1}`,
+            secret: suppliedKey,
+            baseUrl: input.baseUrl ?? current.baseUrl,
+            model: input.model ?? current.model,
+            wireApi: input.wireApi ?? current.wireApi,
+            enabled: true,
+            createdAt: new Date().toISOString()
+          }]
+        : current.apiKeys;
   return {
     baseUrl: input.baseUrl ?? current.baseUrl,
     model: input.model ?? current.model,
     wireApi: input.wireApi ?? current.wireApi,
-    apiKey: clearApiKey ? "" : suppliedKey || current.apiKey
+    maxConcurrency: input.maxConcurrency ?? current.maxConcurrency,
+    budget: { ...(current.budget ?? {}), ...(input.budget ?? {}) },
+    apiKeys
   };
 }
 
+function importedWireApi(value, lineNumber) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s/-]+/g, "_");
+  if (["responses", "response", "responses_api"].some((item) => item === normalized)) return "responses";
+  if (["chat", "chat_completions", "chat_completion", "chat_completions_api"].some((item) => item === normalized)) return "chat_completions";
+  throw new Error(`Line ${lineNumber} must use Responses or Chat Completions as its API type.`);
+}
+
+function aiConnectionName(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+function aiConnectionNameKey(value) {
+  return aiConnectionName(value).normalize("NFKC").toLowerCase();
+}
+
+function parseAiKeyImport(input, currentKeys = [], defaults = {}) {
+  const text = String(input || "").trim();
+  if (!text) throw new Error("Paste at least one AI connection.");
+  let rows;
+  if (text.startsWith("[")) {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) throw new Error("The JSON import must be an array.");
+    rows = parsed;
+  } else {
+    rows = text.split(/\r?\n/).map((line, index) => {
+      const clean = line.trim();
+      if (!clean) return null;
+      const cleanField = (value) => String(value || "").trim().replace(/^['"]|['"]$/g, "");
+      if (!clean.includes("|")) {
+        const legacy = clean.split(/[\t,]/).map(cleanField);
+        if (legacy.length === 1) return { secret: legacy[0] };
+        if (legacy.length === 2) return { label: legacy[0], secret: legacy[1] };
+        throw new Error(`Line ${index + 1} must use | between connection fields.`);
+      }
+      const fields = clean.split("|").map(cleanField);
+      if (fields.length === 2) {
+        const [label, secret] = fields;
+        return { label, secret };
+      }
+      if (fields.length === 5) {
+        const [label, secret, baseUrl, model, wireApi] = fields;
+        return { label, secret, baseUrl, model, wireApi };
+      }
+      if (fields.length === 4) {
+        if (/^https?:\/\//i.test(fields[0])) {
+          const [baseUrl, model, wireApi, secret] = fields;
+          return { secret, baseUrl, model, wireApi };
+        }
+        const [secret, baseUrl, model, wireApi] = fields;
+        return { secret, baseUrl, model, wireApi };
+      }
+      throw new Error(`Line ${index + 1} must contain API Key, Base URL, model, and API type; the name is optional.`);
+    }).filter(Boolean);
+  }
+  if (rows.length > 50) throw new Error("Import up to 50 AI connections at a time.");
+  const connectionIdentity = (item) => [
+    String(item.secret || ""),
+    String(item.baseUrl || "").replace(/\/$/, "").toLowerCase(),
+    String(item.model || "").toLowerCase(),
+    item.wireApi
+  ].join("\u0000");
+  const existingConnections = new Set(currentKeys.map(connectionIdentity));
+  const importedConnections = new Set();
+  const usedNames = new Set(currentKeys.map((key) => aiConnectionNameKey(key.label)));
+  const imported = rows.map((raw, index) => {
+    const item = typeof raw === "string" ? { secret: raw } : raw;
+    const secret = String(item?.secret ?? item?.apiKey ?? item?.key ?? "").trim();
+    if (secret.length < 8) throw new Error(`Line ${index + 1} does not contain a valid API key.`);
+    const baseUrl = String(item?.baseUrl ?? defaults.baseUrl ?? "").trim().replace(/\/$/, "");
+    if (!baseUrl) throw new Error(`Line ${index + 1} does not contain an API Base URL.`);
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(baseUrl);
+    } catch {
+      throw new Error(`Line ${index + 1} contains an invalid API Base URL.`);
+    }
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error(`Line ${index + 1} API Base URL must use http or https.`);
+    const model = String(item?.model ?? defaults.model ?? "").trim().slice(0, 160);
+    if (!model) throw new Error(`Line ${index + 1} does not contain a model.`);
+    const wireApi = importedWireApi(item?.wireApi ?? item?.apiType ?? defaults.wireApi, index + 1);
+    const connection = {
+      id: `key-${randomUUID()}`,
+      label: aiConnectionName(item?.label),
+      secret,
+      baseUrl,
+      model,
+      wireApi,
+      enabled: item?.enabled !== false,
+      createdAt: new Date().toISOString()
+    };
+    const identity = connectionIdentity(connection);
+    if (existingConnections.has(identity) || importedConnections.has(identity)) return null;
+    if (!connection.label) {
+      let number = 1;
+      while (usedNames.has(aiConnectionNameKey(`Key ${number}`))) number += 1;
+      connection.label = `Key ${number}`;
+    }
+    const nameKey = aiConnectionNameKey(connection.label);
+    if (usedNames.has(nameKey)) throw new Error(`AI connection name already exists: ${connection.label}`);
+    usedNames.add(nameKey);
+    importedConnections.add(identity);
+    return connection;
+  }).filter(Boolean);
+  if (currentKeys.length + imported.length > 50) throw new Error("The AI connection pool supports up to 50 connections in total.");
+  return imported;
+}
+
+function exportAiConnections(connections) {
+  const requiredField = (value, field) => {
+    const text = String(value || "").trim();
+    if (!text || /[|\r\n]/.test(text)) throw new Error(`${field} contains characters that cannot be exported in the batch-import format.`);
+    return text;
+  };
+  return connections.map((connection) => {
+    const label = String(connection.label || "AI connection").replace(/[|\r\n]+/g, " ").replace(/\s+/g, " ").trim() || "AI connection";
+    return [
+      label,
+      requiredField(connection.secret, "API key"),
+      requiredField(connection.baseUrl, "API Base URL"),
+      requiredField(connection.model, "Model"),
+      requiredField(connection.wireApi, "API type")
+    ].join(" | ");
+  }).join("\n");
+}
+
 async function saveAiConfig(config) {
+  const currentKeys = aiPrivateConfig().apiKeys ?? [];
+  const keys = config.apiKeys ?? [];
+  for (const key of keys) {
+    const nameKey = aiConnectionNameKey(key.label);
+    const previous = currentKeys.find((item) => item.id === key.id);
+    if (previous && aiConnectionNameKey(previous.label) === nameKey) continue;
+    if (keys.some((other) => other !== key && aiConnectionNameKey(other.label) === nameKey)) {
+      throw new Error(`AI connection name already exists: ${aiConnectionName(key.label)}`);
+    }
+  }
   configureAi(config);
   await mkdir(dataDirectory, { recursive: true });
   await writeFile(aiConfigPath, JSON.stringify(aiPrivateConfig(), null, 2) + "\n", { mode: 0o600 });
@@ -315,7 +477,10 @@ function buildBootstrap(state) {
       jobIds: batch.jobIds,
       createdAt: batch.createdAt
     })),
-    ai: aiStatus()
+    ai: {
+      ...aiStatus(),
+      queue: { waiting: autoReviewQueue.length, running: autoReviewRunning }
+    }
   };
 }
 
@@ -476,18 +641,50 @@ function safeSettings(input) {
 
 const supportedPostedWithinDays = new Set([0, 1, 3, 7, 14, 30]);
 
+function normalizedSearchRadiusKm(value) {
+  if (value === null || value === undefined || value === "" || value === "any") return null;
+  const radius = Number(value);
+  return Number.isInteger(radius) && radius >= 0 ? radius : Number.NaN;
+}
+
+function locationSupportsSearchRadius(location) {
+  const normalized = String(location ?? "")
+    .toLowerCase()
+    .replace(/[.,/()_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized || normalized.length < 3) return false;
+  if (/^(all\b|remote\b|anywhere\b|nationwide\b)/.test(normalized)) return false;
+  const broadLocations = new Set([
+    "australia", "australia wide", "new south wales", "new south wales australia", "nsw", "nsw australia",
+    "victoria", "victoria australia", "vic", "vic australia", "queensland", "queensland australia", "qld", "qld australia",
+    "south australia", "south australia australia", "sa", "sa australia", "western australia", "western australia australia", "wa", "wa australia",
+    "tasmania", "tasmania australia", "tas", "tas australia", "northern territory", "northern territory australia", "nt", "nt australia",
+    "australian capital territory", "australian capital territory australia", "act", "act australia"
+  ]);
+  return !broadLocations.has(normalized);
+}
+
 function safeRoutineTaskInput(input) {
   const platform = String(input.platform ?? "").toLowerCase();
   const keyword = normalizeKeywordAlternatives(String(input.keyword ?? "").slice(0, 160));
   const location = String(input.location ?? "").trim().slice(0, 120);
   const postedWithinDays = Number(input.postedWithinDays ?? 0);
   const jobType = String(input.jobType ?? "any").toLowerCase().trim() || "any";
+  const searchRadiusKm = normalizedSearchRadiusKm(input.searchRadiusKm);
   if (!allowedPlatforms.has(platform)) throw new Error("Choose LinkedIn, Indeed, or SEEK.");
   if (!keyword) throw new Error("Enter a job keyword.");
   if (!location) throw new Error("Enter a location.");
   if (!supportedPostedWithinDays.has(postedWithinDays)) throw new Error("Choose a supported posted-within value.");
   if (!platformJobTypes[platform].has(jobType)) throw new Error(`${platform} does not support the selected job type.`);
-  return { platform, keyword, location, postedWithinDays, jobType };
+  if (Number.isNaN(searchRadiusKm)) throw new Error("Choose a supported search radius.");
+  if (searchRadiusKm !== null && !platformSearchRadiiKm[platform].has(searchRadiusKm)) {
+    throw new Error(`${platform} does not support the selected search radius.`);
+  }
+  if (searchRadiusKm !== null && !locationSupportsSearchRadius(location)) {
+    throw new Error("Search radius requires a specific city, suburb, postcode, or street address. Broad regions such as Australia, a state, Remote, or All locations are not supported.");
+  }
+  return { platform, keyword, location, postedWithinDays, jobType, searchRadiusKm };
 }
 
 function migrateKeywordAlternatives(state) {
@@ -546,12 +743,32 @@ function migrateTaskJobTypes(state) {
   }
 }
 
+function migrateTaskSearchRadii(state) {
+  const migrate = (task) => {
+    const radius = normalizedSearchRadiusKm(task.searchRadiusKm);
+    task.searchRadiusKm = Number.isNaN(radius)
+      || (radius !== null && (!platformSearchRadiiKm[task.platform]?.has(radius) || !locationSupportsSearchRadius(task.location)))
+      ? null
+      : radius;
+  };
+  for (const collection of [state.validations, state.routineTasks]) {
+    for (const task of collection ?? []) migrate(task);
+  }
+  for (const category of state.taskCategories ?? []) {
+    for (const task of category.tasks ?? []) migrate(task);
+  }
+  for (const run of state.runs ?? []) {
+    for (const task of run.tasks ?? []) migrate(task);
+  }
+}
+
 function sameRoutineTask(left, right) {
   return left?.platform === right?.platform
     && left?.keyword === right?.keyword
     && left?.location === right?.location
     && Number(left?.postedWithinDays) === Number(right?.postedWithinDays)
-    && String(left?.jobType ?? "any") === String(right?.jobType ?? "any");
+    && String(left?.jobType ?? "any") === String(right?.jobType ?? "any")
+    && normalizedSearchRadiusKm(left?.searchRadiusKm) === normalizedSearchRadiusKm(right?.searchRadiusKm);
 }
 
 const helpfulFeedbackReasons = new Set(["ROLE_RELEVANT", "SKILL_MATCH", "WOULD_APPLY", "REJECTION_CORRECT"]);
@@ -871,7 +1088,7 @@ function safeTaskCategoryInput(input, existing = null, state = null) {
   const usedTaskKeys = new Set();
   const tasks = incomingTasks.map((task) => {
     const taskInput = safeRoutineTaskInput(task);
-    const taskKey = [taskInput.platform, taskInput.keyword, taskInput.location.toLowerCase(), taskInput.postedWithinDays].join("\u0000");
+    const taskKey = [taskInput.platform, taskInput.keyword, taskInput.location.toLowerCase(), taskInput.postedWithinDays, taskInput.jobType, taskInput.searchRadiusKm ?? "any"].join("\u0000");
     if (usedTaskKeys.has(taskKey)) throw new Error("The same task cannot be added to a combination twice.");
     usedTaskKeys.add(taskKey);
     const requestedId = String(task.id ?? "");
@@ -926,6 +1143,7 @@ function createRoutineTask(validation) {
     location: validation.location,
     postedWithinDays: validation.postedWithinDays,
     jobType: validation.jobType || "any",
+    searchRadiusKm: normalizedSearchRadiusKm(validation.searchRadiusKm),
     enabled: true,
     status: "READY",
     createdAt: new Date().toISOString()
@@ -1547,11 +1765,16 @@ async function drainAutoReviewQueue() {
   let cooldownMs = 0;
   try {
     while (autoReviewQueue.length) {
-      const jobId = autoReviewQueue.shift();
-      queuedAutoReviewIds.delete(jobId);
-      const result = await processAutoReview(jobId);
-      if (result?.transientError) {
-        if (result.willRetry) {
+      if (!await prepareAiReviewConnections()) {
+        cooldownMs = 60_000;
+        break;
+      }
+      const batch = autoReviewQueue.splice(0, aiConcurrencyLimit());
+      for (const jobId of batch) queuedAutoReviewIds.delete(jobId);
+      const results = await Promise.all(batch.map(async (jobId) => ({ jobId, result: await processAutoReview(jobId) })));
+      const retryIds = results.filter((item) => item.result?.transientError && item.result.willRetry).map((item) => item.jobId);
+      if (retryIds.length) {
+        for (const jobId of retryIds.reverse()) {
           queuedAutoReviewIds.add(jobId);
           autoReviewQueue.unshift(jobId);
         }
@@ -1824,6 +2047,7 @@ function createRun(state, routineTaskIds = null, requestedProfileId = null, requ
     priority: index + 1,
     postedWithinDays: task.postedWithinDays,
     jobType: task.jobType || "any",
+    searchRadiusKm: normalizedSearchRadiusKm(task.searchRadiusKm),
     aiReviewEnabled,
     distanceEnabled,
     exclusionKeywords: [...context.exclusionKeywords],
@@ -2093,6 +2317,120 @@ async function handleApi(request, response, url) {
       context: body.context
     });
     return sendJson(response, 200, result);
+  }
+  if (request.method === "POST" && path === "/api/ai-config/keys/import") {
+    const body = await readJson(request);
+    const current = aiPrivateConfig();
+    const imported = parseAiKeyImport(body.text, current.apiKeys ?? [], current);
+    if (!imported.length) return sendJson(response, 200, { imported: 0, duplicates: true, ai: aiStatus() });
+    const ai = await saveAiConfig(mergedAiConfig({ apiKeys: [...(current.apiKeys ?? []), ...imported] }));
+    const ids = await storage.update((state) => prepareAutoReviewJobs(
+      state,
+      state.jobs.filter((job) => ["AI_NOT_CONFIGURED", "AI_ERROR"].includes(job.screening?.screeningStatus))
+    ));
+    enqueueAutoReviews(ids);
+    return sendJson(response, 200, { imported: imported.length, duplicates: false, ai });
+  }
+  if (request.method === "POST" && path === "/api/ai-config/keys") {
+    const body = await readJson(request);
+    const current = aiPrivateConfig();
+    const [connection] = parseAiKeyImport(JSON.stringify([body]), current.apiKeys ?? [], current);
+    if (!connection) return sendJson(response, 200, { imported: 0, duplicates: true, ai: aiStatus() });
+    const ai = await saveAiConfig(mergedAiConfig({ apiKeys: [...(current.apiKeys ?? []), connection] }));
+    const ids = await storage.update((state) => prepareAutoReviewJobs(
+      state,
+      state.jobs.filter((job) => ["AI_NOT_CONFIGURED", "AI_ERROR"].includes(job.screening?.screeningStatus))
+    ));
+    enqueueAutoReviews(ids);
+    return sendJson(response, 201, { imported: 1, duplicates: false, ai });
+  }
+  if (request.method === "POST" && path === "/api/ai-config/keys/export") {
+    const body = await readJson(request);
+    const ids = [...new Set((Array.isArray(body.ids) ? body.ids : []).map((id) => String(id || "").trim()).filter(Boolean))].slice(0, 50);
+    if (!ids.length) throw new Error("Select at least one AI connection to export.");
+    const selectedIds = new Set(ids);
+    const connections = (aiPrivateConfig().apiKeys ?? []).filter((connection) => selectedIds.has(connection.id));
+    if (!connections.length) throw new Error("The selected AI connections were not found.");
+    return sendJson(response, 200, { count: connections.length, text: exportAiConnections(connections) });
+  }
+  if (request.method === "POST" && path === "/api/ai-config/keys/test-all") {
+    const current = aiPrivateConfig();
+    const connections = current.apiKeys ?? [];
+    const results = new Array(connections.length);
+    let cursor = 0;
+    const redactConnectionError = (error) => {
+      let message = String(error?.message || error || "Connection test failed.");
+      for (const connection of connections) {
+        if (connection.secret) message = message.split(connection.secret).join("[REDACTED]");
+      }
+      return message.slice(0, 320);
+    };
+    const testNext = async () => {
+      while (cursor < connections.length) {
+        const index = cursor;
+        cursor += 1;
+        const connection = connections[index];
+        if (!connection.baseUrl || !connection.model || !connection.secret) {
+          results[index] = { id: connection.id, label: connection.label, ok: false, error: "Connection settings are incomplete." };
+          continue;
+        }
+        try {
+          const test = await testSavedAiConnection(connection);
+          results[index] = { id: connection.id, label: connection.label, ok: true, usage: test.usage };
+        } catch (error) {
+          results[index] = { id: connection.id, label: connection.label, ok: false, error: redactConnectionError(error) };
+        }
+      }
+    };
+    const concurrency = Math.max(1, Math.min(4, Number(current.maxConcurrency) || connections.length, connections.length || 1));
+    await Promise.all(Array.from({ length: concurrency }, testNext));
+    const passed = results.filter((item) => item.ok).length;
+    return sendJson(response, 200, { tested: results.length, passed, failed: results.length - passed, results });
+  }
+  const aiKeyTestMatch = /^\/api\/ai-config\/keys\/([^/]+)\/test$/.exec(path);
+  if (request.method === "POST" && aiKeyTestMatch) {
+    const body = await readJson(request);
+    const current = aiPrivateConfig();
+    const key = (current.apiKeys ?? []).find((item) => item.id === aiKeyTestMatch[1]);
+    if (!key) throw new Error("AI key was not found.");
+    const result = await testSavedAiConnection(key);
+    return sendJson(response, 200, { ...result, keyId: key.id, ai: aiStatus() });
+  }
+  const aiKeyMatch = /^\/api\/ai-config\/keys\/([^/]+)$/.exec(path);
+  if (request.method === "PATCH" && aiKeyMatch) {
+    const body = await readJson(request);
+    const current = aiPrivateConfig();
+    const key = (current.apiKeys ?? []).find((item) => item.id === aiKeyMatch[1]);
+    if (!key) throw new Error("AI key was not found.");
+    if (body.label !== undefined) key.label = String(body.label || "API key").replace(/\s+/g, " ").trim().slice(0, 80) || "API key";
+    if (body.enabled !== undefined) key.enabled = body.enabled === true;
+    if (body.baseUrl !== undefined) key.baseUrl = body.baseUrl;
+    if (body.model !== undefined) key.model = body.model;
+    if (body.wireApi !== undefined) key.wireApi = body.wireApi;
+    if (String(body.apiKey || "").trim()) {
+      const replacementKey = String(body.apiKey).trim();
+      if (replacementKey.length < 8) throw new Error("The replacement API key is invalid.");
+      key.secret = replacementKey;
+    }
+    return sendJson(response, 200, { ai: await saveAiConfig(mergedAiConfig({ apiKeys: current.apiKeys })) });
+  }
+  if (request.method === "DELETE" && aiKeyMatch) {
+    const current = aiPrivateConfig();
+    const nextKeys = (current.apiKeys ?? []).filter((item) => item.id !== aiKeyMatch[1]);
+    if (nextKeys.length === (current.apiKeys ?? []).length) throw new Error("AI key was not found.");
+    return sendJson(response, 200, { ai: await saveAiConfig(mergedAiConfig({ apiKeys: nextKeys })) });
+  }
+  if (request.method === "PATCH" && path === "/api/ai-config/scheduling") {
+    const body = await readJson(request);
+    if (!Number.isInteger(body.maxConcurrency) || body.maxConcurrency < 0 || body.maxConcurrency > 50) {
+      throw new Error("AI concurrency must be an integer between 0 and 50.");
+    }
+    return sendJson(response, 200, { ai: await saveAiConfig(mergedAiConfig({ maxConcurrency: body.maxConcurrency })) });
+  }
+  if (request.method === "PATCH" && path === "/api/ai-config/budget") {
+    const body = await readJson(request);
+    if (!body.budget || typeof body.budget !== "object" || Array.isArray(body.budget)) throw new Error("Invalid AI budget settings.");
+    return sendJson(response, 200, { ai: await saveAiConfig(mergedAiConfig({ budget: body.budget })) });
   }
   if (request.method === "PUT" && path === "/api/ai-config") {
     const body = await readJson(request);

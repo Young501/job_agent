@@ -25,6 +25,7 @@
           <button class="nav-item" data-view="profile"><i data-lucide="contact-round"></i><span>职业画像</span></button>
           <button class="nav-item" data-view="exclusions"><i data-lucide="ban"></i><span>排除关键词</span></button>
           <button class="nav-item" data-view="settings"><i data-lucide="sliders-horizontal"></i><span>搜索设置</span></button>
+          <button class="nav-item" data-view="ai"><i data-lucide="cpu"></i><span>AI 服务</span></button>
           <button class="nav-item" data-view="setup"><i data-lucide="wrench"></i><span>安装设置</span></button>
         </nav>
         <div class="sidebar-footer">
@@ -275,7 +276,7 @@
           <div class="section-heading">
             <div>
               <h2>运行与匹配</h2>
-              <p>运行方式、AI 服务和匹配阈值</p>
+              <p>运行方式、访问节奏和匹配阈值</p>
             </div>
             <div class="topbar-actions"><label class="compact-select"><span>学习画像</span><select id="settings-profile-select" aria-label="AI 学习偏好对应画像"></select></label><button class="button button-secondary" id="install-workers"><i data-lucide="wrench"></i><span>Worker 安装</span></button><button class="button button-primary" id="save-settings"><i data-lucide="save"></i><span>保存设置</span></button></div>
           </div>
@@ -331,25 +332,81 @@
             <div class="setting-label"><h3>AI 学习偏好</h3><p>展示最近一次人工审阅复盘形成的匹配偏好；机器信号保持英文。</p></div>
             <div class="preference-learning-panel" id="settings-learning-content"></div>
           </section>
-          <section class="settings-section">
-            <div class="setting-label"><h3>AI 服务</h3><p>密钥仅保存在本机后端，不会回显到页面</p></div>
+        </section>
+
+        <section class="view" id="view-ai">
+          <div class="profile-tabs" role="tablist" aria-label="AI 服务设置">
+            <button class="profile-tab is-active" id="ai-connections-tab" role="tab" aria-selected="true" aria-controls="ai-connections-panel" data-ai-pane="connections"><i data-lucide="network"></i>连接管理</button>
+            <button class="profile-tab" id="ai-budget-tab" role="tab" aria-selected="false" aria-controls="ai-budget-panel" data-ai-pane="budget" tabindex="-1"><i data-lucide="sliders-horizontal"></i>Token 设置</button>
+          </div>
+          <div id="ai-connections-panel" role="tabpanel" aria-labelledby="ai-connections-tab">
+          <div class="section-heading ai-service-heading">
+            <div>
+              <h2>AI 连接池</h2>
+              <p>每条连接可使用不同的服务地址、模型、API 类型和密钥</p>
+            </div>
+          </div>
+
+          <section class="ai-service-summary" aria-label="AI 服务状态">
+            <div><span>服务状态</span><strong id="ai-service-health">未配置</strong></div>
+            <div><span>启用连接</span><strong id="ai-enabled-key-count">0</strong></div>
+            <div><span>并行上限</span><strong id="ai-effective-concurrency">1</strong></div>
+            <div><span>审阅队列</span><strong id="ai-queue-count">0</strong></div>
+          </section>
+
+          <section class="settings-section ai-service-settings">
+            <div class="setting-label"><h3>调度设置</h3><p>连接会独立轮换，实际并行数不超过可用连接数</p></div>
             <div class="ai-config-panel">
-              <div class="ai-config-grid">
-                <label class="field"><span>API Base URL</span><input id="ai-base-url" type="url" placeholder="https://api.openai.com/v1" autocomplete="off"></label>
-                <label class="field"><span>模型</span><input id="ai-model" placeholder="gpt-5.5" autocomplete="off"></label>
-                <label class="field"><span>API 类型</span><select id="ai-wire-api"><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
-                <label class="field"><span>API Key</span><input id="ai-api-key" type="password" placeholder="输入新密钥" autocomplete="new-password"></label>
+              <div class="ai-config-grid ai-scheduling-grid">
+                <label class="field"><span>最大并行请求</span><select id="ai-max-concurrency"><option value="0">自动（当前可用连接数）</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option></select></label>
               </div>
               <div class="ai-config-footer">
                 <span class="config-status" id="ai-config-status">尚未配置</span>
-                <div class="inline-actions">
-                  <button class="button button-danger" id="clear-ai-key" type="button"><i data-lucide="key-round"></i><span>清除密钥</span></button>
-                  <button class="button button-secondary" id="test-ai-config" type="button"><i data-lucide="plug-zap"></i><span>测试连接</span></button>
-                  <button class="button button-primary" id="save-ai-config" type="button"><i data-lucide="save"></i><span>保存 AI 配置</span></button>
-                </div>
+                <p>每条连接同时只承担 1 个请求，失败时自动切换到其他可用连接。</p>
               </div>
             </div>
           </section>
+
+          <section class="ai-connection-workspace">
+            <form class="ai-connection-add" id="ai-connection-form">
+              <div class="ai-key-section-heading"><div><h3>添加一条连接</h3><p>每条连接独立保存服务地址、模型、API 类型和密钥。</p></div><i data-lucide="square-plus"></i></div>
+              <div class="ai-connection-form-grid">
+                <label class="field"><span>名称（可选）</span><input id="ai-connection-label" maxlength="80" placeholder="例如 Grok 主连接" autocomplete="off"></label>
+                <label class="field ai-connection-url"><span>API Base URL</span><input id="ai-connection-base-url" type="url" required placeholder="https://api.example.com/v1" autocomplete="off"></label>
+                <label class="field"><span>模型</span><input id="ai-connection-model" required placeholder="grok-4.5" autocomplete="off"></label>
+                <label class="field"><span>API 类型</span><select id="ai-connection-wire-api"><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
+                <label class="field ai-connection-secret"><span>API Key</span><input id="ai-connection-key" type="password" required minlength="8" placeholder="sk-..." autocomplete="new-password"></label>
+                <button class="button button-primary" id="add-ai-connection" type="submit"><i data-lucide="plus"></i><span>添加连接</span></button>
+              </div>
+            </form>
+            <div class="ai-key-import">
+              <div class="ai-key-section-heading"><div><h3>批量导入连接</h3><p>每行一条完整配置，密钥不会回显。</p></div><i data-lucide="list-plus"></i></div>
+              <label class="field"><span>连接配置</span><textarea id="ai-key-import" rows="6" autocomplete="off" spellcheck="false" placeholder="Grok 主连接 | sk-... | https://api.example.com/v1 | grok-4.5 | responses&#10;备用连接 | sk-... | https://other.example/v1 | gpt-5.5 | chat_completions"></textarea></label>
+              <p class="form-note">格式：<code>名称 | API Key | API Base URL | 模型 | API 类型</code>。名称可省略，此时也可使用 <code>API Base URL | 模型 | API 类型 | API Key</code>；API 类型使用 <code>responses</code> 或 <code>chat_completions</code>。</p>
+              <button class="button button-primary" id="import-ai-keys" type="button"><i data-lucide="list-plus"></i><span>批量添加</span></button>
+            </div>
+          </section>
+
+          <section class="ai-key-manager">
+            <div class="ai-key-section-heading ai-key-manager-heading">
+              <div><h3>连接列表</h3><p>展开后可修改完整配置；测试会向每条连接发送一次最小请求。</p></div>
+              <div class="ai-key-manager-actions"><span id="ai-key-count">0 条</span><button class="button button-secondary" id="test-all-ai-connections" type="button"><i data-lucide="plug-zap"></i><span>一键测试连接</span></button></div>
+            </div>
+            <div class="ai-key-selection-bar">
+              <label><input id="select-all-ai-connections" type="checkbox"><span>全选</span></label>
+              <span id="selected-ai-connection-count">已选 0 条</span>
+              <button class="button button-secondary" id="export-selected-ai-connections" type="button" disabled><i data-lucide="download"></i><span>导出选中</span></button>
+            </div>
+            <div class="ai-key-list" id="ai-key-list" aria-live="polite"></div>
+          </section>
+
+          <p class="ai-pool-note"><i data-lucide="info"></i><span>调度器会随连接一起切换 Base URL、模型、API 类型和 Key。不同服务可以并行；共享同一代理账户限额的连接仍可能被统一限流。</span></p>
+          </div>
+          <div id="ai-budget-panel" role="tabpanel" aria-labelledby="ai-budget-tab" hidden>
+            <div class="section-heading"><div><h2>Token 设置</h2><p>所有 AI 连接共用；修改后自动保存，对后续请求生效。</p></div><span id="ai-budget-save-status" role="status"></span></div>
+            <div id="ai-budget-fields"></div>
+            <p class="form-note">这些是单次请求与运行批次的上限，不是每日总 Token 或金额预算。输入按字符截取，提示词与画像还会占用额外上下文。连接测试固定最多输出 60 tokens。</p>
+          </div>
         </section>
 
         <section class="view" id="view-setup">
@@ -440,13 +497,14 @@
     <dialog id="routine-task-dialog" class="dialog task-dialog">
       <form id="routine-task-form">
         <div class="dialog-heading"><div><p class="eyebrow">每日任务</p><h2 id="routine-task-dialog-title">添加待预检任务</h2></div><button class="icon-button" type="button" data-close-dialog="routine-task-dialog" title="关闭"><i data-lucide="x"></i></button></div>
-        <div class="three-fields">
+        <div class="four-fields routine-task-filters">
           <label class="field"><span>平台</span><select id="routine-task-platform"><option value="linkedin">LinkedIn</option><option value="indeed">Indeed</option><option value="seek">SEEK</option></select></label>
           <label class="field"><span>职位类型</span><select id="routine-task-job-type"></select></label>
           <label class="field"><span>时间范围</span><select id="routine-task-time"><option value="0">不限</option><option value="1">过去 24 小时</option><option value="3">过去 3 天</option><option value="7">过去 7 天</option><option value="14">过去 14 天</option><option value="30">过去 30 天</option></select></label>
+          <label class="field"><span>搜索半径</span><select id="routine-task-search-radius" disabled><option value="any">平台默认</option></select></label>
         </div>
         <label class="field full"><span>职位关键词</span><input id="routine-task-keyword" required maxlength="160" placeholder="例如：intern, internship"><small>多个备选词用逗号分隔。平台搜索第一个词，Worker 按任一备选词筛选。</small></label>
-        <label class="field full"><span>地点</span><input id="routine-task-location" required maxlength="120"></label>
+        <label class="field full"><span>地点</span><input id="routine-task-location" required maxlength="120"><small id="routine-task-radius-note">先选择 Indeed 或 SEEK，并填写城市、城区、邮编或具体地址，才能设置搜索半径。</small></label>
         <div class="dialog-actions"><button class="button button-quiet" type="button" data-close-dialog="routine-task-dialog">取消</button><button class="button button-primary" type="submit"><i data-lucide="list-plus"></i><span id="routine-task-submit-label">加入待预检</span></button></div>
       </form>
     </dialog>

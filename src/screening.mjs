@@ -279,6 +279,35 @@ function profileLayout(source) {
   return { preset, purpose, includedSections };
 }
 
+export const SCORE_PROTOCOL_VERSION = 1;
+
+export const SCORE_DIMENSIONS = Object.freeze([
+  Object.freeze({ key: "roleAlignment", maxScore: 30 }),
+  Object.freeze({ key: "skillsMatch", maxScore: 25 }),
+  Object.freeze({ key: "experienceEvidence", maxScore: 20 }),
+  Object.freeze({ key: "requirementsFit", maxScore: 15 }),
+  Object.freeze({ key: "preferenceFit", maxScore: 10 })
+]);
+
+function normalizeScoreBreakdown(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = {};
+  for (const dimension of SCORE_DIMENSIONS) {
+    const supplied = value[dimension.key];
+    const suppliedScore = Number(supplied?.score);
+    if (!supplied || typeof supplied !== "object" || !Number.isFinite(suppliedScore)) {
+      throw new Error(`AI scoreBreakdown.${dimension.key}.score is required.`);
+    }
+    entries[dimension.key] = {
+      score: Math.round(Math.max(0, Math.min(dimension.maxScore, suppliedScore))),
+      maxScore: dimension.maxScore,
+      reason: normalizeText(supplied.reason) || "该维度没有提供额外说明。",
+      evidence: stringArray(supplied.evidence, 3)
+    };
+  }
+  return entries;
+}
+
 const PROFILE_SUGGESTION_SECTIONS = new Set([
   "targetRoles",
   "focusAreas",
@@ -605,15 +634,20 @@ export function validateScreening(input, { thresholds }) {
   const classification = ["CLEAR_MATCH", "CLEAR_REJECT", "AMBIGUOUS"].includes(input?.titleClassification)
     ? input.titleClassification
     : "AMBIGUOUS";
+  const scoreBreakdown = normalizeScoreBreakdown(input?.scoreBreakdown);
   const suppliedScore = Number(input?.score);
-  if (!Number.isFinite(suppliedScore) || suppliedScore < 0 || suppliedScore > 100) throw new Error("AI screening score must be between 0 and 100.");
+  if (!scoreBreakdown && (!Number.isFinite(suppliedScore) || suppliedScore < 0 || suppliedScore > 100)) {
+    throw new Error("AI screening score must be between 0 and 100.");
+  }
   const reason = normalizeText(input.reason);
   if (!reason) throw new Error("AI screening reason is required.");
   const suppliedWorkRights = input?.workRights && typeof input.workRights === "object" ? input.workRights : {};
   const validAssessments = new Set(["ELIGIBLE", "INELIGIBLE", "UNCERTAIN", "OVERRIDE_KEEP", "NOT_STATED"]);
   const assessment = validAssessments.has(suppliedWorkRights.assessment) ? suppliedWorkRights.assessment : "UNCERTAIN";
   const workRightsReason = normalizeText(suppliedWorkRights.reason) || "AI 没有给出明确的工作权利结论，保留该职位等待人工确认。";
-  const roleFitScore = Math.round(suppliedScore);
+  const roleFitScore = scoreBreakdown
+    ? SCORE_DIMENSIONS.reduce((total, dimension) => total + scoreBreakdown[dimension.key].score, 0)
+    : Math.round(suppliedScore);
   const score = roleFitScore;
   const concerns = stringArray(input.concerns);
   if (assessment === "INELIGIBLE") concerns.push(`工作权利不符合：${workRightsReason}`);
@@ -622,6 +656,8 @@ export function validateScreening(input, { thresholds }) {
     titleClassification: classification,
     score,
     roleFitScore,
+    scoreProtocolVersion: scoreBreakdown ? SCORE_PROTOCOL_VERSION : null,
+    scoreBreakdown,
     category: assessment === "INELIGIBLE" ? "REJECTED" : categoryForScore(score, thresholds),
     reason: assessment === "INELIGIBLE" ? workRightsReason : reason,
     matchedAreas: stringArray(input.matchedAreas),

@@ -1,6 +1,6 @@
 # Job Agent
 
-当前 Agent 版本：`v1.1.0`。LinkedIn 与 SEEK Worker 为 `v1.1.1`，Indeed Worker 为 `v1.1.2`；三个 Worker 均支持按运行选择自动 AI 审阅或仅采集职位。
+当前 Agent 版本：`v1.1.0`。LinkedIn Worker 为 `v1.1.1`，SEEK Worker 为 `v1.1.2`，Indeed Worker 为 `v1.1.3`；三个 Worker 均支持按运行选择自动 AI 审阅或仅采集职位。Indeed 与 SEEK 还支持在具体地点搜索中设置并预检平台搜索半径。
 
 ## 项目简介
 
@@ -106,20 +106,36 @@ JOB_AGENT_PYTHON_PATH=C:\path\to\python.exe
 
 扫描版 PDF 没有可提取文字时，可将简历内容粘贴到文本框，或使用职业画像页面提供的 GPT Prompt，在 ChatGPT 中生成画像 JSON 后粘贴回来。
 
-## 配置 AI
+## AI configuration
 
-AI 是可选的。不配置时，职位名筛选、基础 JD 筛选和复盘仍可使用本地规则运行。
+AI is optional. Local title screening, basic JD screening, and local reflection remain available without it.
 
-推荐直接在“搜索设置 -> AI 服务”中填写：
+Open the standalone **AI Service** view to manage up to 50 independent connections. Every connection owns its API key, Base URL, model, and wire API, so one pool may mix providers and models. Connections can be added individually or imported one per line:
 
-- Base URL：OpenAI 兼容接口的地址，通常以 `/v1` 结尾。
-- Model：接口支持的模型名称。
-- API Key：对应接口的密钥。
-- API 格式：根据服务选择 Responses API 或 Chat Completions。
+```text
+Primary Grok | sk-... | https://provider-a.example/v1 | grok-4.5 | responses
+Backup GPT | sk-... | https://provider-b.example/v1 | gpt-5.5 | chat_completions
+```
 
-先点击“测试连接”，成功后再点击“保存 AI 配置”。API Key 只保存在本机的 `data/ai-config.json`，不会回显到页面，也不会提交到 Git。
+The name is optional. A four-field row may use `API Key | API Base URL | Model | API Type`; `API Base URL | Model | API Type | API Key` is also accepted. JSON-array import and the legacy name/key format remain supported when a legacy shared connection is available.
 
-也可以复制 `.env.example` 为 `.env` 后通过环境变量配置。默认已限制输入长度、输出 token 和单次运行调用次数。
+Connection secrets are stored only in the local `data/ai-config.json`, are masked in normal API responses, and are excluded from Git. Only the explicit selected-connection export returns plaintext keys. Automatic JD reviews use at most one in-flight request per enabled connection. A request selects and uses that connection's URL, model, wire format, and key as one unit. Transient or authentication failures cool down only the affected connection, while another available connection can continue. Automatic concurrency follows the available connection count; a manual setting caps it.
+
+The connection list supports editing every field, optionally replacing a saved key, testing one connection, and testing the complete pool in one action. Bulk tests respect the configured concurrency limit and report a result for each connection without exposing its secret. Connections can also be selected and exported to a local text file in the same line-oriented format accepted by batch import. Exported files contain the selected plaintext API keys and should be stored securely.
+
+Multiple connections improve throughput only when they have independent provider quota or concurrency. Connections under one shared proxy account may still share the same upstream rate limit.
+
+The `.env` variables remain supported as a single-key fallback. Input size, output tokens, retries, and per-run AI calls remain bounded.
+
+The **Token Settings** tab autosaves output limits, input-character limits, and per-run review/call limits to local configuration. Saved values override environment defaults without restarting. New default output ceilings are 2,400 tokens for JD scoring and reflection, 2,000 for job chat, and 3,000 for profile generation and cover letters. Cover letters also retain their page-based limit. These ceilings are not daily spending limits and do not force the model to consume the full allowance. Updating token or scheduling settings does not requeue failed reviews.
+
+Multi-connection review batches preflight connections before dispatch. Passing checks are reused for five minutes, and failed checks pause the connection for one minute before another preflight. Manual connection tests update the same runtime availability state and use one attempt with a 15-second timeout; bulk checks run at most four at a time. Editing a connection pauses UI auto-refresh to preserve unsaved fields.
+
+### Scoring protocol
+
+All AI providers use scoring protocol v1. Role fit is split into five fixed dimensions: `roleAlignment` (30), `skillsMatch` (25), `experienceEvidence` (20), `requirementsFit` (15), and `preferenceFit` (10). Each dimension stores a bounded score, one concise user-facing reason, and up to three evidence items. The server clamps every dimension and recomputes the 100-point total locally, so the provider cannot replace the total with an unrelated holistic score. Work-rights compatibility remains a separate decision and can change the final category without rewriting the role-fit score.
+
+Protocol keys and stored machine fields are English. User-facing reasons and evidence are Simplified Chinese while exact English job titles, technologies, qualifications, visa subclasses, and legal status names are preserved when translation would reduce precision. Existing reviews without a breakdown remain readable and receive the fixed protocol after re-review.
 
 ## 每日使用流程
 
@@ -174,7 +190,7 @@ Agent 运行任务时不再让 Tampermonkey Worker 自行跳过历史职位。�
 以下内容只保存在本机并已被 `.gitignore` 排除：
 
 - `data/state.json`：任务、职位、多套画像、各画像偏好、Cover Letter 和复盘记录。
-- `data/ai-config.json`：AI 服务配置和 API Key。
+- `data/ai-config.json`: AI service configuration and the local API key pool.
 - `data/uploads/`：临时上传文件。
 - `.env`：本机环境变量。
 

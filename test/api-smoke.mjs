@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
@@ -32,12 +32,15 @@ const aiServer = createHttpServer(async (request, response) => {
   const isReflection = /Consolidate a candidate's job-screening preferences/i.test(payload.instructions || "");
   const isJobAssistant = /Answer questions about the supplied job-review context/i.test(payload.instructions || "");
   const isCoverLetter = /Write or revise a professional cover letter/i.test(payload.instructions || "");
+  const isConnectionTest = /Return only a JSON object with ok set to true/i.test(payload.instructions || "");
   if (isCoverLetter) coverLetterInputs.push(JSON.parse(payload.input || "{}"));
   const reflectionInput = isReflection ? JSON.parse(payload.input || "{}") : null;
   const assistantInput = isJobAssistant ? JSON.parse(payload.input || "{}") : null;
   const hasConfirmedRejection = reflectionInput?.rejectedJobSignals?.some((item) => item.humanConfirmed
     && item.feedbackReason === "REJECTION_CORRECT");
-  const output = isCoverLetter
+  const output = isConnectionTest
+    ? { ok: true }
+    : isCoverLetter
     ? {
         overview: "这封信聚焦候选人的软件交付经历、岗位所需的工程能力，以及可验证的项目成果。",
         subject: "Application for Graduate Analyst",
@@ -154,13 +157,26 @@ async function request(path, body, method = body === undefined ? "GET" : "POST")
   return json;
 }
 
-async function validateRoutineTask(platform, postedWithinDays, jobType = "any") {
+async function requestFailure(path, body, status = 400) {
+  const response = await fetch("http://127.0.0.1:" + port + path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const json = await response.json();
+  assert.equal(response.status, status);
+  assert.equal(response.ok, false);
+  return json;
+}
+
+async function validateRoutineTask(platform, postedWithinDays, jobType = "any", searchRadiusKm = null, location = "Melbourne VIC") {
   const pending = await request("/api/task-validations", {
     platform,
     keyword: "graduate software engineer",
-    location: "Melbourne VIC",
+    location,
     postedWithinDays,
-    jobType
+    jobType,
+    searchRadiusKm
   });
   assert.equal(new URL(pending.preflightUrl).searchParams.get("jobAgentPreflight"), "1");
   const requested = await request("/api/worker/preflight?validationId=" + pending.validation.id + "&platform=" + platform);
@@ -181,8 +197,10 @@ async function validateRoutineTask(platform, postedWithinDays, jobType = "any") 
   });
   assert.equal(accepted.validation.status, "VALID");
   assert.equal(accepted.validation.jobType, jobType);
+  assert.equal(accepted.validation.searchRadiusKm, searchRadiusKm);
   assert.ok(accepted.routineTask);
   assert.equal(accepted.routineTask.jobType, jobType);
+  assert.equal(accepted.routineTask.searchRadiusKm, searchRadiusKm);
   return accepted;
 }
 
@@ -204,8 +222,8 @@ try {
   assert.equal(workerResponse.ok, true);
   assert.match(workerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(workerScript, /Job Agent Worker - SEEK/);
-  assert.match(workerScript, /@version\s+1\.1\.1/);
-  assert.match(workerScript, /const APP_VERSION = "1\.1\.1"/);
+  assert.match(workerScript, /@version\s+1\.1\.2/);
+  assert.match(workerScript, /const APP_VERSION = "1\.1\.2"/);
   assert.match(workerScript, /function agentShowNaturalSeekKeyword/);
   assert.match(workerScript, /Do not dispatch an input event/);
   const naturalKeywordFunction = extractNamedFunction(workerScript, "agentShowNaturalSeekKeyword");
@@ -306,6 +324,16 @@ try {
   assert.match(workerScript, /function agentParam\(params, name\)/);
   assert.match(workerScript, /explicitRunId && !agentParam\(params, "jobAgentTask"\)/);
   assert.match(workerScript, /agentApplySeekJobTypeFilter/);
+  assert.match(workerScript, /SEEK_SEARCH_RADII_KM/);
+  assert.match(workerScript, /searchParams\.set\("distance"/);
+  assert.match(workerScript, /agentAssertSeekSearchRadius/);
+  const seekRadiusFunction = extractNamedFunction(workerScript, "agentSearchRadiusKm");
+  const seekTaskUrlFunction = extractNamedFunction(workerScript, "agentTaskUrl");
+  const seekTaskUrl = Function("agentSeekKeywordForSearch", "agentSearchKeyword", "SEEK_SEARCH_RADII_KM",
+    `${seekRadiusFunction}; ${seekTaskUrlFunction}; return agentTaskUrl;`)(value => value, value => value, new Set([0, 2, 5, 10, 25, 30, 50, 100]));
+  assert.equal(new URL(seekTaskUrl({ keyword: "barista", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: 10, runId: "run", id: "task" })).searchParams.get("distance"), "10");
+  assert.equal(new URL(seekTaskUrl({ keyword: "barista", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: 0, runId: "run", id: "task" })).searchParams.get("distance"), "0");
+  assert.equal(new URL(seekTaskUrl({ keyword: "barista", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: null, runId: "run", id: "task" })).searchParams.has("distance"), false);
   assert.match(workerScript, /refine by work type/);
   assert.match(workerScript, /\[150, 600, 1800, 4000\]/);
   assert.match(workerScript, /agentSearchKeyword/);
@@ -355,8 +383,8 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+1\.1\.2/);
-  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.2"/);
+  assert.match(indeedWorkerScript, /@version\s+1\.1\.3/);
+  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.3"/);
   assert.match(indeedWorkerScript, /agentWaitForSearchResults/);
   assert.match(indeedWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(indeedWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
@@ -405,6 +433,16 @@ try {
   assert.match(indeedWorkerScript, /agentFindIndeedDateUpdateButton/);
   assert.match(indeedWorkerScript, /agentWaitForIndeedDateParameter/);
   assert.match(indeedWorkerScript, /agentApplyIndeedJobTypeFilter/);
+  assert.match(indeedWorkerScript, /INDEED_SEARCH_RADII_KM/);
+  assert.match(indeedWorkerScript, /searchParams\.set\("radius"/);
+  assert.match(indeedWorkerScript, /agentAssertIndeedSearchRadius/);
+  const indeedRadiusFunction = extractNamedFunction(indeedWorkerScript, "agentSearchRadiusKm");
+  const indeedTaskUrlFunction = extractNamedFunction(indeedWorkerScript, "agentTaskUrl");
+  const indeedTaskUrl = Function("agentSearchKeyword", "INDEED_SEARCH_RADII_KM",
+    `${indeedRadiusFunction}; ${indeedTaskUrlFunction}; return agentTaskUrl;`)(value => value, new Set([0, 5, 10, 15, 25, 50, 100]));
+  assert.equal(new URL(indeedTaskUrl({ keyword: "barista", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: 15, runId: "run", id: "task" })).searchParams.get("radius"), "15");
+  assert.equal(new URL(indeedTaskUrl({ keyword: "barista", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: 0, runId: "run", id: "task" })).searchParams.get("radius"), "0");
+  assert.equal(new URL(indeedTaskUrl({ keyword: "barista", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: null, runId: "run", id: "task" })).searchParams.has("radius"), false);
   assert.match(indeedWorkerScript, /button\[aria-label='Job type filter'\]/);
   assert.match(indeedWorkerScript, /menuitemcheckbox/);
   assert.match(indeedWorkerScript, /Date posted options/);
@@ -594,10 +632,23 @@ try {
   assert.doesNotMatch(dashboardScript, /failedAiReviewJobsInSelectedPane/);
   assert.match(dashboardScript, /setInterval\(autoReload, 2500\)/);
   assert.match(dashboardScript, /function openScoreDetails/);
-  assert.match(dashboardScript, /AI 根据完整 JD 与职业画像进行语义综合评分/);
+  assert.match(dashboardScript, /function scoreBreakdownMarkup/);
+  assert.match(dashboardScript, /岗位方向/);
+  assert.match(dashboardScript, /协议 v1/);
   assert.match(dashboardScript, /安装 \/ 更新/);
-  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.2"/);
-  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.1"/);
+  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.3"/);
+  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.2"/);
+  assert.match(dashboardScript, /function locationSupportsSearchRadius/);
+  assert.match(dashboardScript, /function syncRoutineSearchRadiusOptions/);
+  assert.match(dashboardHtml, /id="routine-task-search-radius"/);
+  const radiusLocationFunction = extractNamedFunction(dashboardScript, "locationSupportsSearchRadius");
+  const locationSupportsSearchRadius = Function(`${radiusLocationFunction}; return locationSupportsSearchRadius;`)();
+  assert.equal(locationSupportsSearchRadius("Melbourne VIC"), true);
+  assert.equal(locationSupportsSearchRadius("Southbank VIC 3006"), true);
+  assert.equal(locationSupportsSearchRadius("Australia"), false);
+  assert.equal(locationSupportsSearchRadius("Victoria, Australia"), false);
+  assert.equal(locationSupportsSearchRadius("All Melbourne VIC"), false);
+  assert.equal(locationSupportsSearchRadius("Remote"), false);
   assert.match(dashboardScript, /pendingRunAiReviewEnabled/);
   assert.match(dashboardScript, /aiReviewEnabled/);
   assert.match(dashboardScript, /pendingRunDistanceEnabled/);
@@ -606,12 +657,12 @@ try {
   assert.match(dashboardScript, /data-routine-platform-select/);
   assert.match(dashboardScript, /\/workers\/install\//);
   assert.match(dashboardScript, /agent-worker-/);
-  const installerResponse = await fetch("http://127.0.0.1:" + port + "/workers/install/indeed-agent-worker-v1.1.2.user.js");
+  const installerResponse = await fetch("http://127.0.0.1:" + port + "/workers/install/indeed-agent-worker-v1.1.3.user.js");
   const installerScript = await installerResponse.text();
   assert.equal(installerResponse.ok, true);
   assert.match(installerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(installerScript, /@name\s+Job Agent Worker - Indeed/);
-  assert.match(installerScript, /@version\s+1\.1\.2/);
+  assert.match(installerScript, /@version\s+1\.1\.3/);
   assert.match(dashboardScript, /data-copy-worker/);
   assert.match(dashboardScript, /loadWorkerScripts/);
   assert.match(dashboardScript, /job-agent:view/);
@@ -712,6 +763,19 @@ try {
   assert.match(dashboardScript, /settings\/exclusion-keywords/);
   assert.match(dashboardScript, /exclusion-suggestions/);
   assert.match(dashboardScript, /selectedExclusionsProfile/);
+  assert.match(dashboardHtml, /data-view="ai"/);
+  assert.match(dashboardHtml, /id="ai-key-import"/);
+  assert.match(dashboardHtml, /id="ai-connection-form"/);
+  assert.match(dashboardHtml, /id="ai-connection-base-url"/);
+  assert.match(dashboardHtml, /id="test-all-ai-connections"/);
+  assert.match(dashboardHtml, /id="select-all-ai-connections"/);
+  assert.match(dashboardHtml, /id="export-selected-ai-connections"/);
+  assert.match(dashboardHtml, /每条连接可使用不同的服务地址、模型、API 类型和密钥/);
+  assert.match(dashboardScript, /function renderAiService/);
+  assert.match(dashboardScript, /function saveAiConnection/);
+  assert.match(dashboardScript, /function testAllAiConnections/);
+  assert.match(dashboardScript, /function exportSelectedAiConnections/);
+  assert.match(dashboardScript, /\/api\/ai-config\/keys\/import/);
 
   const normalizedKeywordValidation = await request("/api/task-validations", {
     platform: "linkedin",
@@ -744,11 +808,108 @@ try {
   }, "PUT");
   assert.equal(savedAiConfig.ai.hasApiKey, true);
   assert.equal(savedAiConfig.ai.keyHint, "****1234");
+  const previousJdLimit = savedAiConfig.ai.budget.maxJdOutputTokens;
+  const scheduling = await request("/api/ai-config/scheduling", { maxConcurrency: 2 }, "PATCH");
+  assert.equal(scheduling.ai.maxConcurrency, 2);
+  await assert.rejects(request("/api/ai-config/scheduling", { maxConcurrency: 1.5 }, "PATCH"), /integer/);
+  await request("/api/ai-config/scheduling", { maxConcurrency: 0 }, "PATCH");
+  const savedBudget = await request("/api/ai-config/budget", { budget: { maxJdOutputTokens: 1200 } }, "PATCH");
+  assert.equal(savedBudget.ai.budget.maxJdOutputTokens, 1200);
+  assert.equal(savedBudget.ai.keys[0].hint, "****1234");
+  const budgetOnDisk = JSON.parse(await readFile(join(directory, "ai-config.json"), "utf8"));
+  assert.equal(budgetOnDisk.budget.maxJdOutputTokens, 1200);
+  for (const value of [0, 6001, 350.5, "900"]) {
+    await assert.rejects(request("/api/ai-config/budget", { budget: { maxJdOutputTokens: value } }, "PATCH"), /Invalid AI budget/);
+  }
+  assert.equal((await request("/api/bootstrap")).ai.budget.maxJdOutputTokens, 1200);
+  await request("/api/ai-config/budget", { budget: { maxJdOutputTokens: previousJdLimit } }, "PATCH");
   const aiBootstrap = await request("/api/bootstrap");
   assert.equal(aiBootstrap.ai.baseUrl, "https://example.invalid/v1");
   assert.equal(JSON.stringify(aiBootstrap).includes("secret-test-key-1234"), false);
   const clearedAiKey = await request("/api/ai-config/key", {}, "DELETE");
   assert.equal(clearedAiKey.ai.hasApiKey, false);
+  const importedAiKeys = await request("/api/ai-config/keys/import", {
+    text: [
+      "Primary | secret-pool-key-1111 | https://provider-a.invalid/v1 | model-a | responses",
+      "https://provider-b.invalid/v1 | model-b | Chat Completions | secret-pool-key-2222"
+    ].join("\n")
+  });
+  assert.equal(importedAiKeys.imported, 2);
+  assert.equal(importedAiKeys.ai.keys.length, 2);
+  assert.equal(importedAiKeys.ai.keys[0].hint, "****1111");
+  assert.equal(importedAiKeys.ai.keys[0].baseUrl, "https://provider-a.invalid/v1");
+  assert.equal(importedAiKeys.ai.keys[0].model, "model-a");
+  assert.equal(importedAiKeys.ai.keys[0].wireApi, "responses");
+  assert.equal(importedAiKeys.ai.keys[1].baseUrl, "https://provider-b.invalid/v1");
+  assert.equal(importedAiKeys.ai.keys[1].wireApi, "chat_completions");
+  assert.equal(JSON.stringify(importedAiKeys).includes("secret-pool-key-1111"), false);
+  const duplicateAiKey = await request("/api/ai-config/keys/import", {
+    text: "Primary copy | secret-pool-key-1111 | https://provider-a.invalid/v1 | model-a | responses"
+  });
+  assert.equal(duplicateAiKey.imported, 0);
+  const singleAiConnection = await request("/api/ai-config/keys", {
+    label: "Single",
+    apiKey: "secret-pool-key-3333",
+    baseUrl: "https://provider-c.invalid/v1",
+    model: "model-c",
+    wireApi: "chat_completions"
+  });
+  assert.equal(singleAiConnection.imported, 1);
+  assert.equal(singleAiConnection.ai.keys.length, 3);
+  await assert.rejects(request("/api/ai-config/keys", {
+    label: "  PRIMARY  ", apiKey: "different-secret-key", baseUrl: "https://other.invalid/v1",
+    model: "other-model", wireApi: "responses"
+  }), /AI connection name already exists/);
+  await assert.rejects(request("/api/ai-config/keys/import", { text: [
+    "Repeated Name | batch-secret-1111 | https://other.invalid/v1 | model | responses",
+    " repeated   NAME | batch-secret-2222 | https://other.invalid/v1 | model | responses"
+  ].join("\n") }), /AI connection name already exists/);
+  const afterNameConflict = await request("/api/bootstrap");
+  assert.equal(afterNameConflict.ai.keys.length, 3);
+  await assert.rejects(request("/api/ai-config/keys/" + singleAiConnection.ai.keys[2].id,
+    { label: "primary" }, "PATCH"), /AI connection name already exists/);
+  const unchangedName = await request("/api/ai-config/keys/" + singleAiConnection.ai.keys[2].id,
+    { label: "Single" }, "PATCH");
+  assert.equal(unchangedName.ai.keys[2].label, "Single");
+  const disabledAiKey = await request("/api/ai-config/keys/" + importedAiKeys.ai.keys[0].id, { enabled: false }, "PATCH");
+  assert.equal(disabledAiKey.ai.keys[0].enabled, false);
+  const editedAiKey = await request("/api/ai-config/keys/" + importedAiKeys.ai.keys[1].id, {
+    baseUrl: "https://provider-b-new.invalid/v1",
+    model: "model-b-2",
+    wireApi: "responses",
+    apiKey: "secret-pool-key-2222-updated"
+  }, "PATCH");
+  assert.equal(editedAiKey.ai.keys[1].baseUrl, "https://provider-b-new.invalid/v1");
+  assert.equal(editedAiKey.ai.keys[1].model, "model-b-2");
+  assert.equal(editedAiKey.ai.keys[1].wireApi, "responses");
+  assert.equal(editedAiKey.ai.keys[1].hint, "****ated");
+  assert.equal(JSON.stringify(editedAiKey).includes("secret-pool-key-2222-updated"), false);
+  const selectedAiExport = await request("/api/ai-config/keys/export", {
+    ids: [editedAiKey.ai.keys[0].id, editedAiKey.ai.keys[2].id]
+  });
+  assert.equal(selectedAiExport.count, 2);
+  assert.equal(selectedAiExport.text.split("\n").length, 2);
+  assert.match(selectedAiExport.text, /Primary \| secret-pool-key-1111 \| https:\/\/provider-a\.invalid\/v1 \| model-a \| responses/);
+  assert.match(selectedAiExport.text, /Single \| secret-pool-key-3333 \| https:\/\/provider-c\.invalid\/v1 \| model-c \| chat_completions/);
+  assert.doesNotMatch(selectedAiExport.text, /secret-pool-key-2222-updated/);
+  const reimportedAiExport = await request("/api/ai-config/keys/import", { text: selectedAiExport.text });
+  assert.equal(reimportedAiExport.imported, 0);
+  await assert.rejects(request("/api/ai-config/keys/export", { ids: [] }), /Select at least one AI connection/i);
+  for (const connection of editedAiKey.ai.keys) {
+    await request("/api/ai-config/keys/" + connection.id, {
+      baseUrl: "http://127.0.0.1:" + aiPort + "/v1",
+      wireApi: "responses"
+    }, "PATCH");
+  }
+  const testedAiConnections = await request("/api/ai-config/keys/test-all", {});
+  assert.equal(testedAiConnections.tested, 3);
+  assert.equal(testedAiConnections.passed, 3);
+  assert.equal(testedAiConnections.failed, 0);
+  assert.ok(testedAiConnections.results.every((item) => item.ok));
+  assert.equal(JSON.stringify(testedAiConnections).includes("secret-pool-key"), false);
+  const deletedAiKey = await request("/api/ai-config/keys/" + importedAiKeys.ai.keys[0].id, undefined, "DELETE");
+  assert.equal(deletedAiKey.ai.keys.length, 2);
+  await request("/api/ai-config/key", {}, "DELETE");
   await request("/api/ai-config", { baseUrl: "", model: "", wireApi: "chat_completions", apiKey: "" }, "PUT");
   const form = new FormData();
   form.append("resume", new Blob(["Graduate software developer with Python, SQL, JavaScript and cloud projects."], { type: "text/plain" }), "candidate.txt");
@@ -838,6 +999,24 @@ try {
   assert.equal(afterManualProfiles.profileContexts[copiedProfile.profile.id].preferenceModel, null);
   await request("/api/profiles/" + blankProfile.profile.id, undefined, "DELETE");
   await request("/api/profiles/" + copiedProfile.profile.id, undefined, "DELETE");
+
+  const linkedInRadiusError = await requestFailure("/api/task-validations", {
+    platform: "linkedin", keyword: "developer", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: 10
+  });
+  assert.match(linkedInRadiusError.error, /does not support the selected search radius/i);
+  const broadSeekRadiusError = await requestFailure("/api/task-validations", {
+    platform: "seek", keyword: "barista", location: "All Australia", postedWithinDays: 7, searchRadiusKm: 10
+  });
+  assert.match(broadSeekRadiusError.error, /requires a specific city/i);
+  const unsupportedIndeedRadiusError = await requestFailure("/api/task-validations", {
+    platform: "indeed", keyword: "barista", location: "Melbourne VIC", postedWithinDays: 7, searchRadiusKm: 2
+  });
+  assert.match(unsupportedIndeedRadiusError.error, /does not support the selected search radius/i);
+  const exactSeekRadius = await request("/api/task-validations", {
+    platform: "seek", keyword: "barista", location: "Southbank VIC 3006", postedWithinDays: 7, searchRadiusKm: 0
+  });
+  assert.equal(exactSeekRadius.validation.searchRadiusKm, 0);
+  await request("/api/task-validations/" + exactSeekRadius.validation.id, undefined, "DELETE");
 
   const disposableDraft = await request("/api/profiles/generate", {
     sourceName: "candidate-draft.txt",
@@ -933,8 +1112,8 @@ try {
   const failedPreflight = await request("/api/bootstrap");
   assert.equal(failedPreflight.routineTasks.length, 0);
   await validateRoutineTask("linkedin", 7);
-  await validateRoutineTask("indeed", 3, "part-time");
-  await validateRoutineTask("seek", 14, "casual");
+  await validateRoutineTask("indeed", 3, "part-time", 10);
+  await validateRoutineTask("seek", 14, "casual", 5);
   const deletedDailyTask = await validateRoutineTask("linkedin", 1);
   const recheckedDailyTask = await request("/api/task-validations/" + deletedDailyTask.validation.id + "/retry", {});
   assert.equal(recheckedDailyTask.routineTaskRemoved, true);
@@ -984,8 +1163,8 @@ try {
   assert.ok(run.run.tasks.every((task) => task.aiReviewEnabled === true));
   assert.equal(run.run.profileName, "Casual hospitality");
   assert.equal(run.run.tasks.length, 4);
-  assert.ok(run.run.tasks.some((task) => task.platform === "indeed" && task.jobType === "part-time"));
-  assert.ok(run.run.tasks.some((task) => task.platform === "seek" && task.jobType === "casual"));
+  assert.ok(run.run.tasks.some((task) => task.platform === "indeed" && task.jobType === "part-time" && task.searchRadiusKm === 10));
+  assert.ok(run.run.tasks.some((task) => task.platform === "seek" && task.jobType === "casual" && task.searchRadiusKm === 5));
   assert.deepEqual(run.run.tasks[0].workerTiming, run.run.settingsSnapshot.workerTiming);
   const runTimingResponse = await request("/api/worker/settings?runId=" + run.run.id);
   assert.deepEqual(runTimingResponse.workerTiming, run.run.settingsSnapshot.workerTiming);

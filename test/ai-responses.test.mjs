@@ -1,8 +1,85 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
+import { prepareAiReviewConnections, testSavedAiConnection } from "../src/ai.mjs";
 
-import { answerJobQuestions, evaluateJdWithAi, generateCoverLetter, generateProfile, reflectOnJobFeedback, testAiConnection } from "../src/ai.mjs";
+test("a single saved connection retries transient failures and manual tests update availability", async () => {
+  let calls = 0;
+  let failing = false;
+  const server = createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    calls += 1;
+    response.writeHead(failing || calls === 1 ? 503 : 200, { "content-type": "application/json" });
+    response.end(JSON.stringify(failing || calls === 1 ? { error: "Unavailable" } : { output_text: '{"ok":true}' }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const previousDelay = process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+  const key = { id: "single-retry", label: "Single", model: "test", baseUrl: `http://127.0.0.1:${server.address().port}`,
+    secret: "single-test-secret", wireApi: "responses", enabled: true };
+  try {
+    process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = "10";
+    configureAi({ apiKeys: [key] });
+    assert.equal((await testAiConnection()).ok, true);
+    assert.equal(calls, 2);
+    failing = true;
+    await assert.rejects(testSavedAiConnection(key), /503/);
+    assert.equal(aiStatus().keys[0].preflightStatus, "failed");
+    failing = false;
+    await testSavedAiConnection(key);
+    assert.equal(aiStatus().keys[0].preflightStatus, "passed");
+    assert.equal(aiStatus().keys[0].lastError, null);
+  } finally {
+    configureAi(null);
+    if (previousDelay === undefined) delete process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+    else process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = previousDelay;
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("review preflight excludes failing connections, caches success, and rechecks changed configurations", async () => {
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const input = JSON.parse(body);
+    requests.push(input.model);
+    response.writeHead(input.model === "bad" ? 503 : 200, { "content-type": "application/json" });
+    response.end(JSON.stringify(input.model === "bad" ? { error: "Unavailable" } : { output_text: '{"ok":true}' }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const keys = ["bad", "good"].map((model) => ({ id: `preflight-${model}`, label: model, model,
+    baseUrl: `http://127.0.0.1:${server.address().port}`, secret: `secret-${model}`, wireApi: "responses", enabled: true }));
+  try {
+    configureAi({ apiKeys: keys, maxConcurrency: 0 });
+    assert.equal(await prepareAiReviewConnections(), true);
+    assert.equal(aiStatus().keys[0].preflightStatus, "failed");
+    assert.equal(aiConcurrencyLimit(), 1);
+    assert.equal(await prepareAiReviewConnections(), true);
+    assert.equal(requests.length, 2);
+    await testAiConnection();
+    assert.equal(requests.at(-1), "good");
+    configureAi({ apiKeys: keys.map((key) => ({ ...key, model: "bad" })), maxConcurrency: 0 });
+    assert.equal(await prepareAiReviewConnections(), false);
+    configureAi({ apiKeys: keys.map((key) => ({ ...key, model: "fixed" })), maxConcurrency: 0 });
+    assert.equal(await prepareAiReviewConnections(), true);
+    assert.equal(aiConcurrencyLimit(), 2);
+    assert.equal(JSON.stringify(aiStatus()).includes("secret-bad"), false);
+  } finally {
+    configureAi(null);
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+import { aiConcurrencyLimit, aiStatus, answerJobQuestions, configureAi, evaluateJdWithAi, generateCoverLetter, generateProfile, reflectOnJobFeedback, testAiConnection } from "../src/ai.mjs";
+
+test("automatic concurrency follows complete enabled connections and permits a manual cap", () => {
+  const keys = Array.from({ length: 10 }, (_, index) => ({ id: `auto-limit-${index}`, enabled: true,
+    secret: "test-secret", baseUrl: "https://example.invalid/v1", model: "test-model" }));
+  assert.equal(aiConcurrencyLimit({ maxConcurrency: 0, apiKeys: keys }), 10);
+  assert.equal(aiConcurrencyLimit({ apiKeys: keys }), 10);
+  assert.equal(aiConcurrencyLimit({ maxConcurrency: 3, apiKeys: keys }), 3);
+  assert.equal(aiConcurrencyLimit({ maxConcurrency: 0, apiKeys: [keys[0], { ...keys[1], enabled: false }, { ...keys[2], model: "" }] }), 1);
+});
 
 const externalProfile = {
   schemaVersion: 2,
@@ -123,6 +200,14 @@ test("AI JD review semantically compares visa requirements and honors user reten
       output_text: JSON.stringify({
         titleClassification: "CLEAR_MATCH",
         score: 78,
+        scoreProtocolVersion: 1,
+        scoreBreakdown: {
+          roleAlignment: { score: 24, maxScore: 30, reason: "岗位方向符合。", evidence: ["Graduate Software Engineer"] },
+          skillsMatch: { score: 20, maxScore: 25, reason: "技能较匹配。", evidence: ["backend engineering"] },
+          experienceEvidence: { score: 15, maxScore: 20, reason: "画像包含相关经历。", evidence: ["后端工程经历"] },
+          requirementsFit: { score: 11, maxScore: 15, reason: "主要要求基本符合。", evidence: [] },
+          preferenceFit: { score: 8, maxScore: 10, reason: "符合工作偏好。", evidence: ["hybrid"] }
+        },
         reason: "The role aligns with the candidate's backend engineering experience.",
         matchedAreas: ["software engineering"],
         concerns: [],
@@ -154,6 +239,12 @@ test("AI JD review semantically compares visa requirements and honors user reten
     }, { ...externalProfile, jobPreferences: { notes: "Prefer hybrid roles with flexible hours." } }, { strongMatch: 85, goodMatch: 70, maybe: 50, lowMatch: 30 });
     assert.match(received.instructions, /AND, OR, alternatives/i);
     assert.match(received.instructions, /forceKeepRequirements/i);
+    assert.match(received.instructions, /roleAlignment 0-30/);
+    assert.match(received.instructions, /skillsMatch 0-25/);
+    assert.match(received.instructions, /recomputes the total locally/i);
+    assert.equal(result.screening.score, 78);
+    assert.equal(result.screening.scoreProtocolVersion, 1);
+    assert.equal(result.screening.scoreBreakdown.experienceEvidence.maxScore, 20);
     assert.match(received.instructions, /Simplified Chinese/i);
     assert.match(received.instructions, /targetKeywords and preferenceSignals\.exclusionKeywords in English only/i);
     const input = JSON.parse(received.input);
@@ -240,6 +331,170 @@ test("AI requests retry transient provider and proxy upstream failures", async (
     assert.equal(attempts, 3);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    if (originalAttempts === undefined) delete process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS;
+    else process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS = originalAttempts;
+    if (originalDelay === undefined) delete process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+    else process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = originalDelay;
+  }
+});
+
+test("AI key pool fails over on rate limits and runs independent keys concurrently", async () => {
+  const authorizations = [];
+  let active = 0;
+  let maxActive = 0;
+  let rejectPrimary = true;
+  let malformed = false;
+  const server = createServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    const authorization = request.headers.authorization || "";
+    authorizations.push(authorization);
+    if (rejectPrimary && authorization === "Bearer pool-key-one") {
+      rejectPrimary = false;
+      response.writeHead(429, { "content-type": "application/json", "retry-after": "1" });
+      response.end(JSON.stringify({ error: { message: "rate limited pool-key-one" } }));
+      return;
+    }
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    active -= 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      output_text: malformed ? "not structured data" : JSON.stringify({ ok: true }),
+      usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 }
+    }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const originalAttempts = process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS;
+  const originalDelay = process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+  try {
+    process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS = "3";
+    process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = "10";
+    configureAi({
+      baseUrl: "http://127.0.0.1:" + server.address().port,
+      model: "pool-model",
+      wireApi: "responses",
+      maxConcurrency: 2,
+      apiKeys: [
+        { id: "pool-one", label: "Primary", secret: "pool-key-one", enabled: true },
+        { id: "pool-two", label: "Secondary", secret: "pool-key-two", enabled: true }
+      ]
+    });
+    const failover = await testAiConnection();
+    assert.equal(failover.ok, true);
+    assert.deepEqual(authorizations.slice(0, 2), ["Bearer pool-key-one", "Bearer pool-key-two"]);
+    assert.equal(aiStatus().keys.find((key) => key.id === "pool-one").status, "cooling");
+    assert.equal(JSON.stringify(aiStatus()).includes("pool-key-one"), false);
+
+    configureAi({
+      baseUrl: "http://127.0.0.1:" + server.address().port,
+      model: "pool-model",
+      wireApi: "responses",
+      maxConcurrency: 2,
+      apiKeys: [
+        { id: "parallel-one", label: "One", secret: "parallel-key-one", enabled: true },
+        { id: "parallel-two", label: "Two", secret: "parallel-key-two", enabled: true }
+      ]
+    });
+    await Promise.all([testAiConnection(), testAiConnection()]);
+    assert.equal(maxActive, 2);
+    assert.equal(aiStatus().effectiveConcurrency, 2);
+    assert.ok(authorizations.includes("Bearer parallel-key-one"));
+    assert.ok(authorizations.includes("Bearer parallel-key-two"));
+    assert.equal(JSON.stringify(aiStatus()).includes("parallel-key-one"), false);
+
+    malformed = true;
+    configureAi({
+      baseUrl: "http://127.0.0.1:" + server.address().port,
+      model: "pool-model",
+      wireApi: "responses",
+      maxConcurrency: 2,
+      apiKeys: [
+        { id: "format-one", label: "One", secret: "format-key-one", enabled: true },
+        { id: "format-two", label: "Two", secret: "format-key-two", enabled: true }
+      ]
+    });
+    const callsBeforeMalformedResponse = authorizations.length;
+    await assert.rejects(testAiConnection(), /did not include a JSON object/);
+    assert.equal(authorizations.length - callsBeforeMalformedResponse, 1);
+  } finally {
+    configureAi(null);
+    await new Promise((resolve) => server.close(resolve));
+    if (originalAttempts === undefined) delete process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS;
+    else process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS = originalAttempts;
+    if (originalDelay === undefined) delete process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+    else process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = originalDelay;
+  }
+});
+
+test("AI connection pool switches endpoint, model, wire API, and key together", async () => {
+  const received = [];
+  const responsesServer = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    received.push({ provider: "responses", path: request.url, authorization: request.headers.authorization, body: JSON.parse(body) });
+    response.writeHead(429, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "provider busy" } }));
+  });
+  const chatServer = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    received.push({ provider: "chat", path: request.url, authorization: request.headers.authorization, body: JSON.parse(body) });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ ok: true }) } }],
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 }
+    }));
+  });
+  await Promise.all([
+    new Promise((resolve) => responsesServer.listen(0, "127.0.0.1", resolve)),
+    new Promise((resolve) => chatServer.listen(0, "127.0.0.1", resolve))
+  ]);
+  const originalAttempts = process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS;
+  const originalDelay = process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;
+  try {
+    process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS = "2";
+    process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS = "10";
+    configureAi({
+      maxConcurrency: 2,
+      apiKeys: [
+        {
+          id: "responses-provider",
+          label: "Responses provider",
+          secret: "responses-secret",
+          baseUrl: "http://127.0.0.1:" + responsesServer.address().port,
+          model: "responses-model",
+          wireApi: "responses",
+          enabled: true
+        },
+        {
+          id: "chat-provider",
+          label: "Chat provider",
+          secret: "chat-secret",
+          baseUrl: "http://127.0.0.1:" + chatServer.address().port,
+          model: "chat-model",
+          wireApi: "chat_completions",
+          enabled: true
+        }
+      ]
+    });
+    const result = await testAiConnection();
+    assert.equal(result.ok, true);
+    assert.equal(received[0].path, "/responses");
+    assert.equal(received[0].authorization, "Bearer responses-secret");
+    assert.equal(received[0].body.model, "responses-model");
+    assert.equal(received[1].path, "/chat/completions");
+    assert.equal(received[1].authorization, "Bearer chat-secret");
+    assert.equal(received[1].body.model, "chat-model");
+    assert.equal(aiStatus().keys[0].baseUrl, "http://127.0.0.1:" + responsesServer.address().port);
+    assert.equal(aiStatus().keys[1].wireApi, "chat_completions");
+    assert.equal(JSON.stringify(aiStatus()).includes("chat-secret"), false);
+  } finally {
+    configureAi(null);
+    await Promise.all([
+      new Promise((resolve) => responsesServer.close(resolve)),
+      new Promise((resolve) => chatServer.close(resolve))
+    ]);
     if (originalAttempts === undefined) delete process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS;
     else process.env.JOB_AGENT_AI_MAX_REQUEST_ATTEMPTS = originalAttempts;
     if (originalDelay === undefined) delete process.env.JOB_AGENT_AI_RETRY_BASE_DELAY_MS;

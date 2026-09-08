@@ -1,4 +1,4 @@
-const validViews = new Set(["overview", "jobs", "routine", "profile", "exclusions", "settings", "setup"]);
+const validViews = new Set(["overview", "jobs", "routine", "profile", "exclusions", "settings", "ai", "setup"]);
 
 function initialView() {
   const requested = new URL(window.location.href).searchParams.get("view");
@@ -41,6 +41,11 @@ const state = {
   workerScripts: {},
   workerScriptsLoading: false,
   aiConfigDirty: false,
+  aiPane: "connections",
+  aiBudgetSaving: false,
+  editingAiConnectionId: null,
+  aiConnectionTestResults: new Map(),
+  selectedAiConnectionIds: new Set(),
   historyReset: { running: false, completed: new Set(), timeout: null, window: null },
   historyMigration: { running: false, completed: new Set(), results: {}, timeout: null, window: null },
   jobAssistantOpen: false,
@@ -78,6 +83,11 @@ const platformJobTypes = {
   seek: ["any", "full-time", "part-time", "contract", "casual"],
   indeed: ["any", "casual", "part-time", "full-time", "permanent", "temporary", "temp-to-perm", "fixed-term", "graduate", "seasonal", "contract", "subcontract", "student-job"]
 };
+const platformSearchRadiiKm = {
+  linkedin: [],
+  seek: [0, 2, 5, 10, 25, 30, 50, 100],
+  indeed: [0, 5, 10, 15, 25, 50, 100]
+};
 const validationStatusLabels = {
   WAITING_FOR_WORKER: "等待预检",
   VALID: "已验证",
@@ -102,6 +112,13 @@ const scoreCategoryLabels = {
   LOW_MATCH: "低匹配",
   REJECTED: "已排除"
 };
+const scoreDimensionDefinitions = [
+  { key: "roleAlignment", label: "岗位方向", maxScore: 30 },
+  { key: "skillsMatch", label: "技能匹配", maxScore: 25 },
+  { key: "experienceEvidence", label: "经验证据", maxScore: 20 },
+  { key: "requirementsFit", label: "要求适配", maxScore: 15 },
+  { key: "preferenceFit", label: "偏好契合", maxScore: 10 }
+];
 const titleClassificationLabels = {
   CLEAR_MATCH: "标题明确匹配",
   AMBIGUOUS: "标题信息不足",
@@ -169,12 +186,13 @@ const pages = {
   profile: ["候选人资料", "职业画像"],
   exclusions: ["筛选规则", "排除关键词"],
   settings: ["共用配置", "搜索设置"],
+  ai: ["本地模型连接", "AI 服务"],
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
   { id: "linkedin", name: "LinkedIn", version: "v1.1.1", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v1.1.2", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v1.1.1", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "indeed", name: "Indeed", version: "v1.1.3", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v1.1.2", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -277,7 +295,13 @@ async function api(path, options = {}) {
     ...options
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || "请求失败。");
+  if (!response.ok) {
+    const message = body.error || "请求失败。";
+    const duplicateNamePrefix = "AI connection name already exists: ";
+    throw new Error(message.startsWith(duplicateNamePrefix)
+      ? "连接名称已存在，请使用其他名称：" + message.slice(duplicateNamePrefix.length)
+      : message);
+  }
   return body;
 }
 
@@ -1356,7 +1380,7 @@ function unifiedRoutineTaskRow(task, validation = null) {
     + '<td>' + badge(names[source.platform], "source-" + source.platform) + '</td>'
     + '<td><strong>' + escapeHtml(source.keyword) + '</strong></td>'
     + '<td>' + escapeHtml(source.location) + '</td>'
-    + '<td><span>' + escapeHtml(postedWithinLabels[Number(source.postedWithinDays)] || "不限") + '</span><small>' + escapeHtml(jobTypeLabels[source.jobType || "any"] || source.jobType || "不限") + '</small></td>'
+    + '<td><span>' + escapeHtml(postedWithinLabels[Number(source.postedWithinDays)] || "不限") + '</span><small>' + escapeHtml(taskFilterSummary(source)) + '</small></td>'
     + '<td><div class="routine-task-status">' + status + todayRoutineTaskBadge(todayRun) + '</div></td>'
     + '<td class="action-cell unified-task-actions">' + actions + '</td></tr>';
 }
@@ -1511,7 +1535,7 @@ function renderRoutine() {
     + "<td>" + badge(names[validation.platform], "source-" + validation.platform) + "</td>"
     + "<td><strong>" + escapeHtml(validation.keyword) + "</strong></td>"
     + "<td>" + escapeHtml(validation.location) + "</td>"
-    + "<td><span>" + escapeHtml(timeLabel(validation.postedWithinDays)) + "</span><small>" + escapeHtml(jobTypeLabels[validation.jobType || "any"] || validation.jobType || "不限") + "</small></td>"
+    + "<td><span>" + escapeHtml(timeLabel(validation.postedWithinDays)) + "</span><small>" + escapeHtml(taskFilterSummary(validation)) + "</small></td>"
     + "<td>" + badge(presentation.label, "status-badge") + "</td>"
     + '<td class="muted">' + escapeHtml(presentation.reason) + "</td>"
     + '<td class="action-cell validation-actions">' + addButton + '<button class="icon-button" data-retry-validation="' + validation.id + '" title="重新尝试预检"><i data-lucide="rotate-cw"></i></button>'
@@ -1544,7 +1568,7 @@ function renderRoutine() {
       return '<tr>'
       + "<td>" + badge(names[task.platform], "source-" + task.platform) + "</td>"
       + "<td><strong>" + escapeHtml(task.keyword) + "</strong></td>"
-      + "<td>" + escapeHtml(task.location) + "</td><td><span>" + escapeHtml(timeLabel(task.postedWithinDays)) + "</span><small>" + escapeHtml(jobTypeLabels[task.jobType || "any"] || task.jobType || "不限") + "</small></td>"
+      + "<td>" + escapeHtml(task.location) + "</td><td><span>" + escapeHtml(timeLabel(task.postedWithinDays)) + "</span><small>" + escapeHtml(taskFilterSummary(task)) + "</small></td>"
       + "<td>" + badge(task.status, "status-badge") + "</td>"
       + '<td class="muted">' + escapeHtml(progressText) + "</td>"
       + '<td class="action-cell">' + (task.status === "needs_user_action"
@@ -1693,6 +1717,82 @@ function profileEntryCount(profile, key) {
   return (profile[key] || []).length;
 }
 
+function normalizedSearchRadiusKm(value) {
+  if (value === null || value === undefined || value === "" || value === "any") return null;
+  const radius = Number(value);
+  return Number.isInteger(radius) && radius >= 0 ? radius : null;
+}
+
+function locationSupportsSearchRadius(location) {
+  const normalized = String(location || "")
+    .toLowerCase()
+    .replace(/[.,/()_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized || normalized.length < 3 || /^(all\b|remote\b|anywhere\b|nationwide\b)/.test(normalized)) return false;
+  const broadLocations = new Set([
+    "australia", "australia wide", "new south wales", "new south wales australia", "nsw", "nsw australia",
+    "victoria", "victoria australia", "vic", "vic australia", "queensland", "queensland australia", "qld", "qld australia",
+    "south australia", "south australia australia", "sa", "sa australia", "western australia", "western australia australia", "wa", "wa australia",
+    "tasmania", "tasmania australia", "tas", "tas australia", "northern territory", "northern territory australia", "nt", "nt australia",
+    "australian capital territory", "australian capital territory australia", "act", "act australia"
+  ]);
+  return !broadLocations.has(normalized);
+}
+
+function searchRadiusOptions(platform, selected = null) {
+  const selectedRadius = normalizedSearchRadiusKm(selected);
+  return '<option value="any"' + (selectedRadius === null ? " selected" : "") + '>平台默认</option>'
+    + (platformSearchRadiiKm[platform] || []).map((radius) => '<option value="' + radius + '"' + (selectedRadius === radius ? " selected" : "") + '>'
+      + (radius === 0 ? "精确地点" : radius + " km 内") + "</option>").join("");
+}
+
+function searchRadiusLabel(value) {
+  const radius = normalizedSearchRadiusKm(value);
+  return radius === null ? "" : radius === 0 ? "精确地点" : radius + " km 内";
+}
+
+function taskFilterSummary(task) {
+  return [jobTypeLabels[task?.jobType || "any"] || task?.jobType || "不限", searchRadiusLabel(task?.searchRadiusKm)].filter(Boolean).join(" · ");
+}
+
+function searchRadiusEligibility(platform, location) {
+  if (!(platform in platformSearchRadiiKm) || !platformSearchRadiiKm[platform].length) {
+    return { enabled: false, note: platform === "linkedin" ? "LinkedIn 当前不提供任务级搜索半径；原有搜索行为保持不变。" : "该平台暂不支持搜索半径。" };
+  }
+  if (!locationSupportsSearchRadius(location)) {
+    return { enabled: false, note: "请先填写城市、城区、邮编或具体地址。Australia、州、Remote 或 All 开头的宽泛地点不能设置半径。" };
+  }
+  return { enabled: true, note: "可选择平台搜索半径；Worker 预检会再次确认地点与半径已生效。" };
+}
+
+function syncRoutineSearchRadiusOptions(selected) {
+  const platform = el("#routine-task-platform").value || "linkedin";
+  const location = el("#routine-task-location").value;
+  const select = el("#routine-task-search-radius");
+  const eligibility = searchRadiusEligibility(platform, location);
+  const current = selected !== undefined ? selected : select.value;
+  const radius = normalizedSearchRadiusKm(current);
+  const allowed = platformSearchRadiiKm[platform] || [];
+  select.innerHTML = searchRadiusOptions(platform, eligibility.enabled && (radius === null || allowed.includes(radius)) ? radius : null);
+  select.disabled = !eligibility.enabled;
+  el("#routine-task-radius-note").textContent = eligibility.note;
+}
+
+function syncCategorySearchRadiusOptions(row, selected) {
+  if (!row) return;
+  const platform = row.querySelector('[data-category-task-field="platform"]').value;
+  const location = row.querySelector('[data-category-task-field="location"]').value;
+  const select = row.querySelector('[data-category-task-field="searchRadiusKm"]');
+  const eligibility = searchRadiusEligibility(platform, location);
+  const current = selected !== undefined ? selected : select.value;
+  const radius = normalizedSearchRadiusKm(current);
+  const allowed = platformSearchRadiiKm[platform] || [];
+  select.innerHTML = searchRadiusOptions(platform, eligibility.enabled && (radius === null || allowed.includes(radius)) ? radius : null);
+  select.disabled = !eligibility.enabled;
+  select.title = eligibility.note;
+}
+
 function selectedExclusionsProfile() {
   return state.data.profiles.find((profile) => profile.id === state.exclusionsProfileId)
     || activeProfile()
@@ -1830,7 +1930,7 @@ function renderProfile() {
     ? '<i data-lucide="circle-check"></i><span>默认：' + escapeHtml(profileLabel(active)) + "</span>"
     : '<i data-lucide="circle-alert"></i><span>尚未激活画像</span>';
   el("#profile-status").textContent = state.data.ai.configured
-    ? "AI 已配置：" + state.data.ai.model
+    ? "AI 已配置：" + aiConnectionSummary(state.data.ai)
     : "本地规则模式；配置 AI 后可获得语义画像与 JD 审阅。";
   el("#profile-versions").innerHTML = state.data.profiles.map((record) =>
     '<button class="profile-version ' + (record.id === state.profileId ? "is-selected" : "") + '" data-profile="' + record.id + '"><span>'
@@ -1907,21 +2007,143 @@ function renderSettings() {
     + '<div><strong>' + Number(history.migratedWorkerRecords || 0).toLocaleString() + '</strong><span>旧 Worker 已迁移</span></div>'
     + '<p><i data-lucide="shield-check"></i>同平台按 ID / 规范链接精确判重；跨平台仅在公司、完整职位名和地点同时一致时跳过。</p>';
   renderPreferenceLearningSettings();
-  if (!state.aiConfigDirty) {
-    const ai = state.data.ai;
-    el("#ai-base-url").value = ai.baseUrl || "";
-    el("#ai-model").value = ai.model || "";
-    el("#ai-wire-api").value = ai.wireApi === "responses" ? "responses" : "chat_completions";
-    el("#ai-api-key").value = "";
-    el("#ai-api-key").placeholder = ai.hasApiKey ? "已保存 " + (ai.keyHint || "密钥") + "；留空则保留" : "输入新密钥";
-  }
+}
+
+function aiKeyStatus(key) {
+  const labels = {
+    testing: ["连接预检中", "is-active"],
+    ready: ["可用", "is-ready"],
+    active: ["使用中", "is-active"],
+    cooling: ["冷却中", "is-cooling"],
+    attention: ["需检查", "is-attention"],
+    disabled: ["已暂停", "is-disabled"]
+  };
+  return labels[key.status] || labels.ready;
+}
+
+function aiConnectionSummary(ai) {
+  const enabled = (ai?.keys || []).filter((key) => key.enabled && key.baseUrl && key.model);
+  const models = [...new Set(enabled.map((key) => key.model))];
+  if (!enabled.length) return "未配置";
+  if (models.length === 1) return models[0];
+  return `${enabled.length} 条连接 · ${models.length} 个模型`;
+}
+
+function renderAiService() {
   const ai = state.data.ai;
+  renderAiBudget();
+  const availableConnectionIds = new Set(ai.keys.map((key) => key.id));
+  for (const id of state.selectedAiConnectionIds) {
+    if (!availableConnectionIds.has(id)) state.selectedAiConnectionIds.delete(id);
+  }
+  if (!state.aiConfigDirty) {
+    el("#ai-max-concurrency").value = String(ai.maxConcurrency ?? 0);
+  }
   const status = el("#ai-config-status");
   status.textContent = ai.configured
-    ? "已配置 " + ai.model + (ai.hasApiKey ? " · 密钥已保存" : " · 未保存密钥")
-    : "尚未配置完整的 Base URL 与模型";
+    ? `已启用 ${ai.keys.filter((key) => key.enabled && key.baseUrl && key.model).length} 条独立连接`
+    : "尚无可用的完整连接";
   status.classList.toggle("is-configured", ai.configured);
-  el("#clear-ai-key").disabled = !ai.hasApiKey;
+  const enabledCount = ai.keys.filter((key) => key.enabled && key.baseUrl && key.model).length;
+  el("#ai-service-health").textContent = ai.configured ? "可调度" : "未配置";
+  el("#ai-enabled-key-count").textContent = String(enabledCount);
+  el("#ai-effective-concurrency").textContent = String(ai.effectiveConcurrency || 1);
+  el("#ai-queue-count").textContent = String(ai.queue?.waiting || 0);
+  el("#ai-key-count").textContent = ai.keys.length + " 条";
+  el("#ai-key-list").innerHTML = ai.keys.length ? ai.keys.map((key) => {
+    let [statusLabel, statusClass] = aiKeyStatus(key);
+    const activity = key.lastUsedAt ? dateTime(key.lastUsedAt) : "尚未使用";
+    const error = key.lastError ? '<small class="ai-key-error" title="' + escapeHtml(key.lastError) + '">' + escapeHtml(key.lastError) + "</small>" : "";
+    const testState = state.aiConnectionTestResults.get(key.id);
+    if (testState?.pending) [statusLabel, statusClass] = ["测试中", "is-active"];
+    else if (testState?.ok === false) [statusLabel, statusClass] = ["连接不可用", "is-attention"];
+    const testResult = testState
+      && !testState.pending
+      ? '<span class="ai-key-test-result ' + (testState.ok ? "is-success" : "is-failure") + '" title="' + escapeHtml(testState.error || (testState.ok ? "最近一次测试通过" : "最近一次测试失败")) + '"><i data-lucide="'
+        + (testState.ok ? "circle-check" : "circle-alert") + '"></i>' + escapeHtml(testState.ok ? "测试通过" : "测试失败") + "</span>"
+      : "";
+    const editing = state.editingAiConnectionId === key.id;
+    return '<article class="ai-key-row" data-ai-key-id="' + escapeHtml(key.id) + '">'
+      + '<div class="ai-key-row-header"><label class="ai-key-select" title="选择此连接用于导出"><input type="checkbox" data-ai-key-select '
+      + (state.selectedAiConnectionIds.has(key.id) ? "checked" : "") + '><span class="sr-only">选择 ' + escapeHtml(key.label) + '</span></label><label class="ai-key-switch" title="启用或暂停该连接"><input type="checkbox" data-ai-key-enabled '
+      + (key.enabled ? "checked" : "") + '><span></span></label><div class="ai-key-identity"><strong>' + escapeHtml(key.label)
+      + '</strong><code>' + escapeHtml(key.hint) + '</code></div><div class="ai-key-provider"><strong>' + escapeHtml(key.model || "未设置模型")
+      + '</strong><small title="' + escapeHtml(key.baseUrl || "") + '">' + escapeHtml(key.baseUrl || "未设置服务地址") + '</small><span>'
+      + escapeHtml(key.wireApi === "responses" ? "Responses API" : "Chat Completions") + '</span></div><div class="ai-key-runtime"><div><span class="ai-key-status ' + statusClass + '">' + statusLabel
+      + '</span>' + testResult + '</div><small>' + Number(key.requests || 0) + " 次请求 · " + Number(key.failures || 0) + " 次失败</small><small>最近：" + escapeHtml(activity) + '</small>' + error
+      + (testState?.error ? '<small class="ai-key-test-error">' + escapeHtml(testState.error) + '</small>' : '')
+      + '</div><div class="ai-key-actions"><button class="icon-button" data-test-ai-key="' + escapeHtml(key.id)
+      + '" title="测试此连接"><i data-lucide="plug-zap"></i></button><button class="icon-button' + (editing ? " is-active" : "") + '" data-edit-ai-key="' + escapeHtml(key.id)
+      + '" title="编辑连接"><i data-lucide="pencil"></i></button><button class="icon-button destructive" data-delete-ai-key="' + escapeHtml(key.id)
+      + '" title="移除此连接"><i data-lucide="trash-2"></i></button></div></div>'
+      + '<div class="ai-key-edit-panel"' + (editing ? "" : " hidden") + '>'
+      + '<label class="field ai-key-edit-name"><span>名称</span><input data-ai-key-edit-label maxlength="80" value="' + escapeHtml(key.label) + '" autocomplete="off"></label>'
+      + '<label class="field ai-key-edit-url"><span>API Base URL</span><input data-ai-key-edit-base-url type="url" required value="' + escapeHtml(key.baseUrl || "") + '" autocomplete="off"></label>'
+      + '<label class="field ai-key-edit-model"><span>模型</span><input data-ai-key-edit-model required value="' + escapeHtml(key.model || "") + '" autocomplete="off"></label>'
+      + '<label class="field ai-key-edit-api"><span>API 类型</span><select data-ai-key-edit-wire-api><option value="responses"' + (key.wireApi === "responses" ? " selected" : "") + '>Responses API</option><option value="chat_completions"' + (key.wireApi !== "responses" ? " selected" : "") + '>Chat Completions</option></select></label>'
+      + '<label class="field ai-key-edit-secret"><span>更换 API Key（留空则不变）</span><input data-ai-key-edit-secret type="password" minlength="8" placeholder="当前 ' + escapeHtml(key.hint) + '" autocomplete="new-password"></label>'
+      + '<div class="ai-key-edit-actions"><button class="button button-secondary" type="button" data-cancel-ai-key="' + escapeHtml(key.id) + '">取消</button><button class="button button-primary" type="button" data-save-ai-key="' + escapeHtml(key.id) + '"><i data-lucide="save"></i><span>保存更改</span></button></div>'
+      + '</div></article>';
+  }).join("") : '<div class="ai-key-empty"><i data-lucide="network"></i><strong>还没有连接</strong><span>可以单条添加，也可以按规定格式批量导入。</span></div>';
+  el("#test-all-ai-connections").disabled = !ai.keys.length;
+  const selectedCount = state.selectedAiConnectionIds.size;
+  const selectAll = el("#select-all-ai-connections");
+  selectAll.checked = Boolean(ai.keys.length) && selectedCount === ai.keys.length;
+  selectAll.indeterminate = selectedCount > 0 && selectedCount < ai.keys.length;
+  selectAll.disabled = !ai.keys.length;
+  el("#selected-ai-connection-count").textContent = `已选 ${selectedCount} 条`;
+  el("#export-selected-ai-connections").disabled = !selectedCount;
+}
+
+function renderAiBudget() {
+  for (const tab of document.querySelectorAll("[data-ai-pane]")) {
+    const selected = tab.dataset.aiPane === state.aiPane;
+    tab.classList.toggle("is-active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  el("#ai-connections-panel").hidden = state.aiPane !== "connections";
+  el("#ai-budget-panel").hidden = state.aiPane !== "budget";
+  if (state.aiBudgetSaving || el("#ai-budget-fields").contains(document.activeElement)) return;
+  const groups = [
+    ["单次输出 Token", "上限过低可能导致评分明细或 JSON 被截断；Cover Letter 还受页数限制。", "tokens", [
+      ["maxJdOutputTokens", "JD 审阅与评分"], ["maxProfileOutputTokens", "画像生成"],
+      ["maxReflectionOutputTokens", "审阅复盘"], ["maxAssistantOutputTokens", "职位聊天助手"], ["maxCoverLetterOutputTokens", "Cover Letter"]]],
+    ["输入长度", "字符数与 Token 数不同，以下限制用于截取输入正文。", "字符", [
+      ["maxInputChars", "JD / 简历正文"], ["maxExternalProfileChars", "外部画像分析"], ["maxAssistantInputChars", "聊天助手上下文"]]],
+    ["每批次调用限制", "用于运行批次的审阅计数，不包括所有独立聊天、测试或重试请求。", "次", [
+      ["maxJdReviewsPerRun", "JD 审阅数量"], ["maxAiCallsPerRun", "AI 调用计数"]]]
+  ];
+  el("#ai-budget-fields").innerHTML = groups.map(([title, description, unit, fields]) =>
+    '<section class="settings-section ai-budget-section"><div class="setting-label"><h3>' + title + '</h3><p>' + description + '</p></div><div class="ai-budget-grid">'
+    + fields.map(([key, label]) => {
+      const limits = state.data.ai.budgetLimits?.[key];
+      if (!limits) return "";
+      return '<label class="field"><span>' + label + '（' + unit + '）</span><input type="number" required step="1" data-ai-budget="' + key + '" min="' + limits[0] + '" max="' + limits[1] + '" value="' + state.data.ai.budget[key] + '"><small>' + limits[0].toLocaleString() + ' – ' + limits[1].toLocaleString() + '</small></label>';
+    }).join("") + '</div></section>').join("");
+}
+
+async function saveAiBudget(field) {
+  if (!field.reportValidity()) return;
+  const key = field.dataset.aiBudget;
+  const value = Number(field.value);
+  if (value === state.data.ai.budget[key]) return;
+  state.aiBudgetSaving = true;
+  const inputs = [...document.querySelectorAll("[data-ai-budget]")];
+  inputs.forEach((input) => { input.disabled = true; });
+  el("#ai-budget-save-status").textContent = "保存中…";
+  try {
+    const result = await api("/api/ai-config/budget", { method: "PATCH", body: JSON.stringify({ budget: { [key]: value } }) });
+    state.data.ai = result.ai;
+    el("#ai-budget-save-status").textContent = "已自动保存";
+  } catch (error) {
+    field.value = state.data.ai.budget[key];
+    el("#ai-budget-save-status").textContent = "保存失败";
+    toast(error.message, "error");
+  } finally {
+    state.aiBudgetSaving = false;
+    inputs.forEach((input) => { input.disabled = false; });
+  }
 }
 
 function renderExclusions() {
@@ -2168,7 +2390,7 @@ function render() {
   el("#page-kicker").textContent = title[0];
   el("#page-title").textContent = title[1];
   el("#ai-state").textContent = state.data
-    ? state.data.ai.configured ? "AI · " + state.data.ai.model : "本地规则"
+    ? state.data.ai.configured ? "AI · " + aiConnectionSummary(state.data.ai) : "本地规则"
     : "正在连接";
   el("#start-run").classList.toggle("is-hidden", state.view === "routine");
   document.querySelectorAll(".view").forEach((node) => node.classList.toggle("is-active", node.id === "view-" + state.view));
@@ -2180,6 +2402,7 @@ function render() {
   renderProfile();
   renderExclusions();
   renderSettings();
+  renderAiService();
   renderSetup();
   renderImportOptions();
   refreshIcons();
@@ -2956,6 +3179,8 @@ function settingPayload() {
 function categoryTaskEditorRow(task = {}) {
   const platform = task.platform || "linkedin";
   const jobType = task.jobType || "any";
+  const searchRadiusKm = normalizedSearchRadiusKm(task.searchRadiusKm);
+  const radiusEnabled = searchRadiusEligibility(platform, task.location || "").enabled;
   const postedWithinDays = Number(task.postedWithinDays || 0);
   const platformOptions = ["linkedin", "indeed", "seek"].map((value) => '<option value="' + value + '"' + (platform === value ? " selected" : "") + '>' + names[value] + '</option>').join("");
   const timeOptions = Object.entries(postedWithinLabels).map(([value, label]) => '<option value="' + value + '"' + (postedWithinDays === Number(value) ? " selected" : "") + '>' + label + '</option>').join("");
@@ -2965,6 +3190,7 @@ function categoryTaskEditorRow(task = {}) {
     + '<label class="field category-task-keyword"><span>关键词（逗号表示任一）</span><input data-category-task-field="keyword" required maxlength="160" placeholder="intern, internship" value="' + escapeHtml(task.keyword || "") + '"></label>'
     + '<label class="field category-task-location"><span>地点</span><input data-category-task-field="location" required maxlength="120" value="' + escapeHtml(task.location || "") + '"></label>'
     + '<label class="field"><span>时间</span><select data-category-task-field="postedWithinDays">' + timeOptions + '</select></label>'
+    + '<label class="field"><span>搜索半径</span><select data-category-task-field="searchRadiusKm"' + (radiusEnabled ? "" : " disabled") + '>' + searchRadiusOptions(platform, radiusEnabled ? searchRadiusKm : null) + '</select></label>'
     + '<button class="icon-button destructive category-task-remove" type="button" data-remove-category-task title="删除子任务"><i data-lucide="trash-2"></i></button>'
     + '</div>';
 }
@@ -2975,7 +3201,8 @@ function taskIdentityKey(task) {
     String(task?.keyword || "").toLowerCase().split(",").map((value) => value.trim()).filter(Boolean).join(","),
     String(task?.location || "").toLowerCase().replace(/\s+/g, " ").trim(),
     Number(task?.postedWithinDays || 0),
-    String(task?.jobType || "any")
+    String(task?.jobType || "any"),
+    normalizedSearchRadiusKm(task?.searchRadiusKm) ?? "any"
   ].join("\u0000");
 }
 
@@ -2995,6 +3222,7 @@ function verifiedTaskOptions() {
       location: source.location,
       postedWithinDays: Number(source.postedWithinDays || 0),
       jobType: source.jobType || "any",
+      searchRadiusKm: normalizedSearchRadiusKm(source.searchRadiusKm),
       enabled: Boolean(enabled)
     });
   };
@@ -3012,7 +3240,7 @@ function verifiedTaskOptions() {
 function visibleVerifiedTaskOptions() {
   const query = String(el("#category-verified-search")?.value || "").toLowerCase().trim();
   if (!query) return verifiedTaskOptions();
-  return verifiedTaskOptions().filter((task) => [names[task.platform], task.platform, task.keyword, task.location, postedWithinLabels[task.postedWithinDays], jobTypeLabels[task.jobType || "any"]]
+  return verifiedTaskOptions().filter((task) => [names[task.platform], task.platform, task.keyword, task.location, postedWithinLabels[task.postedWithinDays], jobTypeLabels[task.jobType || "any"], searchRadiusLabel(task.searchRadiusKm)]
     .some((value) => String(value || "").toLowerCase().includes(query)));
 }
 
@@ -3030,7 +3258,7 @@ function renderVerifiedTaskPicker() {
       + '<span>' + badge(names[task.platform], "source-" + task.platform) + '</span>'
       + '<strong title="' + escapeHtml(task.keyword) + '">' + escapeHtml(task.keyword) + '</strong>'
       + '<span class="verified-task-location" title="' + escapeHtml(task.location) + '">' + escapeHtml(task.location) + '</span>'
-      + '<span class="verified-task-time">' + escapeHtml(postedWithinLabels[task.postedWithinDays] || "不限") + ' · ' + escapeHtml(jobTypeLabels[task.jobType || "any"] || task.jobType) + '</span>'
+      + '<span class="verified-task-time">' + escapeHtml(postedWithinLabels[task.postedWithinDays] || "不限") + ' · ' + escapeHtml(taskFilterSummary(task)) + '</span>'
       + '<span class="verified-task-state">' + badge(task.enabled ? "可运行" : "已预检", "status-badge") + '</span>'
       + '</label>';
   }).join("") || '<div class="category-editor-empty">' + (options.length ? "没有匹配的已预检任务。" : "还没有通过预检的任务，可先在下方新增。") + '</div>';
@@ -3052,6 +3280,7 @@ function updateCategoryEditorCount() {
 function addCategoryTaskEditor(task = {}) {
   el("#category-task-editor").querySelector(".category-editor-empty")?.remove();
   el("#category-task-editor").insertAdjacentHTML("beforeend", categoryTaskEditorRow(task));
+  syncCategorySearchRadiusOptions(el("#category-task-editor .category-task-editor-row:last-child"), task.searchRadiusKm);
   updateCategoryEditorCount();
   refreshIcons();
 }
@@ -3097,7 +3326,8 @@ function taskCategoryFormInput() {
       keyword: task.keyword,
       location: task.location,
       postedWithinDays: task.postedWithinDays,
-      jobType: task.jobType || "any"
+      jobType: task.jobType || "any",
+      searchRadiusKm: normalizedSearchRadiusKm(task.searchRadiusKm)
     };
   });
   const draftTasks = [...document.querySelectorAll("#category-task-editor .category-task-editor-row")].map((row) => ({
@@ -3106,7 +3336,8 @@ function taskCategoryFormInput() {
     keyword: row.querySelector('[data-category-task-field="keyword"]').value,
     location: row.querySelector('[data-category-task-field="location"]').value,
     postedWithinDays: Number(row.querySelector('[data-category-task-field="postedWithinDays"]').value),
-    jobType: row.querySelector('[data-category-task-field="jobType"]').value
+    jobType: row.querySelector('[data-category-task-field="jobType"]').value,
+    searchRadiusKm: normalizedSearchRadiusKm(row.querySelector('[data-category-task-field="searchRadiusKm"]').value)
   }));
   const tasks = [...verifiedTasks, ...draftTasks];
   if (!tasks.length) throw new Error("请至少选择一项已预检任务，或新增一项待预检任务。");
@@ -3204,6 +3435,7 @@ function openRoutineTaskDialog() {
   el("#routine-task-dialog-title").textContent = "添加待预检任务";
   el("#routine-task-submit-label").textContent = "加入待预检";
   syncRoutineJobTypeOptions("any");
+  syncRoutineSearchRadiusOptions(null);
   el("#routine-task-dialog").showModal();
 }
 
@@ -3216,6 +3448,7 @@ function openValidationEditor(id) {
   el("#routine-task-location").value = validation.location;
   el("#routine-task-time").value = String(validation.postedWithinDays);
   syncRoutineJobTypeOptions(validation.jobType || "any");
+  syncRoutineSearchRadiusOptions(validation.searchRadiusKm);
   el("#routine-task-dialog-title").textContent = "修改待预检任务";
   el("#routine-task-submit-label").textContent = "保存到待预检";
   el("#routine-task-dialog").showModal();
@@ -3227,7 +3460,8 @@ function routineTaskInput() {
     keyword: el("#routine-task-keyword").value,
     location: el("#routine-task-location").value,
     postedWithinDays: Number(el("#routine-task-time").value),
-    jobType: el("#routine-task-job-type").value
+    jobType: el("#routine-task-job-type").value,
+    searchRadiusKm: normalizedSearchRadiusKm(el("#routine-task-search-radius").value)
   };
 }
 
@@ -3529,10 +3763,7 @@ async function saveSettings() {
 
 function aiConfigPayload() {
   return {
-    baseUrl: el("#ai-base-url").value.trim(),
-    model: el("#ai-model").value.trim(),
-    wireApi: el("#ai-wire-api").value,
-    apiKey: el("#ai-api-key").value.trim()
+    maxConcurrency: Number(el("#ai-max-concurrency").value)
   };
 }
 
@@ -3549,38 +3780,217 @@ async function runAiConfigAction(button, busyLabel, action) {
   } finally {
     button.classList.remove("is-busy");
     button.innerHTML = originalMarkup;
-    button.disabled = button.id === "clear-ai-key" ? !state.data.ai.hasApiKey : false;
+    button.disabled = false;
     refreshIcons();
   }
 }
 
 async function saveAiConfig() {
-  const button = el("#save-ai-config");
+  const select = el("#ai-max-concurrency");
+  const previous = state.data.ai.maxConcurrency ?? 0;
+  state.aiConfigDirty = true;
+  select.disabled = true;
+  el("#ai-config-status").textContent = "正在保存…";
+  try {
+    const result = await api("/api/ai-config/scheduling", { method: "PATCH", body: JSON.stringify(aiConfigPayload()) });
+    state.data.ai = result.ai;
+    toast("调度设置已自动保存。");
+  } catch (error) {
+    select.value = String(previous);
+    toast("保存失败：" + error.message, "error");
+  } finally {
+    state.aiConfigDirty = false;
+    select.disabled = false;
+    renderAiService();
+    refreshIcons();
+  }
+}
+
+async function addAiConnection(event) {
+  event.preventDefault();
+  const button = el("#add-ai-connection");
+  await runAiConfigAction(button, "添加中", async () => {
+    const existingIds = new Set(state.data.ai.keys.map((key) => key.id));
+    const result = await api("/api/ai-config/keys", {
+      method: "POST",
+      body: JSON.stringify({
+        label: el("#ai-connection-label").value.trim(),
+        baseUrl: el("#ai-connection-base-url").value.trim(),
+        model: el("#ai-connection-model").value.trim(),
+        wireApi: el("#ai-connection-wire-api").value,
+        apiKey: el("#ai-connection-key").value.trim()
+      })
+    });
+    if (result.duplicates) return toast("这条连接已经存在。", "error");
+    el("#ai-connection-form").reset();
+    await reload();
+    await testNewAiConnections(result.ai.keys.filter((key) => !existingIds.has(key.id)));
+  });
+}
+
+async function importAiKeys() {
+  const input = el("#ai-key-import");
+  const button = el("#import-ai-keys");
+  await runAiConfigAction(button, "导入中", async () => {
+    const existingIds = new Set(state.data.ai.keys.map((key) => key.id));
+    const result = await api("/api/ai-config/keys/import", { method: "POST", body: JSON.stringify({ text: input.value }) });
+    input.value = "";
+    await reload();
+    if (result.imported) await testNewAiConnections(result.ai.keys.filter((key) => !existingIds.has(key.id)));
+    else toast("没有新增连接，重复项已忽略。", "success");
+  });
+}
+
+async function testNewAiConnections(connections) {
+  for (const connection of connections) state.aiConnectionTestResults.set(connection.id, { pending: true });
+  renderAiService();
+  refreshIcons();
+  let passed = 0;
+  for (const connection of connections) {
+    try {
+      await api("/api/ai-config/keys/" + encodeURIComponent(connection.id) + "/test", { method: "POST", body: "{}" });
+      state.aiConnectionTestResults.set(connection.id, { ok: true });
+      passed += 1;
+    } catch (error) {
+      state.aiConnectionTestResults.set(connection.id, { ok: false, error: error.message });
+    }
+    renderAiService();
+    refreshIcons();
+  }
+  const failed = connections.length - passed;
+  toast(failed ? `连接已保存：${passed} 条测试通过，${failed} 条不可用，请查看列表中的失败原因。`
+    : `连接已保存，${passed} 条测试通过。`, failed ? "error" : "success");
+}
+
+async function updateAiKey(id, patch) {
+  try {
+    await api("/api/ai-config/keys/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify(patch) });
+    await reload();
+  } catch (error) {
+    toast(error.message, "error");
+    await reload();
+  }
+}
+
+function editAiConnection(id) {
+  state.editingAiConnectionId = state.editingAiConnectionId === id ? null : id;
+  renderAiService();
+  refreshIcons();
+  if (state.editingAiConnectionId) {
+    requestAnimationFrame(() => document.querySelector(`[data-ai-key-id="${CSS.escape(id)}"] [data-ai-key-edit-label]`)?.focus());
+  }
+}
+
+function cancelAiConnectionEdit() {
+  state.editingAiConnectionId = null;
+  renderAiService();
+  refreshIcons();
+}
+
+async function saveAiConnection(id, button) {
+  const row = button.closest("[data-ai-key-id]");
+  const invalidField = [...row.querySelectorAll(".ai-key-edit-panel input, .ai-key-edit-panel select")]
+    .find((field) => !field.checkValidity());
+  if (invalidField) {
+    invalidField.reportValidity();
+    return;
+  }
+  const apiKey = row.querySelector("[data-ai-key-edit-secret]").value.trim();
+  const patch = {
+    label: row.querySelector("[data-ai-key-edit-label]").value.trim(),
+    baseUrl: row.querySelector("[data-ai-key-edit-base-url]").value.trim(),
+    model: row.querySelector("[data-ai-key-edit-model]").value.trim(),
+    wireApi: row.querySelector("[data-ai-key-edit-wire-api]").value,
+    ...(apiKey ? { apiKey } : {})
+  };
   await runAiConfigAction(button, "保存中", async () => {
-    await api("/api/ai-config", { method: "PUT", body: JSON.stringify(aiConfigPayload()) });
-    state.aiConfigDirty = false;
+    await api("/api/ai-config/keys/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify(patch) });
+    state.editingAiConnectionId = null;
+    state.aiConnectionTestResults.delete(id);
     await reload();
-    toast("AI 配置已保存到本机后端。密钥不会回显到页面。");
+    toast("连接设置已保存。", "success");
   });
 }
 
-async function testAiConfig() {
-  const button = el("#test-ai-config");
+async function testAiKey(id, button) {
   await runAiConfigAction(button, "测试中", async () => {
-    const result = await api("/api/ai-config/test", { method: "POST", body: JSON.stringify(aiConfigPayload()) });
-    toast("AI 连接成功" + (result.usage?.totalTokens ? "，本次使用 " + result.usage.totalTokens + " tokens。" : "。"));
+    try {
+      const result = await api("/api/ai-config/keys/" + encodeURIComponent(id) + "/test", { method: "POST", body: "{}" });
+      state.aiConnectionTestResults.set(id, { ok: true });
+      await reload();
+      toast("此连接测试通过" + (result.usage?.totalTokens ? `，使用 ${result.usage.totalTokens} tokens。` : "。"), "success");
+    } catch (error) {
+      state.aiConnectionTestResults.set(id, { ok: false, error: error.message });
+      renderAiService();
+      refreshIcons();
+      throw error;
+    }
   });
 }
 
-async function clearAiKey() {
-  if (!window.confirm("清除保存在本机后端的 AI API Key？")) return;
-  const button = el("#clear-ai-key");
-  await runAiConfigAction(button, "清除中", async () => {
-    await api("/api/ai-config/key", { method: "DELETE", body: "{}" });
-    state.aiConfigDirty = false;
+async function testAllAiConnections() {
+  const button = el("#test-all-ai-connections");
+  await runAiConfigAction(button, "测试中", async () => {
+    const result = await api("/api/ai-config/keys/test-all", { method: "POST", body: "{}" });
+    state.aiConnectionTestResults = new Map(result.results.map((item) => [item.id, item]));
     await reload();
-    toast("本机 AI API Key 已清除。密钥环境变量不会被修改。");
+    const message = result.failed
+      ? `测试完成：${result.passed} 条通过，${result.failed} 条失败。`
+      : `全部 ${result.passed} 条连接测试通过。`;
+    toast(message, result.failed ? "error" : "success");
   });
+}
+
+function selectAllAiConnections(selected) {
+  state.selectedAiConnectionIds = selected
+    ? new Set(state.data.ai.keys.map((key) => key.id))
+    : new Set();
+  renderAiService();
+  refreshIcons();
+}
+
+function selectAiConnection(id, selected) {
+  if (selected) state.selectedAiConnectionIds.add(id);
+  else state.selectedAiConnectionIds.delete(id);
+  renderAiService();
+  refreshIcons();
+}
+
+async function exportSelectedAiConnections() {
+  const ids = state.data.ai.keys.map((key) => key.id).filter((id) => state.selectedAiConnectionIds.has(id));
+  if (!ids.length) return;
+  const button = el("#export-selected-ai-connections");
+  await runAiConfigAction(button, "导出中", async () => {
+    const result = await api("/api/ai-config/keys/export", {
+      method: "POST",
+      body: JSON.stringify({ ids })
+    });
+    const date = new Intl.DateTimeFormat("en-CA", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+    const blob = new Blob(["\uFEFF", result.text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `job-agent-ai-connections-${date}.txt`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    toast(`已导出 ${result.count} 条连接，可直接粘贴到批量导入框。`, "success");
+  });
+}
+
+async function deleteAiKey(id) {
+  const key = state.data.ai.keys.find((item) => item.id === id);
+  if (!key || !window.confirm(`移除连接 ${key.label}（${key.hint}）？`)) return;
+  try {
+    await api("/api/ai-config/keys/" + encodeURIComponent(id), { method: "DELETE" });
+    state.aiConnectionTestResults.delete(id);
+    if (state.editingAiConnectionId === id) state.editingAiConnectionId = null;
+    await reload();
+    toast("AI 连接已从本机移除。", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 function installWorkers() {
@@ -3766,6 +4176,37 @@ function scoreEvidenceMarkup(values, emptyText, tone) {
   return '<ul class="score-evidence-list ' + tone + '">' + values.map((item) => '<li>' + escapeHtml(item) + "</li>").join("") + "</ul>";
 }
 
+function normalizedScoreBreakdown(screening) {
+  const breakdown = screening?.scoreBreakdown;
+  if (!breakdown || typeof breakdown !== "object") return [];
+  return scoreDimensionDefinitions.map((definition) => {
+    const value = breakdown[definition.key];
+    if (!value || !Number.isFinite(Number(value.score))) return null;
+    const score = Math.max(0, Math.min(definition.maxScore, Math.round(Number(value.score))));
+    return {
+      ...definition,
+      score,
+      reason: String(value.reason || "该维度没有提供额外说明。").trim(),
+      evidence: localizedScoreEvidence(value.evidence, "is-positive")
+    };
+  }).filter(Boolean);
+}
+
+function scoreBreakdownMarkup(screening) {
+  const dimensions = normalizedScoreBreakdown(screening);
+  if (dimensions.length !== scoreDimensionDefinitions.length) return "";
+  return '<section class="score-section score-breakdown"><div class="score-section-heading"><i data-lucide="chart-no-axes-column-increasing"></i><h3>固定评分构成</h3><span>协议 v1</span></div>'
+    + '<div class="score-dimensions">' + dimensions.map((dimension) => {
+      const percentage = Math.round((dimension.score / dimension.maxScore) * 100);
+      return '<article class="score-dimension">'
+        + '<div class="score-dimension-heading"><strong>' + escapeHtml(dimension.label) + '</strong><span><b>' + dimension.score + '</b> / ' + dimension.maxScore + '</span></div>'
+        + '<div class="score-dimension-track" role="meter" aria-label="' + escapeHtml(dimension.label) + '" aria-valuemin="0" aria-valuemax="' + dimension.maxScore + '" aria-valuenow="' + dimension.score + '"><span style="width:' + percentage + '%"></span></div>'
+        + '<p>' + escapeHtml(dimension.reason) + '</p>'
+        + (dimension.evidence.length ? '<ul>' + dimension.evidence.map((item) => '<li>' + escapeHtml(item) + '</li>').join("") + '</ul>' : '<small>没有可验证证据</small>')
+        + '</article>';
+    }).join("") + '</div></section>';
+}
+
 function scoreThresholdText() {
   const thresholds = state.data?.settings?.thresholds || { strongMatch: 85, goodMatch: 70, maybe: 50, lowMatch: 30 };
   const range = (minimum, maximum) => maximum >= minimum ? `${minimum}-${maximum}` : String(minimum);
@@ -3775,9 +4216,12 @@ function scoreThresholdText() {
 function scoreEngineDetails(screening) {
   const engine = String(screening.engine || "local-rules");
   if (/^ai(?:$|-)/i.test(engine)) {
+    const standardized = normalizedScoreBreakdown(screening).length === scoreDimensionDefinitions.length;
     return {
-      label: screening.jdReviewed ? "AI 综合审阅 · 完整 JD" : "AI 流程尚未完成",
-      note: "AI 根据完整 JD 与职业画像进行语义综合评分；证据项共同构成判断，不使用可验证的固定逐项加减分公式。"
+      label: screening.jdReviewed ? standardized ? "AI 标准评分 · 完整 JD" : "AI 综合审阅 · 完整 JD" : "AI 流程尚未完成",
+      note: standardized
+        ? "总分由五个固定维度相加得出，并由本地校验器重新计算；模型不能直接决定最终总分。"
+        : "这是旧版 AI 综合评分记录，当时尚未保存固定维度；重新审阅后会采用统一评分协议。"
     };
   }
   if (screening.jdReviewed) {
@@ -3802,6 +4246,7 @@ function openScoreDetails(id) {
   const workRights = screening.workRights || null;
   const matchedEvidence = localizedScoreEvidence(screening.matchedAreas, "is-positive");
   const concernEvidence = localizedScoreEvidence(screening.concerns, "is-concern");
+  const breakdownMarkup = scoreBreakdownMarkup(screening);
   const requirements = [...new Set((workRights?.requirements || []).map(localizedWorkRightsRequirement).filter(Boolean))];
   const workRightsCopy = workRights
     ? '<div class="score-visa-heading"><strong>' + escapeHtml(workRightsLabels[workRights.assessment] || workRights.assessment || "待确认") + '</strong>'
@@ -3824,8 +4269,9 @@ function openScoreDetails(id) {
     + '<div><dt>标题判断</dt><dd>' + escapeHtml(titleClassificationLabels[screening.titleClassification] || screening.titleClassification || "未判断") + "</dd></div>"
     + '<div><dt>当前状态</dt><dd>' + escapeHtml(screeningStatusLabels[screening.screeningStatus] || "未审阅") + "</dd></div>"
     + "</dl>"
-    + '<section class="score-section"><div class="score-section-heading"><i data-lucide="circle-plus"></i><h3>匹配证据</h3><span>' + matchedEvidence.length + " 项</span></div>"
-    + scoreEvidenceMarkup(matchedEvidence, "当前没有记录明确的匹配证据。", "is-positive") + "</section>"
+    + breakdownMarkup
+    + (breakdownMarkup ? "" : '<section class="score-section"><div class="score-section-heading"><i data-lucide="circle-plus"></i><h3>匹配证据</h3><span>' + matchedEvidence.length + " 项</span></div>"
+      + scoreEvidenceMarkup(matchedEvidence, "当前没有记录明确的匹配证据。", "is-positive") + "</section>")
     + '<section class="score-section"><div class="score-section-heading"><i data-lucide="triangle-alert"></i><h3>风险与扣分依据</h3><span>' + concernEvidence.length + " 项</span></div>"
     + scoreEvidenceMarkup(concernEvidence, "当前没有记录明确的风险项。", "is-concern") + "</section>"
     + '<section class="score-section"><div class="score-section-heading"><i data-lucide="badge-check"></i><h3>身份与签证</h3></div><div class="score-visa">' + workRightsCopy + "</div></section>"
@@ -4460,6 +4906,22 @@ document.addEventListener("click", (event) => {
   if (dismissExclusionButton) return dismissExclusionSuggestion(dismissExclusionButton.dataset.dismissExclusionSuggestion);
   const removeActiveExclusionButton = event.target.closest("[data-remove-active-exclusion]");
   if (removeActiveExclusionButton) return removeActiveExclusion(removeActiveExclusionButton.dataset.removeActiveExclusion);
+  const testAiKeyButton = event.target.closest("[data-test-ai-key]");
+  const aiPaneButton = event.target.closest("[data-ai-pane]");
+  if (aiPaneButton) {
+    state.aiPane = aiPaneButton.dataset.aiPane;
+    renderAiBudget();
+    return;
+  }
+  if (testAiKeyButton) return testAiKey(testAiKeyButton.dataset.testAiKey, testAiKeyButton);
+  const editAiKeyButton = event.target.closest("[data-edit-ai-key]");
+  if (editAiKeyButton) return editAiConnection(editAiKeyButton.dataset.editAiKey);
+  const cancelAiKeyButton = event.target.closest("[data-cancel-ai-key]");
+  if (cancelAiKeyButton) return cancelAiConnectionEdit();
+  const saveAiKeyButton = event.target.closest("[data-save-ai-key]");
+  if (saveAiKeyButton) return saveAiConnection(saveAiKeyButton.dataset.saveAiKey, saveAiKeyButton);
+  const deleteAiKeyButton = event.target.closest("[data-delete-ai-key]");
+  if (deleteAiKeyButton) return deleteAiKey(deleteAiKeyButton.dataset.deleteAiKey);
   const closeDialog = event.target.closest("[data-close-dialog]");
   if (closeDialog) return el("#" + closeDialog.dataset.closeDialog).close();
   const add = event.target.closest("[data-add]");
@@ -4476,10 +4938,19 @@ document.addEventListener("input", (event) => {
     el("#send-job-assistant").disabled = state.jobAssistantBusy || !context.jobs.length || !event.target.value.trim();
   }
   if (event.target.matches("#category-verified-search")) renderVerifiedTaskPicker();
-  if (event.target.matches("#ai-base-url, #ai-model, #ai-api-key")) state.aiConfigDirty = true;
+  if (event.target.matches("#routine-task-location")) syncRoutineSearchRadiusOptions();
+  if (event.target.matches('[data-category-task-field="location"]')) syncCategorySearchRadiusOptions(event.target.closest(".category-task-editor-row"));
   if (event.target.matches("#run-exclusion-confirmed")) el("#confirm-start-run").disabled = !event.target.checked;
 });
 document.addEventListener("keydown", (event) => {
+  if (event.target.matches("[data-ai-pane]") && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll("[data-ai-pane]")];
+    const target = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1) : tabs.find((tab) => tab !== event.target);
+    target.click();
+    target.focus();
+    return;
+  }
   if (event.target.matches("#job-assistant-input") && event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
     el("#job-assistant-form").requestSubmit();
@@ -4544,13 +5015,27 @@ document.addEventListener("change", (event) => {
     state.pendingRunDistanceEnabled = event.target.value === "enabled";
     renderRunProfileConfirmation();
   }
-  if (event.target.matches("#routine-task-platform")) syncRoutineJobTypeOptions();
+  if (event.target.matches("#routine-task-platform")) {
+    syncRoutineJobTypeOptions();
+    syncRoutineSearchRadiusOptions(null);
+  }
   if (event.target.matches('[data-category-task-field="platform"]')) {
     const row = event.target.closest(".category-task-editor-row");
     const jobType = row.querySelector('[data-category-task-field="jobType"]');
     jobType.innerHTML = jobTypeOptions(event.target.value, "any");
+    syncCategorySearchRadiusOptions(row, null);
   }
-  if (event.target.matches("#ai-wire-api")) state.aiConfigDirty = true;
+  if (event.target.matches("#ai-max-concurrency")) return saveAiConfig();
+  if (event.target.matches("[data-ai-budget]")) return saveAiBudget(event.target);
+  if (event.target.matches("#select-all-ai-connections")) {
+    return selectAllAiConnections(event.target.checked);
+  }
+  if (event.target.matches("[data-ai-key-select]")) {
+    return selectAiConnection(event.target.closest("[data-ai-key-id]").dataset.aiKeyId, event.target.checked);
+  }
+  if (event.target.matches("[data-ai-key-enabled]")) {
+    return updateAiKey(event.target.closest("[data-ai-key-id]").dataset.aiKeyId, { enabled: event.target.checked });
+  }
   if (event.target.matches("[data-category-verified-task]")) {
     const id = event.target.dataset.categoryVerifiedTask;
     if (event.target.checked) state.categoryEditorSelectedValidationIds.add(id);
@@ -4687,9 +5172,10 @@ el("#generate-profile").addEventListener("click", generateProfile);
 el("#new-profile-form").addEventListener("submit", createProfile);
 el("#save-settings").addEventListener("click", saveSettings);
 el("#add-exclusion-keyword").addEventListener("click", addExclusionKeyword);
-el("#save-ai-config").addEventListener("click", saveAiConfig);
-el("#test-ai-config").addEventListener("click", testAiConfig);
-el("#clear-ai-key").addEventListener("click", clearAiKey);
+el("#test-all-ai-connections").addEventListener("click", testAllAiConnections);
+el("#export-selected-ai-connections").addEventListener("click", exportSelectedAiConnections);
+el("#ai-connection-form").addEventListener("submit", addAiConnection);
+el("#import-ai-keys").addEventListener("click", importAiKeys);
 el("#install-workers").addEventListener("click", installWorkers);
 el("#migrate-worker-history").addEventListener("click", migrateWorkerHistory);
 el("#open-clear-all-history").addEventListener("click", openClearAllHistoryDialog);
@@ -4718,12 +5204,13 @@ let lastAutoReloadAt = 0;
 function agentDataIsChanging() {
   const latestRunIsActive = state.data?.runs?.[0]?.tasks?.some((task) => ["queued", "running"].includes(task.status));
   const aiIsWorking = state.data?.jobs?.some((job) => ["JD_FETCHING", "AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus));
-  return Boolean(latestRunIsActive || aiIsWorking || state.data?.jdRetryBatches?.length || state.data?.distance?.batch?.status === "RUNNING");
+  return Boolean(latestRunIsActive || aiIsWorking || state.data?.ai?.queue?.waiting || state.data?.jdRetryBatches?.length || state.data?.distance?.batch?.status === "RUNNING");
 }
 
 async function autoReload() {
   if (autoReloadInFlight || document.visibilityState === "hidden") return;
-  if (!["overview", "routine", "jobs"].includes(state.view)) return;
+  if (state.view === "ai" && (state.editingAiConnectionId || state.aiConfigDirty || state.aiBudgetSaving)) return;
+  if (!["overview", "routine", "jobs", "ai"].includes(state.view)) return;
   const refreshInterval = agentDataIsChanging() ? 2500 : 8000;
   if (Date.now() - lastAutoReloadAt < refreshInterval) return;
   autoReloadInFlight = true;

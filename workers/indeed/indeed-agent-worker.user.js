@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.1.2
+// @version      1.1.3
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -23,7 +23,8 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.1.2";
+    const APP_VERSION = "1.1.3";
+    const INDEED_SEARCH_RADII_KM = new Set([0, 5, 10, 15, 25, 50, 100]);
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
         cooldownMinutes: 5,
@@ -1023,10 +1024,26 @@
         url.searchParams.set("q", agentSearchKeyword(task.keyword));
         url.searchParams.set("l", task.location);
         if (Number(task.postedWithinDays) > 0) url.searchParams.set("fromage", String(task.postedWithinDays));
+        const searchRadiusKm = agentSearchRadiusKm(task);
+        if (searchRadiusKm !== null) url.searchParams.set("radius", String(searchRadiusKm));
         url.searchParams.set("jobAgentWorker", "1");
         url.searchParams.set("jobAgentRun", task.runId);
         url.searchParams.set("jobAgentTask", task.id);
         return url.href;
+    }
+
+    function agentSearchRadiusKm(subject) {
+        if (subject?.searchRadiusKm === null || subject?.searchRadiusKm === undefined || subject?.searchRadiusKm === "") return null;
+        const radius = Number(subject.searchRadiusKm);
+        if (!INDEED_SEARCH_RADII_KM.has(radius)) throw new Error(`Indeed does not support search radius ${subject.searchRadiusKm}.`);
+        return radius;
+    }
+
+    function agentAssertIndeedSearchRadius(subject) {
+        const expected = agentSearchRadiusKm(subject);
+        if (expected === null) return;
+        const applied = new URL(location.href).searchParams.get("radius");
+        if (applied === null || Number(applied) !== expected) throw new Error(`搜索半径未确认生效。Indeed 没有保留 radius=${expected}。`);
     }
 
     function agentOnTaskPage(task) {
@@ -1176,9 +1193,11 @@
         while (!ui && Date.now() < deadline) await sleep(300);
         if (!ui) return agentSubmit("failed", "Job results did not load in the worker tab.", { results: [] });
         try {
+            agentAssertIndeedSearchRadius(agentTask);
             if (!await agentApplyIndeedJobTypeFilter(agentTask, "task")) return;
+            agentAssertIndeedSearchRadius(agentTask);
         } catch (error) {
-            return agentSubmit("failed", `Job type filter failed: ${error.message || String(error)}`, { results: [] });
+            return agentSubmit("failed", `Search filter failed: ${error.message || String(error)}`, { results: [] });
         }
         agentStartedTaskId = agentTask.id;
         const includeKeywords = agentIncludeKeywordText(agentTask.keyword);
@@ -1966,6 +1985,8 @@
         const searchUrl = new URL("https://au.indeed.com/jobs");
         searchUrl.searchParams.set("q", searchKeyword);
         searchUrl.searchParams.set("l", validation.location.trim());
+        const searchRadiusKm = agentSearchRadiusKm(validation);
+        if (searchRadiusKm !== null) searchUrl.searchParams.set("radius", String(searchRadiusKm));
         window.location.assign(searchUrl.href);
         return true;
     }
@@ -2052,10 +2073,12 @@
                 }
                 throw new Error("Date posted 未确认生效。Indeed 没有在结果 URL 中写入对应的 fromage 参数。");
             }
+            agentAssertIndeedSearchRadius(validation);
             if (!await agentApplyIndeedJobTypeFilter(validation, "preflight")) return true;
+            agentAssertIndeedSearchRadius(validation);
             await agentAssertSearchResults(validation);
             setStatus("Job Agent: 预检通过。");
-            log("预检通过：搜索条件、Date posted 与 Job type 均已确认。");
+            log("预检通过：搜索条件、搜索半径、Date posted 与 Job type 均已确认。");
             await agentSubmitPreflight(validation, "valid");
         } catch (error) {
             const reason = `预检失败：${error.message || String(error)}`;
