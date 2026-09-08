@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - SEEK
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.1.2
+// @version      1.1.3
 // @description  Job Agent worker for SEEK. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
@@ -29,7 +29,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.1.2";
+    const APP_VERSION = "1.1.3";
     const SEEK_SEARCH_RADII_KM = new Set([0, 2, 5, 10, 25, 30, 50, 100]);
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
@@ -1596,16 +1596,31 @@
         if (agentStopRequested) return { jobs, humanReason: null };
         let plan;
         try {
+            plan = [];
+            for (let offset = 0; offset < jobs.length && !agentStopRequested; offset += 50) {
             const response = await agentRequest("POST", "/api/worker/title-plan", {
                 runId: task.runId,
                 taskId: task.id,
-                jobs
+                jobs: jobs.slice(offset, offset + 50)
             });
-            plan = response.plan;
-            log(`Job Agent 中央预筛：发现 ${response.counts.total} 个，历史跳过 ${response.counts.seen} 个，复用 ${response.counts.reuse} 个，本地拒绝 ${response.counts.rejected} 个，需获取 ${response.counts.fetch} 份 JD。`);
+            let chunkPlan = response.plan.map(item => ({ ...item, index: item.index + offset }));
+            while (chunkPlan.some(item => item.action === "title_pending") && !agentStopRequested) {
+                setStatus("AI 正在批量初筛标题，暂不获取 JD。");
+                await sleep(2000);
+                const pending = chunkPlan.filter(item => item.action === "title_pending");
+                const update = await agentRequest("POST", "/api/worker/title-plan", {
+                    runId: task.runId, taskId: task.id, jobIds: pending.map(item => item.jobId)
+                });
+                const byId = new Map(update.plan.map(item => [item.jobId, item]));
+                chunkPlan = chunkPlan.map(item => byId.has(item.jobId) ? { ...item, ...byId.get(item.jobId) } : item);
+            }
+            plan.push(...chunkPlan);
+            log(`Job Agent 标题初筛进度：${Math.min(offset + 50, jobs.length)}/${jobs.length}。`);
+            }
         } catch (error) {
-            log(`标题初筛计划暂不可用，将为全部职位尝试获取 JD：${error.message}`, "warn");
-            plan = jobs.map((_, index) => ({ index, action: task.aiReviewEnabled === false ? "skip_ai" : "fetch" }));
+            log(`标题初筛暂不可用，保留职位等待平台重试：${error.message}`, "warn");
+            const saved = new Map((plan || []).map(item => [item.index, item]));
+            plan = jobs.map((_, index) => saved.get(index) || ({ index, action: task.aiReviewEnabled === false ? "skip_ai" : "title_error" }));
         }
         const planByIndex = new Map(plan.map((item) => [item.index, item]));
         const fetchIndexes = plan.filter((item) => item.action === "fetch").map((item) => item.index);
@@ -1615,8 +1630,12 @@
             if (agentStopRequested) break;
             const job = jobs[index];
             const planItem = planByIndex.get(index);
-            const action = planItem?.action || "fetch";
+            const action = planItem?.action || "title_error";
             if (planItem?.jobId) job.agentJobId = planItem.jobId;
+            if (["title_pending", "title_error"].includes(action)) {
+                job.descriptionFetchStatus = "pending-title";
+                continue;
+            }
             if (action === "reject") {
                 job.descriptionFetchStatus = "skipped-rejected";
                 continue;

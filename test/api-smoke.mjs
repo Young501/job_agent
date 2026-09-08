@@ -12,11 +12,24 @@ const aiPort = await availablePort();
 let serverOutput = "";
 let transientReviewFailures = 0;
 let manualReviewFailures = 0;
+let malformedTitleResponses = 2;
+const titleInputs = [];
 const coverLetterInputs = [];
 const aiServer = createHttpServer(async (request, response) => {
   let body = "";
   for await (const chunk of request) body += chunk;
   const payload = JSON.parse(body || "{}");
+  if (/Conservatively triage job titles/.test(payload.instructions || "")) {
+    const input = JSON.parse(payload.input);
+    titleInputs.push(input);
+    const decisions = input.jobs.map(job => ({ id: job.id,
+      decision: /Civil Engineer/.test(job.title) || (input.learnedPreferences && job.title === "Graduate Analyst") ? "EXCLUDE" : "KEEP",
+      reason: "依据当前画像判断职业方向，信息不足的职位保留。" }));
+    response.writeHead(200, { "content-type": "application/json" });
+    const incomplete = input.jobs.some(job => job.title === "Incomplete Triage") && malformedTitleResponses-- > 0;
+    response.end(JSON.stringify({ output_text: JSON.stringify({ decisions: incomplete ? [] : decisions }), usage: { input_tokens: 30, output_tokens: 25, total_tokens: 55 } }));
+    return;
+  }
   if (String(payload.input || "").includes("Transient AI Review Failure") && transientReviewFailures === 0) {
     transientReviewFailures += 1;
     response.writeHead(503, { "content-type": "text/plain" });
@@ -154,6 +167,15 @@ async function request(path, body, method = body === undefined ? "GET" : "POST")
   });
   const json = await response.json();
   assert.equal(response.ok, true, json.error);
+  if (path === "/api/jobs/import" && json.jobs?.some(job => job.titleTriage?.status === "QUEUED")) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const state = await (await fetch("http://127.0.0.1:" + port + "/api/bootstrap")).json();
+      json.jobs = json.jobs.map(job => state.jobs.find(item => item.id === job.id) || job);
+      if (json.jobs.every(job => !["QUEUED", "REVIEWING"].includes(job.titleTriage?.status))) break;
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+  }
   return json;
 }
 
@@ -222,8 +244,8 @@ try {
   assert.equal(workerResponse.ok, true);
   assert.match(workerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(workerScript, /Job Agent Worker - SEEK/);
-  assert.match(workerScript, /@version\s+1\.1\.2/);
-  assert.match(workerScript, /const APP_VERSION = "1\.1\.2"/);
+  assert.match(workerScript, /@version\s+1\.1\.3/);
+  assert.match(workerScript, /const APP_VERSION = "1\.1\.3"/);
   assert.match(workerScript, /function agentShowNaturalSeekKeyword/);
   assert.match(workerScript, /Do not dispatch an input event/);
   const naturalKeywordFunction = extractNamedFunction(workerScript, "agentShowNaturalSeekKeyword");
@@ -383,8 +405,8 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+1\.1\.3/);
-  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.3"/);
+  assert.match(indeedWorkerScript, /@version\s+1\.1\.4/);
+  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.4"/);
   assert.match(indeedWorkerScript, /agentWaitForSearchResults/);
   assert.match(indeedWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(indeedWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
@@ -468,8 +490,8 @@ try {
   assert.match(linkedInWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(linkedInWorkerScript, /@name\s+Job Agent Worker - LinkedIn/);
   assert.match(linkedInWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(linkedInWorkerScript, /@version\s+1\.1\.1/);
-  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.1\.1"/);
+  assert.match(linkedInWorkerScript, /@version\s+1\.1\.2/);
+  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.1\.2"/);
   assert.match(linkedInWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(linkedInWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
   assert.match(linkedInWorkerScript, /Job Agent 访问节奏/);
@@ -636,8 +658,8 @@ try {
   assert.match(dashboardScript, /岗位方向/);
   assert.match(dashboardScript, /协议 v1/);
   assert.match(dashboardScript, /安装 \/ 更新/);
-  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.3"/);
-  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.2"/);
+  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.4"/);
+  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.3"/);
   assert.match(dashboardScript, /function locationSupportsSearchRadius/);
   assert.match(dashboardScript, /function syncRoutineSearchRadiusOptions/);
   assert.match(dashboardHtml, /id="routine-task-search-radius"/);
@@ -662,7 +684,7 @@ try {
   assert.equal(installerResponse.ok, true);
   assert.match(installerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(installerScript, /@name\s+Job Agent Worker - Indeed/);
-  assert.match(installerScript, /@version\s+1\.1\.3/);
+  assert.match(installerScript, /@version\s+1\.1\.4/);
   assert.match(dashboardScript, /data-copy-worker/);
   assert.match(dashboardScript, /loadWorkerScripts/);
   assert.match(dashboardScript, /job-agent:view/);
@@ -1283,12 +1305,12 @@ try {
       }
     ]
   });
-  assert.equal(titlePlan.plan[0].action, "reject");
-  assert.equal(titlePlan.plan[1].action, "fetch");
-  assert.equal(titlePlan.plan[2].action, "fetch");
+  assert.equal(titlePlan.plan[0].action, "title_pending");
+  assert.equal(titlePlan.plan[1].action, "title_pending");
+  assert.equal(titlePlan.plan[2].action, "title_pending");
   assert.match(titlePlan.plan[2].reason, /profile has not reviewed/i);
   assert.ok(titlePlan.plan.every((item) => item.jobId));
-  assert.equal(titlePlan.counts.fetch, 2);
+  assert.equal(titlePlan.counts.fetch, 0);
   assert.equal(titlePlan.counts.seen, 0);
   const pausedIndeedResult = await request("/api/worker/result", {
     runId: run.run.id,
@@ -1396,6 +1418,32 @@ try {
     wireApi: "responses",
     apiKey: ""
   }, "PUT");
+  const titleBatchImport = await request("/api/jobs/import", { jobs: Array.from({ length: 55 }, (_, index) => ({
+    source: "seek", sourceJobId: `title-batch-${index}`, title: index === 0 ? "Senior Civil Engineer" : "Software Architect",
+    company: `Title Batch ${index}`, location: "Melbourne VIC", jobUrl: `https://www.seek.com.au/job/title-batch-${index}`
+  })) });
+  assert.ok(titleInputs.every(input => input.jobs.length <= 50));
+  assert.equal(titleBatchImport.jobs[0].titleTriage.status, "EXCLUDED");
+  assert.ok(titleBatchImport.jobs.slice(1).every(job => job.titleTriage.status === "KEPT"));
+  assert.ok(titleBatchImport.jobs.every(job => job.screening.score === null));
+  const blockedJd = await requestFailure("/api/jobs/" + titleBatchImport.jobs[0].id + "/fetch-jd", {});
+  assert.ok(blockedJd.error);
+  const restoredTitle = await request("/api/jobs/title-triage", { action: "restore", jobIds: [titleBatchImport.jobs[0].id] });
+  assert.deepEqual(restoredTitle.missingJdIds, [titleBatchImport.jobs[0].id]);
+  const restoredTitleJob = (await request("/api/bootstrap")).jobs.find(job => job.id === titleBatchImport.jobs[0].id);
+  assert.equal(restoredTitleJob.titleTriage.status, "RESTORED");
+  assert.equal(restoredTitleJob.feedback.helpfulness, "REJECTION_INCORRECT");
+  const failedTitleImport = await request("/api/jobs/import", { jobs: [{ source: "seek", sourceJobId: "title-missing-id", title: "Incomplete Triage" }] });
+  assert.equal(failedTitleImport.jobs[0].titleTriage.status, "ERROR");
+  assert.equal(failedTitleImport.jobs[0].titleTriage.attempts, 2);
+  assert.equal(failedTitleImport.jobs[0].screening.category, "MAYBE");
+  await request("/api/jobs/title-triage", { action: "retry", jobIds: [failedTitleImport.jobs[0].id] });
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const job = (await request("/api/bootstrap")).jobs.find(item => item.id === failedTitleImport.jobs[0].id);
+    if (job.titleTriage.status === "KEPT") break;
+    await new Promise(resolve => setTimeout(resolve, 30));
+  }
+  assert.equal((await request("/api/bootstrap")).jobs.find(item => item.id === failedTitleImport.jobs[0].id).titleTriage.status, "KEPT");
   const transientFailureImport = await request("/api/jobs/import", {
     runId: run.run.id,
     jobs: [{
@@ -1479,7 +1527,7 @@ try {
       descriptionFetchStatus: "fetched"
     }]
   });
-  assert.equal(imported.jobs[0].screening.screeningStatus, "AI_QUEUED");
+  assert.ok(["AI_QUEUED", "AI_REVIEWING", "JD_SCREENED"].includes(imported.jobs[0].screening.screeningStatus));
   const reviewDeadline = Date.now() + 5_000;
   let reviewedJob;
   while (Date.now() < reviewDeadline) {
@@ -1554,7 +1602,7 @@ try {
     }]
   });
   const legacyJob = legacyImport.jobs[0];
-  assert.equal(legacyJob.screening.screeningStatus, "JD_FETCH_FAILED");
+  assert.equal(legacyJob.screening.screeningStatus, "NEEDS_JD_REVIEW");
   const fetchLaunch = await request("/api/jobs/" + legacyJob.id + "/fetch-jd", {}, "POST");
   assert.equal(fetchLaunch.job.screening.screeningStatus, "JD_FETCHING");
   assert.match(fetchLaunch.launchUrl, /au\.indeed\.com\/jobs\?/);
@@ -1590,7 +1638,7 @@ try {
     }]
   });
   const seekDomainJob = seekDomainImport.jobs[0];
-  assert.equal(seekDomainJob.screening.screeningStatus, "JD_FETCH_FAILED");
+  assert.equal(seekDomainJob.screening.screeningStatus, "NEEDS_JD_REVIEW");
   const seekFetchLaunch = await request("/api/jobs/" + seekDomainJob.id + "/fetch-jd", {}, "POST");
   assert.equal(new URL(seekFetchLaunch.launchUrl).hostname, "au.seek.com");
   assert.match(seekFetchLaunch.launchUrl, /jobAgentOnDemandJd=/);
@@ -1616,7 +1664,7 @@ try {
       }
     ]
   });
-  assert.ok(retryImports.jobs.every((job) => job.screening.screeningStatus === "JD_FETCH_FAILED"));
+  assert.ok(retryImports.jobs.every((job) => job.screening.screeningStatus === "NEEDS_JD_REVIEW"));
   const retryBatch = await request("/api/jobs/retry-failed-jd", {
     jobIds: retryImports.jobs.map((job) => job.id)
   });
@@ -1689,7 +1737,7 @@ try {
     }]
   });
   assert.equal(learnedImport.jobs[0].screening.category, "REJECTED");
-  assert.equal(learnedImport.jobs[0].screening.engine, "local-rules+feedback");
+  assert.equal(learnedImport.jobs[0].screening.engine, "ai-title");
   const correctedRejection = await request("/api/jobs/" + learnedImport.jobs[0].id + "/feedback", {
     helpfulness: "REJECTION_INCORRECT",
     reason: "CLASSIFICATION_WRONG",
@@ -1766,9 +1814,9 @@ try {
   const bootstrap = await request("/api/bootstrap");
   assert.equal(bootstrap.activeProfile.id, casualProfile.profile.id);
   assert.equal(bootstrap.profiles.length, 1);
-  assert.equal(bootstrap.jobs.length, 14);
+  assert.equal(bootstrap.jobs.length, 70);
   assert.equal(bootstrap.reviewReflections.length, 2);
-  assert.equal(bootstrap.preferenceModel.feedbackCount, 3);
+  assert.equal(bootstrap.preferenceModel.feedbackCount, 4);
   assert.equal(bootstrap.routineTasks.length, 4);
 
   const selectedTaskIds = bootstrap.routineTasks.slice(0, 2).map((task) => task.id);
@@ -1777,8 +1825,9 @@ try {
   assert.deepEqual(nextRun.run.tasks.map((task) => task.routineTaskId), selectedTaskIds);
   const afterNextRun = await request("/api/bootstrap");
   assert.equal(afterNextRun.runs[0].id, nextRun.run.id);
-  assert.equal(afterNextRun.jobs.length, 14);
-  assert.ok(afterNextRun.jobs.filter((job) => job.id !== learnedImport.jobs[0].id).every((job) => job.runId === run.run.id));
+  assert.equal(afterNextRun.jobs.length, 70);
+  const standaloneIds = new Set([learnedImport.jobs[0].id, failedTitleImport.jobs[0].id, ...titleBatchImport.jobs.map(job => job.id)]);
+  assert.ok(afterNextRun.jobs.filter((job) => !standaloneIds.has(job.id)).every((job) => job.runId === run.run.id));
   assert.equal(afterNextRun.jobs.find((job) => job.id === learnedImport.jobs[0].id).runId, null);
   assert.ok(afterNextRun.jobs.every((job) => job.runId !== afterNextRun.runs[0].id));
 
@@ -1789,7 +1838,7 @@ try {
   assert.equal(afterDailyClear.runs.find((item) => item.id === run.run.id).tasks.filter((task) => task.status === "cancelled").length, 0);
 
   const clearedRecords = await request("/api/records", undefined, "DELETE");
-  assert.equal(clearedRecords.cleared.jobs, 14);
+  assert.equal(clearedRecords.cleared.jobs, 70);
   assert.equal(clearedRecords.cleared.legacyWorkerHistory, 2);
   assert.equal(clearedRecords.cleared.workerHistoryMigrations, 3);
   assert.equal(clearedRecords.cleared.reviewReflections, 2);

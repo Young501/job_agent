@@ -71,6 +71,7 @@
             </div>
             <div class="jobs-heading-actions">
               <button class="button button-secondary" id="retry-failed-ai-reviews" type="button" hidden><i data-lucide="refresh-cw"></i><span>重审全部 AI 失败项</span></button>
+              <button class="button button-secondary" id="open-title-triage" type="button"><i data-lucide="list-filter"></i><span>标题初筛</span></button>
               <button class="button button-secondary" id="retry-failed-jds" type="button" hidden><i data-lucide="files"></i><span>获取全部缺失 JD</span></button>
               <button class="button button-secondary" id="open-import"><i data-lucide="file-input"></i><span>导入职位结果</span></button>
             </div>
@@ -631,6 +632,19 @@
         <input id="distance-job-id" type="hidden">
         <div class="dialog-actions"><button class="button button-secondary" id="distance-calculate-one" type="button"><i data-lucide="map-pin"></i><span>保存并计算距离</span></button><button class="button button-primary" type="submit"><i data-lucide="save"></i><span>保存地址</span></button></div>
       </form>
+    </dialog>
+    <dialog id="title-triage-dialog" class="dialog">
+      <div class="dialog-heading"><h2>标题初筛</h2><button class="icon-button" data-close-dialog="title-triage-dialog" title="关闭"><i data-lucide="x"></i></button></div>
+      <p id="title-triage-stats" class="form-note"></p>
+      <label class="field"><span>搜索职位或公司</span><input id="title-triage-search" type="search"></label>
+      <label class="field"><span>状态</span><select id="title-triage-filter"><option value="attention">排除与失败</option><option value="all">全部</option></select></label>
+      <label><input type="checkbox" id="title-triage-select-all">全选当前列表</label>
+      <div id="title-triage-list" style="max-height:50vh;overflow:auto"></div>
+      <div class="dialog-actions">
+        <button class="button button-secondary" data-title-action="confirm">确认排除</button>
+        <button class="button button-secondary" data-title-action="retry">重试初筛</button>
+        <button class="button button-primary" data-title-action="restore">恢复 / 跳过初筛并审阅 JD</button>
+      </div>
     </dialog>
   </body>
 </html>

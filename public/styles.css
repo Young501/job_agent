@@ -1386,3 +1386,10 @@ h3 { margin: 0; font: 700 14px/1.3 var(--font-display); }
     animation-iteration-count: 1 !important;
   }
 }
+#title-triage-dialog { width: min(900px, calc(100vw - 32px)); padding: 24px; }
+#title-triage-dialog .field { margin-bottom: 12px; }
+.title-triage-row { display: flex; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.title-triage-row > div { min-width: 0; overflow-wrap: anywhere; }
+.title-triage-row small { display: block; color: var(--muted); }
+.title-triage-row p { margin: 6px 0 0; }
+#title-triage-dialog .dialog-actions { flex-wrap: wrap; }

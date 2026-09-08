@@ -190,9 +190,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v1.1.1", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v1.1.3", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v1.1.2", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v1.1.2", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v1.1.4", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v1.1.3", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -335,6 +335,11 @@ function screeningMethodBadge(job) {
       ? "连接 AI 服务失败，完整 JD 已保留，请检查网络后重试"
       : rawAiError.replace(/^AI JD review failed:\s*/i, "").slice(0, 360) || "AI 审阅发生错误，结果未确认";
   const pendingPresentation = {
+    TITLE_QUEUED: ["clock-3", "待标题初筛", "等待按任务画像批量初筛"],
+    TITLE_REVIEWING: ["loader-circle", "标题初筛中", "初筛完成前不会获取 JD"],
+    TITLE_ERROR: ["triangle-alert", "标题初筛失败", job.titleTriage?.reason || "职位已保留，可重试或跳过初筛"],
+    TITLE_EXCLUDED: ["list-filter", "标题初筛排除", job.titleTriage?.reason || "可在标题初筛清单恢复"],
+    TITLE_RULE_EXCLUDED: ["list-filter", "排除词过滤", job.screening?.reason || "用户已启用的排除词"],
     AI_QUEUED: ["clock-3", "AI 排队中", "完整 JD 已获取，正在等待自动 AI 审阅"],
     AI_REVIEWING: ["loader-circle", "AI 审阅中", "AI 正在结合职业画像评估完整 JD"],
     AI_RETRY_WAIT: ["timer-reset", "AI 稍后重试", aiErrorMessage + (job.aiReview?.retryAt ? `；预计 ${dateTime(job.aiReview.retryAt)} 自动重试` : "")],
@@ -657,6 +662,7 @@ function missingJdJobsInCurrentReview() {
     const staleFetch = job.screening?.screeningStatus === "JD_FETCHING"
       && (!Number.isFinite(fetchStartedAt) || Date.now() - fetchStartedAt > 30_000);
     return ["linkedin", "indeed", "seek"].includes(job.source)
+      && !["QUEUED", "REVIEWING", "ERROR", "EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage?.status)
       && jobRunUsesAiReview(job)
       && job.screening?.category !== "REJECTED"
       && job.screening?.titleClassification !== "CLEAR_REJECT"
@@ -779,6 +785,7 @@ function visibleJobs() {
   const jobs = jobsInSelectedPane().filter((job) => {
     const words = [job.title, job.company, job.location, job.searchKeyword].join(" ").toLowerCase();
     return (!query || words.includes(query))
+      && (category === "REJECTED" || !["EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage?.status))
       && (!category || effectiveJobCategory(job) === category)
       && (!source || job.source === source)
       && (!status || job.screening.screeningStatus === status)
@@ -1094,6 +1101,52 @@ async function saveWorkAddress(calculate = false) {
   } catch (error) { toast(error.message, "error"); }
 }
 
+function titleTriageJobs() {
+  const jobs = jobsInSelectedPane();
+  const unassigned = state.jobsPane === "current" && !selectedPendingReviewTaskEntry()
+    ? state.data.jobs.filter(job => !job.runId && !job.viewedAt) : [];
+  return uniqueJobsById([...jobs, ...unassigned]).filter(job => job.titleTriage);
+}
+
+function renderTitleTriage() {
+  const selectedIds = new Set([...document.querySelectorAll('[data-title-select]:checked')].map(node => node.dataset.titleSelect));
+  const jobs = titleTriageJobs();
+  const query = el("#title-triage-search").value.trim().toLowerCase();
+  const attention = el("#title-triage-filter").value === "attention";
+  const rows = jobs.filter(job => (!attention || ["ERROR", "EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage.status))
+    && [job.title, job.company].join(" ").toLowerCase().includes(query));
+  const labels = { QUEUED: "待初筛", REVIEWING: "初筛中", KEPT: "保留待查", EXCLUDED: "AI 明确排除", RULE_EXCLUDED: "已启用排除词", ERROR: "初筛失败", RESTORED: "人工恢复", DISABLED: "未启用 AI", SKIPPED: "历史跳过" };
+  const ids = new Set(jobs.map(job => job.id));
+  const stats = (state.data.titleTriageBatches || []).filter(batch => batch.jobIds.some(id => ids.has(id))).map(batch => ({ calls: batch.calls || 0, totalTokens: batch.usage?.totalTokens || 0 }));
+  el("#title-triage-stats").textContent = `${jobs.length} 个职位 · ${jobs.filter(job => job.titleTriage.status === "EXCLUDED").length} 个 AI 排除 · ${stats.reduce((n,s) => n + (s.calls || 0),0)} 次初筛调用 · ${stats.reduce((n,s) => n + (s.totalTokens || 0),0)} 已记录 tokens（失败请求可能未返回用量）`;
+  el("#title-triage-list").innerHTML = rows.map(job => '<div class="title-triage-row"><input type="checkbox" data-title-select="' + escapeHtml(job.id)
+    + '" aria-label="选择 ' + escapeHtml(job.title) + '"' + (["ERROR", "EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage.status) ? '' : ' disabled')
+    + '><div><strong>' + escapeHtml(job.title) + '</strong><small>' + escapeHtml(job.company || '') + ' · ' + escapeHtml(labels[job.titleTriage.status] || job.titleTriage.status)
+    + '</small><p title="' + escapeHtml(job.titleTriage.reason || '') + '">' + escapeHtml(job.titleTriage.status === "ERROR" ? "标题初筛未完成，职位已保留。可重试或跳过初筛。" : job.titleTriage.reason || job.screening.reason || '') + '</p></div></div>').join('') || '<p class="form-note">暂无相关职位。</p>';
+  el("#title-triage-select-all").checked = false;
+  document.querySelectorAll('[data-title-select]:not(:disabled)').forEach(node => { node.checked = selectedIds.has(node.dataset.titleSelect); });
+}
+
+async function applyTitleTriageAction(action) {
+  const jobIds = [...document.querySelectorAll('[data-title-select]:checked')].map(node => node.dataset.titleSelect);
+  if (!jobIds.length) return toast("请先选择职位。", "error");
+  const buttons = [...document.querySelectorAll('[data-title-action]')];
+  if (buttons.some(button => button.disabled)) return;
+  buttons.forEach(button => { button.disabled = true; });
+  const launcher = action === "restore" ? window.open("about:blank", "job-agent-jd-retry") : null;
+  try {
+    const result = await api("/api/jobs/title-triage", { method: "POST", body: JSON.stringify({ action, jobIds }) });
+    if (launcher && result.missingJdIds.length) {
+      const batch = await api("/api/jobs/retry-failed-jd", { method: "POST", body: JSON.stringify({ jobIds: result.missingJdIds }) });
+      if (batch.launchUrl) launcher.location.replace(batch.launchUrl); else launcher.close();
+    } else launcher?.close();
+    await reload();
+    renderTitleTriage();
+    toast(action === "restore" && !launcher ? "已恢复职位；请点击获取缺失 JD 继续。" : "已更新标题初筛结果。");
+  } catch (error) { launcher?.close(); toast(error.message, "error"); }
+  finally { buttons.forEach(button => { button.disabled = false; }); }
+}
+
 function jobRow(job, compact = false, includeBatch = false) {
   const duplicate = job.duplicateOf ? '<span class="tiny-note">重复导入</span>' : "";
   const search = compact ? "" : '<td class="muted">' + escapeHtml(job.searchKeyword || "-") + "</td>";
@@ -1111,7 +1164,7 @@ function jobRow(job, compact = false, includeBatch = false) {
     + '<td><span>' + escapeHtml(job.company || "-") + "</span><small>" + escapeHtml(job.location || "-") + "</small>" + jobDistanceBadge(job) + "</td>"
     + '<td>' + badge(names[job.source] || job.source, "source-" + job.source) + "</td>"
     + search
-    + '<td><button class="score score-trigger" type="button" data-score-details="' + job.id + '" title="点击查看分数构成：' + scoreReason + '" aria-label="查看评分 ' + job.screening.score + ' 的构成">' + job.screening.score + "</button>" + badge(effectiveJobCategory(job), "category-" + effectiveJobCategory(job).toLowerCase()) + "</td>"
+    + '<td>' + (job.screening.score === null ? '<span class="muted">待 JD 评分</span>' : '<button class="score score-trigger" type="button" data-score-details="' + job.id + '" title="点击查看分数构成：' + scoreReason + '">' + job.screening.score + '</button>') + badge(effectiveJobCategory(job), "category-" + effectiveJobCategory(job).toLowerCase()) + "</td>"
     + '<td>' + badge(job.screening.screeningStatus, "status-badge") + screeningMethodBadge(job) + workRightsBadge(job) + "</td>"
     + batch
     + '<td class="action-cell">' + actionButtons(job) + "</td></tr>";
@@ -1234,6 +1287,7 @@ function renderReviewLearning() {
 }
 
 function renderJobs() {
+  if (el("#title-triage-dialog").open) renderTitleTriage();
   renderDistanceToolbar();
   const pendingEntries = pendingReviewTaskEntries();
   const currentJobs = pendingReviewJobs(pendingEntries);
@@ -2107,7 +2161,7 @@ function renderAiBudget() {
   if (state.aiBudgetSaving || el("#ai-budget-fields").contains(document.activeElement)) return;
   const groups = [
     ["单次输出 Token", "上限过低可能导致评分明细或 JSON 被截断；Cover Letter 还受页数限制。", "tokens", [
-      ["maxJdOutputTokens", "JD 审阅与评分"], ["maxProfileOutputTokens", "画像生成"],
+      ["maxTitleOutputTokens", "批量标题初筛"], ["maxJdOutputTokens", "JD 审阅与评分"], ["maxProfileOutputTokens", "画像生成"],
       ["maxReflectionOutputTokens", "审阅复盘"], ["maxAssistantOutputTokens", "职位聊天助手"], ["maxCoverLetterOutputTokens", "Cover Letter"]]],
     ["输入长度", "字符数与 Token 数不同，以下限制用于截取输入正文。", "字符", [
       ["maxInputChars", "JD / 简历正文"], ["maxExternalProfileChars", "外部画像分析"], ["maxAssistantInputChars", "聊天助手上下文"]]],
@@ -5165,6 +5219,11 @@ el("#clear-run-queue").addEventListener("click", clearRunQueue);
 el("#delete-selected-history-run").addEventListener("click", () => deleteRunHistory(state.historyRunId));
 el("#retry-failed-jds").addEventListener("click", retryFailedJds);
 el("#retry-failed-ai-reviews").addEventListener("click", retryFailedAiReviews);
+el("#open-title-triage").addEventListener("click", () => { renderTitleTriage(); el("#title-triage-dialog").showModal(); });
+el("#title-triage-search").addEventListener("input", renderTitleTriage);
+el("#title-triage-filter").addEventListener("change", renderTitleTriage);
+el("#title-triage-select-all").addEventListener("change", event => document.querySelectorAll('[data-title-select]:not(:disabled)').forEach(node => { node.checked = event.target.checked; }));
+document.querySelectorAll('[data-title-action]').forEach(button => button.addEventListener("click", () => applyTitleTriageAction(button.dataset.titleAction)));
 el("#open-import").addEventListener("click", openImport);
 el("#extract-resume").addEventListener("click", uploadResume);
 el("#copy-external-profile-prompt").addEventListener("click", copyExternalGptPrompt);
@@ -5203,7 +5262,7 @@ let lastAutoReloadAt = 0;
 
 function agentDataIsChanging() {
   const latestRunIsActive = state.data?.runs?.[0]?.tasks?.some((task) => ["queued", "running"].includes(task.status));
-  const aiIsWorking = state.data?.jobs?.some((job) => ["JD_FETCHING", "AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus));
+  const aiIsWorking = state.data?.jobs?.some((job) => ["TITLE_QUEUED", "TITLE_REVIEWING", "JD_FETCHING", "AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus));
   return Boolean(latestRunIsActive || aiIsWorking || state.data?.ai?.queue?.waiting || state.data?.jdRetryBatches?.length || state.data?.distance?.batch?.status === "RUNNING");
 }
 

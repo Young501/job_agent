@@ -88,7 +88,16 @@ export function createStorage({ dataDirectory, defaultSettings, defaultTaskCateg
     await mkdir(dirname(statePath), { recursive: true });
     const temporaryPath = `${statePath}.${process.pid}.tmp`;
     await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-    await rename(temporaryPath, statePath);
+    // Windows readers or antivirus may briefly hold the destination file.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rename(temporaryPath, statePath);
+        break;
+      } catch (error) {
+        if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 5) throw error;
+        await new Promise(resolve => setTimeout(resolve, 50 * (2 ** attempt)));
+      }
+    }
   }
 
   function update(mutator) {

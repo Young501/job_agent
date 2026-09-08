@@ -1,6 +1,6 @@
 # Job Agent
 
-当前 Agent 版本：`v1.1.0`。LinkedIn Worker 为 `v1.1.1`，SEEK Worker 为 `v1.1.2`，Indeed Worker 为 `v1.1.3`；三个 Worker 均支持按运行选择自动 AI 审阅或仅采集职位。Indeed 与 SEEK 还支持在具体地点搜索中设置并预检平台搜索半径。
+Agent version: `v1.1.0`. Workers: LinkedIn `v1.1.2`, SEEK `v1.1.3`, Indeed `v1.1.4`. Update all three workers for batch AI title triage before JD retrieval. Existing platform extraction and search filters remain unchanged.
 
 ## 项目简介
 
@@ -22,10 +22,15 @@ flowchart TD
     E --> F["Agent 统一入库<br/>保留平台、任务与执行时间"]
     F --> G{"统一历史中是否已有<br/>高置信度重复职位"}
     G -->|"是"| H["记录本次重复出现<br/>同画像复用审阅，跨画像只复用 JD"]
-    G -->|"否"| I{"标题或卡片摘要<br/>是否明确不相关"}
-    I -->|"是"| J["本地规则标记 Rejected<br/>不获取 JD、不调用 AI"]
+    G -->|"否"| I{"Matches a user-approved exclusion?"}
+    I -->|"是"| J["User-rule exclusion<br/>No JD retrieval or AI call"]
     I -->|"否或不确定"| X{"本次是否启用<br/>自动 AI 审阅"}
-    X -->|"是"| K["自动获取完整 JD<br/>后台读取，失败可集中补取"]
+    X -->|"是"| T["AI title triage in batches of up to 50<br/>Use the selected profile snapshot"]
+    T -->|"KEEP"| K["自动获取完整 JD<br/>后台读取，失败可集中补取"]
+    T -->|"EXCLUDE"| E1["Reviewable exclusion list<br/>Reason required; user can restore"]
+    T -->|"Failed after one retry"| E2["Keep jobs pending<br/>Retry or explicitly bypass triage"]
+    E1 --> N
+    E2 --> N
     X -->|"否"| N
     K --> L["Agent 结合职业画像进行 AI 审阅<br/>能力、方向、身份与签证"]
     L --> M["输出匹配分数、分数构成<br/>Strong、Maybe、Low、Rejected"]

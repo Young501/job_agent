@@ -13,6 +13,7 @@ import {
   answerJobQuestions,
   configureAi,
   evaluateJdWithAi,
+  evaluateTitlesWithAi,
   generateCoverLetter,
   generateProfile,
   isTransientAiError,
@@ -429,7 +430,7 @@ function profileBundleForJob(state, job) {
     profileId,
     record,
     profile: cloneData(profileForMatching(run?.profileSnapshot || record?.profile || null)),
-    preferenceModel: cloneData(run?.preferenceModelSnapshot || profileContext(state, profileId).preferenceModel || null)
+    preferenceModel: cloneData(run && Object.hasOwn(run, "preferenceModelSnapshot") ? run.preferenceModelSnapshot : profileContext(state, profileId).preferenceModel || null)
   };
 }
 
@@ -477,6 +478,7 @@ function buildBootstrap(state) {
       jobIds: batch.jobIds,
       createdAt: batch.createdAt
     })),
+    titleTriageBatches: state.titleTriageBatches || [],
     ai: {
       ...aiStatus(),
       queue: { waiting: autoReviewQueue.length, running: autoReviewRunning }
@@ -1305,6 +1307,7 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
       thresholds: state.settings.thresholds,
       runId,
       preferenceModel,
+      titleTriage: true,
       profilePurpose: runProfilePurpose || profilePurposeById.get(candidateProfileId) || "career"
     });
     const candidateKeys = strongIdentityKeys(candidate);
@@ -1357,6 +1360,21 @@ function addJobsToState(state, rawJobs, { runId = null, label = "manual import",
       }
     }
     state.jobs.push(candidate);
+    if (!hasAiJdReview(candidate)) {
+      const excluded = (task?.exclusionKeywords || []).find(word => String(candidate.title).toLowerCase().includes(String(word).toLowerCase()));
+      candidate.titleTriage = { status: excluded ? "RULE_EXCLUDED" : run?.aiReviewEnabled === false ? "DISABLED" : "QUEUED", attempts: 0 };
+      if (excluded) candidate.screening = { ...candidate.screening, titleClassification: "CLEAR_REJECT", category: "REJECTED", screeningStatus: "TITLE_RULE_EXCLUDED", reason: `命中用户已启用的排除词：${excluded}` };
+      else if (run?.aiReviewEnabled === false) markCollectedWithoutAi(candidate);
+      else if (candidate.duplicateOf && candidate.deduplication?.sameProfileBasis) {
+        if (["KEPT", "RESTORED", "EXCLUDED", "RULE_EXCLUDED"].includes(existing?.titleTriage?.status)) {
+          candidate.titleTriage = cloneData(existing.titleTriage);
+          candidate.screening = cloneData(existing.screening);
+        } else {
+          candidate.titleTriage.status = "SKIPPED";
+          candidate.screening.screeningStatus = "DUPLICATE_SKIPPED";
+        }
+      }
+    }
     existingPool.push(candidate);
     jobs.push(candidate);
     addedCount += 1;
@@ -1409,12 +1427,94 @@ function mergeWorkerResultJobs(state, rawJobs, { run, task }) {
     }
     merged.push(existing);
   }
-  if (missing.length) merged.push(...addJobsToState(state, missing, {
+  for (let offset = 0; offset < missing.length; offset += 1000) merged.push(...addJobsToState(state, missing.slice(offset, offset + 1000), {
     runId: run.id,
     label: `${task.platform} worker result fallback`,
     task
   }));
   return merged;
+}
+
+let titleTriageRunning = false;
+const titlePending = (job) => ["QUEUED", "REVIEWING", "ERROR", "EXCLUDED", "RULE_EXCLUDED"].includes(job?.titleTriage?.status);
+
+async function drainTitleTriage() {
+  if (titleTriageRunning) return;
+  titleTriageRunning = true;
+  try {
+    while (true) {
+      const snapshot = await storage.ensureState();
+      if (!snapshot.jobs.some(job => job.titleTriage?.status === "QUEUED" && jobRunUsesAiReview(snapshot, job))) break;
+      const batch = await storage.update(state => {
+        const first = state.jobs.find(job => job.titleTriage?.status === "QUEUED" && jobRunUsesAiReview(state, job));
+        if (!first) return null;
+        const jobs = state.jobs.filter(job => job.titleTriage?.status === "QUEUED"
+          && job.runId === first.runId && job.profileId === first.profileId).slice(0, 50);
+        const id = newId("title_batch");
+        state.titleTriageBatches ||= [];
+        state.titleTriageBatches.push({ id, runId: first.runId, profileId: first.profileId,
+          jobIds: jobs.map(job => job.id), status: "REVIEWING", startedAt: new Date().toISOString() });
+        state.titleTriageBatches = state.titleTriageBatches.slice(-1000);
+        for (const job of jobs) {
+          job.titleTriage = { ...job.titleTriage, status: "REVIEWING", batchId: id, startedAt: new Date().toISOString() };
+          job.screening.screeningStatus = "TITLE_REVIEWING";
+        }
+        return { id, jobs, ...profileBundleForJob(state, first) };
+      });
+      if (!batch) break;
+      let result = null;
+      let failure = null;
+      let attempts = 0;
+      for (; attempts < 2; attempts += 1) {
+        try {
+          if (!batch.profile) throw new Error("A task profile is required for title triage.");
+          if (!await prepareAiReviewConnections()) throw new Error("No AI connection passed title triage preflight.");
+          await storage.update(state => {
+            const run = state.runs.find(item => item.id === batch.jobs[0].runId);
+            if (run) {
+              ensureRunCounterShape(run);
+              if (run.counters.ai.calls >= aiStatus().budget.maxAiCallsPerRun) throw new Error("AI run call budget reached.");
+              run.counters.ai.calls += 1;
+            }
+          });
+          result = await evaluateTitlesWithAi(batch.jobs, batch.profile, batch.preferenceModel);
+          attempts += 1;
+          break;
+        } catch (error) { failure = error; }
+      }
+      const jdIds = await storage.update(state => {
+        const record = state.titleTriageBatches?.find(item => item.id === batch.id);
+        if (record) Object.assign(record, { status: result ? "COMPLETED" : "ERROR", calls: attempts,
+          completedAt: new Date().toISOString(), usage: result?.usage || null, error: result ? null : failure?.message });
+        const completed = [];
+        for (const original of batch.jobs) {
+          const job = state.jobs.find(item => item.id === original.id);
+          if (!job || job.titleTriage?.batchId !== batch.id || job.titleTriage.status !== "REVIEWING") continue;
+          const row = result?.decisions.find(item => item.id === job.id);
+          const status = row ? row.decision === "EXCLUDE" ? "EXCLUDED" : "KEPT" : "ERROR";
+          job.titleTriage = { ...job.titleTriage, status, attempts: (job.titleTriage.attempts || 0) + attempts,
+            reason: row ? row.reason || "标题尚不能明确排除，保留待 JD 审阅。" : failure?.message || "Title triage failed.", completedAt: new Date().toISOString() };
+          job.screening = { ...job.screening, score: null, category: status === "EXCLUDED" ? "REJECTED" : "MAYBE",
+            titleClassification: status === "EXCLUDED" ? "CLEAR_REJECT" : "AMBIGUOUS",
+            screeningStatus: status === "KEPT" ? "NEEDS_JD_REVIEW" : `TITLE_${status}`,
+            reason: row ? row.reason || "标题尚不能明确排除，保留待 JD 审阅。" : "标题初筛失败，职位已保留，可重试或跳过初筛。", engine: "ai-title" };
+          if (status === "KEPT" && hasCompleteDescription(job)) completed.push(job);
+        }
+        const run = state.runs.find(item => item.id === batch.jobs[0].runId);
+        if (run) {
+          recordAiUsage(run, result?.usage);
+          run.titleTriageStats ||= { batches: 0, calls: 0, failedBatches: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+          run.titleTriageStats.batches += 1;
+          run.titleTriageStats.calls += attempts;
+          run.titleTriageStats.failedBatches += result ? 0 : 1;
+          for (const key of ["inputTokens", "outputTokens", "totalTokens"]) run.titleTriageStats[key] += result?.usage?.[key] || 0;
+        }
+        return prepareAutoReviewJobs(state, completed);
+      });
+      enqueueAutoReviews(jdIds);
+    }
+  } catch (error) { console.error("Title triage queue failed", error); }
+  finally { titleTriageRunning = false; }
 }
 
 function isRejectedBeforeJd(job) {
@@ -1451,6 +1551,7 @@ function prepareAutoReviewJobs(state, jobs, { force = false } = {}) {
   const jobIds = [];
   const aiConfigured = aiStatus().configured;
   for (const job of jobs) {
+    if (titlePending(job)) continue;
     const profileBundle = profileBundleForJob(state, job);
     if (job.duplicateOf && !hasAiJdReview(job) && !hasCompleteDescription(job)) {
       if (!hasAiJdReview(job)) {
@@ -1534,6 +1635,7 @@ function buildOnDemandJdUrl(job, batchId = null) {
 }
 
 function markJobJdFetching(job) {
+  if (titlePending(job)) throw new Error("Resolve title triage before fetching the full JD.");
   job.descriptionFetchStatus = "fetching";
   job.descriptionFetchError = null;
   job.screening = { ...job.screening, jdReviewed: false, screeningStatus: "JD_FETCHING" };
@@ -1553,6 +1655,7 @@ function retryableMissingAiJd(state, job) {
   const staleFetch = job?.screening?.screeningStatus === "JD_FETCHING"
     && (!Number.isFinite(fetchStartedAt) || Date.now() - fetchStartedAt > 30_000);
   return Boolean(job
+    && !titlePending(job)
     && !isRejectedBeforeJd(job)
     && ["linkedin", "indeed", "seek"].includes(job.source)
     && jobRunUsesAiReview(state, job)
@@ -1793,8 +1896,15 @@ async function drainAutoReviewQueue() {
 
 async function resumeAutoReviews() {
   const ids = await storage.update((state) => {
+    for (const batch of state.titleTriageBatches || []) {
+      if (batch.status === "REVIEWING") batch.status = "INTERRUPTED";
+    }
     const pending = [];
     for (const job of state.jobs) {
+      if (job.titleTriage?.status === "REVIEWING") {
+        job.titleTriage.status = "QUEUED";
+        job.screening.screeningStatus = "TITLE_QUEUED";
+      }
       if (!["AI_QUEUED", "AI_REVIEWING", "AI_RETRY_WAIT"].includes(job.screening?.screeningStatus)) continue;
       const transientAttempts = Math.max(0, Number(job.aiReview?.transientAttempts || 0));
       job.screening.screeningStatus = "AI_QUEUED";
@@ -1805,6 +1915,7 @@ async function resumeAutoReviews() {
     return pending;
   });
   enqueueAutoReviews(ids);
+  void drainTitleTriage();
 }
 
 function jobBelongsToRunTask(job, task, run) {
@@ -2468,6 +2579,7 @@ async function handleApi(request, response, url) {
         workerHistoryMigrations: (state.workerHistoryMigrations ?? []).length
       };
       state.jobs = [];
+      state.titleTriageBatches = [];
       state.runs = [];
       state.routineTasks = [];
       state.validations = [];
@@ -3166,6 +3278,20 @@ async function handleApi(request, response, url) {
   }
   if (request.method === "POST" && path === "/api/worker/title-plan") {
     const body = await readJson(request);
+    if (Array.isArray(body.jobIds)) {
+      const state = await storage.ensureState();
+      const task = state.runs.find(run => run.id === body.runId)?.tasks.find(task => task.id === body.taskId);
+      if (!task || task.status !== "running") throw new Error("The title triage Worker task is no longer running.");
+      const ids = new Set(body.jobIds.slice(0, 1000));
+      const plan = state.jobs.filter(job => ids.has(job.id) && job.runId === body.runId && job.runTaskId === body.taskId).map(job => ({
+        jobId: job.id,
+        action: job.titleTriage?.status === "ERROR" ? "title_error"
+          : ["EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage?.status) ? "reject"
+          : titlePending(job) ? "title_pending" : hasCompleteDescription(job) ? "reuse" : "fetch",
+        reason: job.titleTriage?.reason || ""
+      }));
+      return sendJson(response, 200, { plan });
+    }
     const rawJobs = Array.isArray(body.jobs) ? body.jobs.slice(0, 1000) : [];
     const result = await storage.update((state) => {
       const run = state.runs.find((item) => item.id === body.runId);
@@ -3207,6 +3333,17 @@ async function handleApi(request, response, url) {
         }
         return { index, jobId: job.id, action: "fetch" };
       });
+      for (const item of plan) {
+        const job = jobs[item.index];
+        if (["skip_seen", "skip_ai"].includes(item.action) && job.titleTriage?.status === "QUEUED") {
+          job.titleTriage.status = "SKIPPED";
+          job.screening.screeningStatus = item.action === "skip_seen" ? "DUPLICATE_SKIPPED" : "COLLECTED_ONLY";
+        }
+        if ((item.action === "fetch" || item.reuseKind === "jd") && titlePending(job)) {
+          item.action = job.titleTriage.status === "ERROR" ? "title_error"
+            : ["EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage.status) ? "reject" : "title_pending";
+        }
+      }
       const counts = {
         total: plan.length,
         fetch: plan.filter((item) => item.action === "fetch").length,
@@ -3231,6 +3368,7 @@ async function handleApi(request, response, url) {
       recalculateRunCounters(state, run);
       return { plan, counts };
     });
+    void drainTitleTriage();
     return sendJson(response, 200, result);
   }
   if (request.method === "POST" && path === "/api/worker/job-jd") {
@@ -3328,6 +3466,7 @@ async function handleApi(request, response, url) {
       updateRunState(run);
       return { run, task, jobs, autoReviewJobIds };
     });
+    void drainTitleTriage();
     enqueueAutoReviews(result.autoReviewJobIds || []);
     if (result.run?.distanceEnabled) enqueueAutomaticDistances((result.jobs || []).filter((job) => !job.duplicateOf).map((job) => job.id));
     return sendJson(response, 200, {
@@ -3511,7 +3650,41 @@ async function handleApi(request, response, url) {
       return { jobs, autoReviewJobIds: prepareAutoReviewJobs(state, jobs) };
     });
     enqueueAutoReviews(result.autoReviewJobIds);
+    void drainTitleTriage();
     return sendJson(response, 201, { jobs: result.jobs, autoReviewQueued: result.autoReviewJobIds.length });
+  }
+
+  if (request.method === "POST" && path === "/api/jobs/title-triage") {
+    const body = await readJson(request);
+    if (!["retry", "restore", "confirm"].includes(body.action)) throw new Error("Choose a title triage action.");
+    const selected = new Set(Array.isArray(body.jobIds) ? body.jobIds.slice(0, 1000) : []);
+    const result = await storage.update(state => {
+      const jobs = state.jobs.filter(job => selected.has(job.id) && ["ERROR", "EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage?.status));
+      if (!jobs.length) throw new Error("No eligible title triage jobs selected.");
+      for (const job of jobs) {
+        const wasExcluded = ["EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage.status);
+        if (body.action === "confirm") {
+          if (!wasExcluded) continue;
+          job.feedback = { helpfulness: "HELPFUL", reason: "REJECTION_CORRECT", updatedAt: new Date().toISOString(), note: "" };
+          job.viewedAt = job.feedback.updatedAt;
+          continue;
+        }
+        if (body.action === "retry" && job.titleTriage.status !== "ERROR") continue;
+        if (body.action === "restore" && wasExcluded) {
+          job.feedback = { helpfulness: "REJECTION_INCORRECT", reason: "CLASSIFICATION_WRONG", updatedAt: new Date().toISOString(), note: "" };
+          removeJobFromPendingExclusionSuggestions(state, job.id, profileBundleForJob(state, job).profileId);
+        }
+        job.titleTriage = { ...job.titleTriage, status: body.action === "retry" ? "QUEUED" : "RESTORED", humanOverride: body.action === "restore" };
+        job.viewedAt = null;
+        job.screening = { ...job.screening, score: null, category: "MAYBE", titleClassification: "AMBIGUOUS",
+          screeningStatus: body.action === "retry" ? "TITLE_QUEUED" : "NEEDS_JD_REVIEW", reason: "等待继续审阅 JD。" };
+      }
+      return { jobIds: jobs.map(job => job.id), missingJdIds: jobs.filter(job => job.titleTriage.status === "RESTORED" && !hasCompleteDescription(job)).map(job => job.id),
+        autoReviewJobIds: prepareAutoReviewJobs(state, jobs.filter(job => job.titleTriage.status === "RESTORED" && hasCompleteDescription(job))) };
+    });
+    enqueueAutoReviews(result.autoReviewJobIds);
+    void drainTitleTriage();
+    return sendJson(response, 200, result);
   }
 
   const viewedMatch = /^\/api\/jobs\/([^/]+)\/viewed$/.exec(path);

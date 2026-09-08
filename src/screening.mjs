@@ -167,7 +167,7 @@ function applyPreviewScreen(screening, preview, profilePurpose = "career") {
   };
 }
 
-export function normalizeJob(input, { thresholds, runId = null, duplicateOf = null, preferenceModel = null, profilePurpose = "career" } = {}) {
+export function normalizeJob(input, { thresholds, runId = null, duplicateOf = null, preferenceModel = null, profilePurpose = "career", titleTriage = false } = {}) {
   const source = ["linkedin", "indeed", "seek", "manual"].includes(String(input.source).toLowerCase())
     ? String(input.source).toLowerCase()
     : "manual";
@@ -202,7 +202,10 @@ export function normalizeJob(input, { thresholds, runId = null, duplicateOf = nu
     routineTaskId: normalizeText(input.routineTaskId) || null,
     runId,
     duplicateOf,
-    screening: applyPreviewScreen(screenTitle(title, { thresholds, preferenceModel, profilePurpose }), input.description, profilePurpose),
+    screening: titleTriage ? {
+      titleClassification: "AMBIGUOUS", score: null, category: "MAYBE", reason: "等待结合任务画像进行标题初筛。",
+      matchedAreas: [], concerns: [], jdReviewed: false, screeningStatus: "TITLE_QUEUED", engine: "ai-title-pending"
+    } : applyPreviewScreen(screenTitle(title, { thresholds, preferenceModel, profilePurpose }), input.description, profilePurpose),
     feedback: null,
     viewedAt: null,
     reviewedAt: null,
