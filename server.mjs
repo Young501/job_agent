@@ -5,6 +5,7 @@ import { extname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
+import { loadWorkerVersions, workerVersionStatus } from "./src/worker-versions.mjs";
 
 import {
   aiPrivateConfig,
@@ -43,6 +44,8 @@ const execFileAsync = promisify(execFile);
 const root = fileURLToPath(new URL(".", import.meta.url));
 const publicDirectory = join(root, "public");
 const workerDirectory = join(root, "workers");
+const workerVersions = await loadWorkerVersions(workerDirectory);
+const workerCompatibility = new Map();
 const dataDirectory = process.env.JOB_AGENT_DATA_DIRECTORY
   ? resolve(process.env.JOB_AGENT_DATA_DIRECTORY)
   : join(root, "data");
@@ -444,6 +447,8 @@ function buildBootstrap(state) {
   state.runs.forEach(ensureRunCounterShape);
   return {
     settings: state.settings,
+    workerVersions,
+    workerCompatibility: [...workerCompatibility.values()],
     distance: distanceService.snapshot(state.jobs),
     profiles: state.profiles.map(publicProfile),
     activeProfile: activeProfile ? publicProfile(activeProfile) : null,
@@ -498,10 +503,11 @@ async function readBody(request) {
 }
 
 async function readJson(request) {
+  if (request.parsedJson !== undefined) return request.parsedJson;
   const body = await readBody(request);
   if (!body.length) return {};
   try {
-    return JSON.parse(body.toString("utf8"));
+    return (request.parsedJson = JSON.parse(body.toString("utf8")));
   } catch {
     throw new Error("Request body must be valid JSON.");
   }
@@ -2296,6 +2302,18 @@ function workerLaunchUrls(run) {
 
 async function handleApi(request, response, url) {
   const path = url.pathname;
+  const guardedWorkerRoute = ["/api/worker/next", "/api/worker/preflight", "/api/worker/preflight/started"].includes(path)
+    || /^\/api\/worker\/jd-retry\/[^/]+\/next$/.test(path);
+  if (guardedWorkerRoute) {
+    const body = request.method === "POST" ? await readJson(request) : {};
+    const platform = String(url.searchParams.get("platform") || body.platform || request.headers["x-job-agent-platform"] || "").toLowerCase();
+    const status = workerVersionStatus(workerVersions, platform, request.headers["x-job-agent-version"]);
+    if (workerVersions[platform]) workerCompatibility.set(platform, status);
+    if (!status.compatible) {
+      return sendJson(response, 409, { error: `${platform.toUpperCase() || "Worker"} 脚本版本不匹配或未上报。请前往 Agent 安装设置更新 Worker，再刷新招聘平台页面。`,
+        code: "WORKER_UPDATE_REQUIRED", ...status, updateUrl: "/?view=setup" });
+    }
+  }
   if (request.method === "GET" && path === "/api/health") {
     return sendJson(response, 200, { ok: true, ai: aiStatus() });
   }

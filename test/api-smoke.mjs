@@ -5,6 +5,14 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadWorkerVersions } from "../src/worker-versions.mjs";
+import { fileURLToPath } from "node:url";
+const workerVersions = await loadWorkerVersions(fileURLToPath(new URL("../workers/", import.meta.url)));
+
+function workerHeaders(path, body) {
+  const platform = new URL(path, "http://localhost").searchParams.get("platform") || body?.platform || "seek";
+  return { "content-type": "application/json", "x-job-agent-platform": platform, "x-job-agent-version": workerVersions[platform] };
+}
 
 const directory = await mkdtemp(join(tmpdir(), "job-agent-smoke-"));
 const port = await availablePort();
@@ -162,7 +170,7 @@ async function waitForServer() {
 async function request(path, body, method = body === undefined ? "GET" : "POST") {
   const response = await fetch("http://127.0.0.1:" + port + path, {
     method,
-    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    headers: workerHeaders(path, body),
     body: body === undefined ? undefined : JSON.stringify(body)
   });
   const json = await response.json();
@@ -182,7 +190,7 @@ async function request(path, body, method = body === undefined ? "GET" : "POST")
 async function requestFailure(path, body, status = 400) {
   const response = await fetch("http://127.0.0.1:" + port + path, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: workerHeaders(path, body),
     body: JSON.stringify(body)
   });
   const json = await response.json();
@@ -228,6 +236,31 @@ async function validateRoutineTask(platform, postedWithinDays, jobType = "any", 
 
 try {
   await waitForServer();
+  for (const platform of Object.keys(workerVersions)) {
+    for (const version of [null, "1.0.0", "99.0.0"]) {
+      const denied = await fetch(`http://127.0.0.1:${port}/api/worker/next?platform=${platform}&workerId=old-worker`, {
+        headers: version ? { "x-job-agent-version": version } : {}
+      });
+      assert.equal(denied.status, 409);
+      const payload = await denied.json();
+      assert.equal(payload.code, "WORKER_UPDATE_REQUIRED");
+      assert.equal(payload.requiredVersion, workerVersions[platform]);
+      const bootstrap = await request("/api/bootstrap");
+      assert.equal(bootstrap.workerCompatibility.find(item => item.platform === platform).compatible, false);
+    }
+    const accepted = await request(`/api/worker/next?platform=${platform}&workerId=current-worker`);
+    assert.equal(accepted.task, null);
+    const bootstrap = await request("/api/bootstrap");
+    assert.equal(bootstrap.workerCompatibility.find(item => item.platform === platform).compatible, true);
+  }
+  for (const path of ["/api/worker/preflight?platform=seek", "/api/worker/preflight/started", "/api/worker/jd-retry/example/next"]) {
+    const denied = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: path.includes("?") ? "GET" : "POST",
+      headers: { "content-type": "application/json", "x-job-agent-platform": "seek" },
+      body: path.includes("?") ? undefined : JSON.stringify({ platform: "seek" })
+    });
+    assert.equal(denied.status, 409);
+  }
   const workerTimingResponse = await request("/api/worker/settings");
   assert.deepEqual(workerTimingResponse.workerTiming, {
     accessLimit: 20,
@@ -244,8 +277,8 @@ try {
   assert.equal(workerResponse.ok, true);
   assert.match(workerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(workerScript, /Job Agent Worker - SEEK/);
-  assert.match(workerScript, /@version\s+1\.1\.3/);
-  assert.match(workerScript, /const APP_VERSION = "1\.1\.3"/);
+  assert.match(workerScript, /@version\s+1\.1\.4/);
+  assert.match(workerScript, /const APP_VERSION = "1\.1\.4"/);
   assert.match(workerScript, /function agentShowNaturalSeekKeyword/);
   assert.match(workerScript, /Do not dispatch an input event/);
   const naturalKeywordFunction = extractNamedFunction(workerScript, "agentShowNaturalSeekKeyword");
@@ -405,8 +438,8 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+1\.1\.4/);
-  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.4"/);
+  assert.match(indeedWorkerScript, /@version\s+1\.1\.5/);
+  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.5"/);
   assert.match(indeedWorkerScript, /agentWaitForSearchResults/);
   assert.match(indeedWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(indeedWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
@@ -490,8 +523,8 @@ try {
   assert.match(linkedInWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(linkedInWorkerScript, /@name\s+Job Agent Worker - LinkedIn/);
   assert.match(linkedInWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(linkedInWorkerScript, /@version\s+1\.1\.2/);
-  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.1\.2"/);
+  assert.match(linkedInWorkerScript, /@version\s+1\.1\.3/);
+  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.1\.3"/);
   assert.match(linkedInWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(linkedInWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
   assert.match(linkedInWorkerScript, /Job Agent 访问节奏/);
@@ -658,8 +691,8 @@ try {
   assert.match(dashboardScript, /岗位方向/);
   assert.match(dashboardScript, /协议 v1/);
   assert.match(dashboardScript, /安装 \/ 更新/);
-  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.4"/);
-  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.3"/);
+  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.5"/);
+  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.4"/);
   assert.match(dashboardScript, /function locationSupportsSearchRadius/);
   assert.match(dashboardScript, /function syncRoutineSearchRadiusOptions/);
   assert.match(dashboardHtml, /id="routine-task-search-radius"/);
@@ -684,7 +717,7 @@ try {
   assert.equal(installerResponse.ok, true);
   assert.match(installerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(installerScript, /@name\s+Job Agent Worker - Indeed/);
-  assert.match(installerScript, /@version\s+1\.1\.4/);
+  assert.match(installerScript, /@version\s+1\.1\.5/);
   assert.match(dashboardScript, /data-copy-worker/);
   assert.match(dashboardScript, /loadWorkerScripts/);
   assert.match(dashboardScript, /job-agent:view/);
@@ -1211,6 +1244,10 @@ try {
   assert.equal(activeLinkedInRun.run.id, run.run.id);
 
   const firstQueuedTask = run.run.tasks[0];
+  const outdatedClaim = await fetch(`http://127.0.0.1:${port}/api/worker/next?runId=${run.run.id}&platform=${firstQueuedTask.platform}&workerId=outdated`);
+  assert.equal(outdatedClaim.status, 409);
+  const afterOutdatedClaim = await request("/api/bootstrap");
+  assert.equal(afterOutdatedClaim.runs.find(item => item.id === run.run.id).tasks.find(item => item.id === firstQueuedTask.id).status, "queued");
   const reopenedQueuedWorker = await request("/api/runs/" + run.run.id + "/tasks/" + firstQueuedTask.id + "/launch", {});
   assert.equal(reopenedQueuedWorker.task.id, firstQueuedTask.id);
   assert.equal(reopenedQueuedWorker.recovered, false);

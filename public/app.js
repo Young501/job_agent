@@ -190,9 +190,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v1.1.2", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v1.1.4", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v1.1.3", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v1.1.3", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v1.1.5", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v1.1.4", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -1533,6 +1533,13 @@ function setCategorySelection(categoryIds, checked) {
 }
 
 function renderRoutine() {
+  const blockedWorkers = (state.data.workerCompatibility || []).filter(worker => !worker.compatible);
+  const versionNotice = el("#worker-version-notice");
+  versionNotice.hidden = !blockedWorkers.length;
+  versionNotice.innerHTML = blockedWorkers.map(worker => '<p>' + escapeHtml(worker.platform.toUpperCase())
+    + ' Worker 需要更新：检测到 ' + escapeHtml(worker.version || '未上报版本') + '，要求 v' + escapeHtml(worker.requiredVersion)
+    + '。任务尚未领取，请更新脚本并刷新招聘平台页面。</p>').join('')
+    + '<a class="button button-secondary" href="/?view=setup">前往安装设置</a>';
   const routineTasks = state.data.routineTasks || [];
   const availableRoutineTaskIds = new Set(routineTasks.filter((task) => task.status === "READY").map((task) => task.id));
   for (const id of state.selectedRoutineTaskIds) {
@@ -2299,12 +2306,17 @@ function workerInstallMarkup(worker) {
 function renderSetup() {
   const target = el("#worker-script-list");
   target.innerHTML = workerDefinitions.map((worker) => {
+    const compatibility = (state.data.workerCompatibility || []).find(item => item.platform === worker.id);
+    worker.version = 'v' + (state.data.workerVersions?.[worker.id] || worker.version.replace(/^v/, ''));
+    const versionText = !compatibility ? '尚未验证，将在领取任务时检查' : compatibility.compatible
+      ? '最近领取检查：版本匹配' : '需要更新：' + (compatibility.version || '未上报版本') + '。更新后请刷新招聘平台页面。';
     const script = state.workerScripts[worker.id];
     const pending = state.workerScriptsLoading && !script;
     const code = script ? escapeHtml(script) : pending ? "正在读取脚本代码..." : "代码将在打开此页面后自动读取。";
     return '<article class="worker-script-row">'
       + '<div class="worker-script-header"><div class="worker-script-title"><span class="platform-dot source-' + worker.id + '"></span><div><h3>' + worker.name + ' Worker</h3><p>' + worker.domain + ' <span>' + worker.version + '</span></p></div></div>'
       + '<div class="worker-script-actions">' + workerInstallMarkup(worker) + workerCopyMarkup(worker, !script) + '</div></div>'
+      + '<p class="form-note">' + escapeHtml(versionText) + '</p>'
       + '<details class="worker-code"><summary><i data-lucide="code-2"></i><span>查看完整代码</span><small>' + (script ? script.length.toLocaleString() + ' 字符' : '读取中') + '</small></summary>'
       + '<pre><code>' + code + '</code></pre></details></article>';
   }).join("");
@@ -5269,7 +5281,7 @@ function agentDataIsChanging() {
 async function autoReload() {
   if (autoReloadInFlight || document.visibilityState === "hidden") return;
   if (state.view === "ai" && (state.editingAiConnectionId || state.aiConfigDirty || state.aiBudgetSaving)) return;
-  if (!["overview", "routine", "jobs", "ai"].includes(state.view)) return;
+  if (!["overview", "routine", "jobs", "ai", "setup"].includes(state.view)) return;
   const refreshInterval = agentDataIsChanging() ? 2500 : 8000;
   if (Date.now() - lastAutoReloadAt < refreshInterval) return;
   autoReloadInFlight = true;

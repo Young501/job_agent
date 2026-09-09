@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - Indeed
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.1.4
+// @version      1.1.5
 // @description  Job Agent worker for Indeed. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/indeed/indeed-agent-worker.user.js
@@ -23,7 +23,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.1.4";
+    const APP_VERSION = "1.1.5";
     const INDEED_SEARCH_RADII_KM = new Set([0, 5, 10, 15, 25, 50, 100]);
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
@@ -1059,11 +1059,15 @@
                 url: AGENT.apiBase + path,
                 data: payload === undefined ? undefined : JSON.stringify(payload),
                 timeout: 20000,
-                headers: payload === undefined ? undefined : { "content-type": "application/json" },
+                headers: { "content-type": "application/json", "x-job-agent-platform": AGENT.platform, "x-job-agent-version": APP_VERSION },
                 onload(response) {
                     let body;
                     try { body = JSON.parse(response.responseText || "{}"); } catch { return reject(new Error("The local Job Agent returned invalid JSON.")); }
                     if (response.status >= 200 && response.status < 300) return resolve(body);
+                    if (body.code === "WORKER_UPDATE_REQUIRED") {
+                        agentHideOverlay();
+                        setStatus(body.error);
+                    }
                     reject(new Error(body.error || `Local Job Agent request failed (${response.status}).`));
                 },
                 onerror() { reject(new Error("Could not reach the local Job Agent.")); },
