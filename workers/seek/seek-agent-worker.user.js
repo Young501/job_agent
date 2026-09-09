@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Agent Worker - SEEK
 // @namespace    https://routine.local/job-agent-worker
-// @version      1.1.4
+// @version      1.1.5
 // @description  Job Agent worker for SEEK. Runs one assigned task at a time and reports results locally.
 // @updateURL    http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
 // @downloadURL  http://127.0.0.1:4317/workers/seek/seek-agent-worker.user.js
@@ -29,7 +29,7 @@
 (function () {
     "use strict";
 
-    const APP_VERSION = "1.1.4";
+    const APP_VERSION = "1.1.5";
     const SEEK_SEARCH_RADII_KM = new Set([0, 2, 5, 10, 25, 30, 50, 100]);
     const DEFAULT_AGENT_TIMING = {
         accessLimit: 20,
@@ -1607,6 +1607,12 @@
                 taskId: task.id,
                 jobs: jobs.slice(offset, offset + 50)
             });
+            const chunkSize = Math.min(50, jobs.length - offset);
+            if (!Array.isArray(response.plan) || response.plan.length !== chunkSize
+                || new Set(response.plan.map(item => item?.index)).size !== chunkSize
+                || response.plan.some(item => !Number.isInteger(item?.index) || item.index < 0 || item.index >= chunkSize || !item.jobId)) {
+                throw new Error("Invalid title plan: missing or duplicate job indexes.");
+            }
             let chunkPlan = response.plan.map(item => ({ ...item, index: item.index + offset }));
             while (chunkPlan.some(item => item.action === "title_pending") && !agentStopRequested) {
                 setStatus("AI 正在批量初筛标题，暂不获取 JD。");
@@ -1615,8 +1621,15 @@
                 const update = await agentRequest("POST", "/api/worker/title-plan", {
                     runId: task.runId, taskId: task.id, jobIds: pending.map(item => item.jobId)
                 });
+                const expectedIds = new Set(pending.map(item => item.jobId));
+                if (!Array.isArray(update.plan) || update.plan.length !== pending.length
+                    || new Set(update.plan.map(item => item?.jobId)).size !== pending.length
+                    || update.plan.some(item => !expectedIds.has(item?.jobId))) {
+                    throw new Error("Invalid title polling response: missing or duplicate job IDs.");
+                }
                 const byId = new Map(update.plan.map(item => [item.jobId, item]));
-                chunkPlan = chunkPlan.map(item => byId.has(item.jobId) ? { ...item, ...byId.get(item.jobId) } : item);
+                chunkPlan = chunkPlan.map(item => byId.has(item.jobId)
+                    ? { ...item, action: byId.get(item.jobId).action, reason: byId.get(item.jobId).reason } : item);
             }
             plan.push(...chunkPlan);
             log(`Job Agent 标题初筛进度：${Math.min(offset + 50, jobs.length)}/${jobs.length}。`);
@@ -1627,7 +1640,8 @@
             plan = jobs.map((_, index) => saved.get(index) || ({ index, action: task.aiReviewEnabled === false ? "skip_ai" : "title_error" }));
         }
         const planByIndex = new Map(plan.map((item) => [item.index, item]));
-        const fetchIndexes = plan.filter((item) => item.action === "fetch").map((item) => item.index);
+        const fetchIndexes = jobs.map((_, index) => index).filter(index => planByIndex.get(index)?.action === "fetch" && task.aiReviewEnabled !== false);
+        log(`Job Agent 初筛完成：待获取 ${fetchIndexes.length} 份 JD，其他职位跳过或保留等待。`);
         let completed = 0;
         let humanReason = null;
         for (let index = 0; index < jobs.length; index += 1) {
@@ -1636,7 +1650,7 @@
             const planItem = planByIndex.get(index);
             const action = planItem?.action || "title_error";
             if (planItem?.jobId) job.agentJobId = planItem.jobId;
-            if (["title_pending", "title_error"].includes(action)) {
+            if (!["fetch", "reject", "skip_seen", "reuse", "skip_ai"].includes(action)) {
                 job.descriptionFetchStatus = "pending-title";
                 continue;
             }
@@ -1652,7 +1666,7 @@
                 job.descriptionFetchStatus = "reused";
                 continue;
             }
-            if (action === "skip_ai") {
+            if (action === "skip_ai" || task.aiReviewEnabled === false) {
                 job.descriptionFetchStatus = "skipped-ai";
                 continue;
             }

@@ -190,9 +190,9 @@ const pages = {
   setup: ["浏览器连接", "安装设置"]
 };
 const workerDefinitions = [
-  { id: "linkedin", name: "LinkedIn", version: "v1.1.3", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
-  { id: "indeed", name: "Indeed", version: "v1.1.5", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
-  { id: "seek", name: "SEEK", version: "v1.1.4", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
+  { id: "linkedin", name: "LinkedIn", version: "v1.1.4", domain: "linkedin.com/jobs", path: "/workers/linkedin/linkedin-agent-worker.user.js" },
+  { id: "indeed", name: "Indeed", version: "v1.1.6", domain: "au.indeed.com/jobs", path: "/workers/indeed/indeed-agent-worker.user.js" },
+  { id: "seek", name: "SEEK", version: "v1.1.5", domain: "seek.com.au/jobs", path: "/workers/seek/seek-agent-worker.user.js" }
 ];
 const profileTagSections = [
   { key: "candidateItems", label: "候选池", icon: "inbox" },
@@ -785,7 +785,6 @@ function visibleJobs() {
   const jobs = jobsInSelectedPane().filter((job) => {
     const words = [job.title, job.company, job.location, job.searchKeyword].join(" ").toLowerCase();
     return (!query || words.includes(query))
-      && (category === "REJECTED" || !["EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage?.status))
       && (!category || effectiveJobCategory(job) === category)
       && (!source || job.source === source)
       && (!status || job.screening.screeningStatus === status)
@@ -1148,6 +1147,8 @@ async function applyTitleTriageAction(action) {
 }
 
 function jobRow(job, compact = false, includeBatch = false) {
+  const titleExcluded = ["EXCLUDED", "RULE_EXCLUDED"].includes(job.titleTriage?.status);
+  const titleReason = titleExcluded ? '<small class="title-exclusion-reason">' + escapeHtml(job.titleTriage?.reason || job.screening?.reason || "标题初筛已排除") + '</small>' : '';
   const duplicate = job.duplicateOf ? '<span class="tiny-note">重复导入</span>' : "";
   const search = compact ? "" : '<td class="muted">' + escapeHtml(job.searchKeyword || "-") + "</td>";
   const run = includeBatch ? runForJob(job) : null;
@@ -1160,11 +1161,11 @@ function jobRow(job, compact = false, includeBatch = false) {
   const reviewMeta = viewed || feedback ? '<span class="job-review-meta">' + viewed + feedback + "</span>" : "";
   const scoreReason = escapeHtml(job.screening?.reason || "尚无评分说明");
   return '<tr' + (rowClasses ? ' class="' + rowClasses + '"' : "") + '>'
-    + '<td><strong>' + escapeHtml(job.title) + "</strong>" + duplicate + reviewMeta + "</td>"
+    + '<td><strong>' + escapeHtml(job.title) + "</strong>" + duplicate + reviewMeta + titleReason + "</td>"
     + '<td><span>' + escapeHtml(job.company || "-") + "</span><small>" + escapeHtml(job.location || "-") + "</small>" + jobDistanceBadge(job) + "</td>"
     + '<td>' + badge(names[job.source] || job.source, "source-" + job.source) + "</td>"
     + search
-    + '<td>' + (job.screening.score === null ? '<span class="muted">待 JD 评分</span>' : '<button class="score score-trigger" type="button" data-score-details="' + job.id + '" title="点击查看分数构成：' + scoreReason + '">' + job.screening.score + '</button>') + badge(effectiveJobCategory(job), "category-" + effectiveJobCategory(job).toLowerCase()) + "</td>"
+    + '<td>' + (titleExcluded ? '<span class="muted">无需 JD 评分</span>' : job.screening.score === null ? '<span class="muted">待 JD 评分</span>' : '<button class="score score-trigger" type="button" data-score-details="' + job.id + '" title="点击查看分数构成：' + scoreReason + '">' + job.screening.score + '</button>') + badge(effectiveJobCategory(job), "category-" + effectiveJobCategory(job).toLowerCase()) + "</td>"
     + '<td>' + badge(job.screening.screeningStatus, "status-badge") + screeningMethodBadge(job) + workRightsBadge(job) + "</td>"
     + batch
     + '<td class="action-cell">' + actionButtons(job) + "</td></tr>";

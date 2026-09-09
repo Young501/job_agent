@@ -1,6 +1,6 @@
 # Job Agent
 
-Agent version: `v1.1.0`. Workers: LinkedIn `v1.1.3`, SEEK `v1.1.4`, Indeed `v1.1.5`. Update all three workers for version-checked task claiming and batch AI title triage. Existing platform extraction and search filters remain unchanged.
+Agent version: `v1.1.0`. Workers: LinkedIn `v1.1.4`, SEEK `v1.1.5`, Indeed `v1.1.6`. Update all three workers for strict JD action gating and accurate post-triage progress counts. Existing platform extraction and search filters remain unchanged.
 
 Worker task claims, preflight starts and JD retry claims require the exact version shipped with the running Agent. Missing, older or newer versions receive `WORKER_UPDATE_REQUIRED` without consuming a queued task. Installation settings and the run queue show the latest check; update the script and refresh existing platform tabs before trying again. Checks report the requesting tab's version, not every installed browser script. Results already in flight and history migration remain accepted to avoid losing collected data.
 

@@ -277,8 +277,7 @@ try {
   assert.equal(workerResponse.ok, true);
   assert.match(workerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(workerScript, /Job Agent Worker - SEEK/);
-  assert.match(workerScript, /@version\s+1\.1\.4/);
-  assert.match(workerScript, /const APP_VERSION = "1\.1\.4"/);
+  assert.ok(workerScript.includes(`const APP_VERSION = "${workerVersions.seek}"`));
   assert.match(workerScript, /function agentShowNaturalSeekKeyword/);
   assert.match(workerScript, /Do not dispatch an input event/);
   const naturalKeywordFunction = extractNamedFunction(workerScript, "agentShowNaturalSeekKeyword");
@@ -438,8 +437,7 @@ try {
   assert.match(indeedWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(indeedWorkerScript, /@name\s+Job Agent Worker - Indeed/);
   assert.match(indeedWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(indeedWorkerScript, /@version\s+1\.1\.5/);
-  assert.match(indeedWorkerScript, /const APP_VERSION = "1\.1\.5"/);
+  assert.ok(indeedWorkerScript.includes(`const APP_VERSION = "${workerVersions.indeed}"`));
   assert.match(indeedWorkerScript, /agentWaitForSearchResults/);
   assert.match(indeedWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(indeedWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
@@ -523,8 +521,7 @@ try {
   assert.match(linkedInWorkerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(linkedInWorkerScript, /@name\s+Job Agent Worker - LinkedIn/);
   assert.match(linkedInWorkerScript, /@namespace\s+https:\/\/routine\.local\/job-agent-worker/);
-  assert.match(linkedInWorkerScript, /@version\s+1\.1\.3/);
-  assert.match(linkedInWorkerScript, /const APP_VERSION = "1\.1\.3"/);
+  assert.ok(linkedInWorkerScript.includes(`const APP_VERSION = "${workerVersions.linkedin}"`));
   assert.match(linkedInWorkerScript, /agentRefreshTiming\(runId = agentTask\?\.runId\)/);
   assert.match(linkedInWorkerScript, /workerTiming: \{ \.\.\.agentTiming \}/);
   assert.match(linkedInWorkerScript, /Job Agent 访问节奏/);
@@ -691,8 +688,8 @@ try {
   assert.match(dashboardScript, /岗位方向/);
   assert.match(dashboardScript, /协议 v1/);
   assert.match(dashboardScript, /安装 \/ 更新/);
-  assert.match(dashboardScript, /name: "Indeed", version: "v1\.1\.5"/);
-  assert.match(dashboardScript, /name: "SEEK", version: "v1\.1\.4"/);
+  assert.ok(dashboardScript.includes(`name: "Indeed", version: "v${workerVersions.indeed}"`));
+  assert.ok(dashboardScript.includes(`name: "SEEK", version: "v${workerVersions.seek}"`));
   assert.match(dashboardScript, /function locationSupportsSearchRadius/);
   assert.match(dashboardScript, /function syncRoutineSearchRadiusOptions/);
   assert.match(dashboardHtml, /id="routine-task-search-radius"/);
@@ -717,7 +714,7 @@ try {
   assert.equal(installerResponse.ok, true);
   assert.match(installerResponse.headers.get("content-type") || "", /^text\/javascript/);
   assert.match(installerScript, /@name\s+Job Agent Worker - Indeed/);
-  assert.match(installerScript, /@version\s+1\.1\.5/);
+  assert.ok(installerScript.includes(`const APP_VERSION = "${workerVersions.indeed}"`));
   assert.match(dashboardScript, /data-copy-worker/);
   assert.match(dashboardScript, /loadWorkerScripts/);
   assert.match(dashboardScript, /job-agent:view/);
